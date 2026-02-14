@@ -368,15 +368,15 @@ function decode_delta_length_byte_array(data::AbstractVector{UInt8}, count::Int)
         end
     end
 
-    # Now read the actual byte data
-    result = Vector{Vector{UInt8}}(undef, count)
+    # Byte data is contiguous from here — build VectorOfVectors as a zero-copy view
+    elem_ptr = Vector{Int}(undef, count + 1)
+    elem_ptr[1] = 1
     for i in 1:count
-        len = Int(lengths[i])
-        result[i] = data[pos : pos + len - 1]
-        pos += len
+        elem_ptr[i+1] = elem_ptr[i] + Int(lengths[i])
     end
 
-    result
+    total = elem_ptr[end] - 1
+    VectorOfVectors(@view(data[pos : pos + total - 1]), elem_ptr)
 end
 
 #=============================================================================
