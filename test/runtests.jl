@@ -147,7 +147,7 @@ end
 """Generate a parquet file via pyarrow, run tests, then clean up."""
 function _with_pyarrow_file(test_fn::Function, label::String, filename::String, pyscript::String)
     test_file = joinpath(@__DIR__, filename)
-    result = _run_pyarrow(pyscript * "\npq.write_table(table, '$(test_file)')\nprint('SUCCESS')")
+    result = _run_pyarrow("write_kwargs = {}\n" * pyscript * "\npq.write_table(table, '$(test_file)', **write_kwargs)\nprint('SUCCESS')")
     if result == "SUCCESS"
         @info "Testing $label"
         try
@@ -234,5 +234,31 @@ table = pa.table({
         @test length(nested[3]) == 2
         @test collect(skipmissing(nested[3][1])) == [7]
         @test collect(skipmissing(nested[3][2])) == [8, 9]
+    end
+end
+
+@testset "Compression Codecs" begin
+    pyscript = """
+import pyarrow as pa, pyarrow.parquet as pq
+table = pa.table({
+    'id': [1, 2, 3, 4, 5],
+    'name': ['Alice', 'Bob', 'Charlie', 'David', 'Eve'],
+    'value': [1.5, 2.5, 3.5, 4.5, 5.5],
+})"""
+
+    function check_table(tbl)
+        @test tbl isa ParquetTable
+        @test collect(tbl.id) == [1, 2, 3, 4, 5]
+        @test collect(tbl.name) == ["Alice", "Bob", "Charlie", "David", "Eve"]
+        @test collect(tbl.value) == [1.5, 2.5, 3.5, 4.5, 5.5]
+    end
+
+    for codec in ["none", "snappy", "gzip", "zstd", "lz4"]
+        @testset "$codec" begin
+            _with_pyarrow_file("compression=$codec", "test_$codec.parquet",
+                pyscript * "\nwrite_kwargs = {'compression': '$codec'}") do tbl
+                check_table(tbl)
+            end
+        end
     end
 end
