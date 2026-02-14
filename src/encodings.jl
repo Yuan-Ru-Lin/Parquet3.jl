@@ -56,15 +56,27 @@ decode_plain_float64(data::AbstractVector{UInt8}, count::Int) =
     reinterpret(Float64, @view data[1:8count])
 
 function decode_plain_byte_array(data::AbstractVector{UInt8}, count::Int)
-    result = Vector{Vector{UInt8}}(undef, count)
+    # Pass 1: compute element boundaries
+    elem_ptr = Vector{Int}(undef, count + 1)
+    elem_ptr[1] = 1
     pos = 1
     for i in 1:count
         len = Int(ltoh(reinterpret(UInt32, @view data[pos:pos+3])[1]))
+        pos += 4 + len
+        elem_ptr[i+1] = elem_ptr[i] + len
+    end
+
+    # Pass 2: copy data into flat buffer
+    flat = Vector{UInt8}(undef, elem_ptr[end] - 1)
+    pos = 1
+    for i in 1:count
+        len = elem_ptr[i+1] - elem_ptr[i]
         pos += 4
-        result[i] = data[pos : pos+len-1]
+        copyto!(flat, elem_ptr[i], data, pos, len)
         pos += len
     end
-    result
+
+    VectorOfVectors(flat, elem_ptr)
 end
 
 decode_plain_fixed_byte_array(data::AbstractVector{UInt8}, count::Int, type_length::Int) =

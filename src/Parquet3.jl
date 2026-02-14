@@ -1,7 +1,7 @@
 module Parquet3
 
 using Dates
-using ArraysOfArrays: nestedview
+using ArraysOfArrays: nestedview, VectorOfVectors
 using BitIntegers: @define_integers
 
 @define_integers 96
