@@ -161,7 +161,7 @@ end
 function _convert_nested_recursive(list, elem::SchemaElement)
     if isempty(list)
         T = element_julia_type(elem.type, elem.converted_type)
-        return Union{Missing, T}[]
+        return T[]
     end
 
     first_non_missing = findfirst(x -> x !== missing, list)
@@ -174,8 +174,11 @@ function _convert_nested_recursive(list, elem::SchemaElement)
     end
 
     # Leaf level -- convert primitives
-    non_missing_vals = filter(!ismissing, list)
-    converted_vals = convert_primitive_values(non_missing_vals, elem.type, elem.converted_type)
+    has_nulls = any(ismissing, list)
+    to_convert = has_nulls ? filter(!ismissing, list) : list
+    converted_vals = convert_primitive_values(to_convert, elem.type, elem.converted_type)
+
+    has_nulls || return converted_vals
 
     T = eltype(converted_vals)
     result = Vector{Union{Missing, T}}(undef, length(list))
