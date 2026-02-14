@@ -33,13 +33,11 @@ function decode_plain(ptype::ParquetType, data::AbstractVector{UInt8}, count::In
 end
 
 function decode_plain_boolean(data::AbstractVector{UInt8}, count::Int)
-    result = Vector{Bool}(undef, count)
-    for i in 1:count
-        byte_index = ((i - 1) >> 3) + 1
-        bit_index = (i - 1) & 7
-        result[i] = (data[byte_index] >> bit_index) & 1 == 1
-    end
-    result
+    bv = BitVector(undef, count)
+    fill!(bv.chunks, zero(UInt64))
+    n = min(cld(count, 8), length(data))
+    GC.@preserve bv data unsafe_copyto!(Ptr{UInt8}(pointer(bv.chunks)), pointer(data), n)
+    bv
 end
 
 function decode_plain_int32(data::AbstractVector{UInt8}, count::Int)
