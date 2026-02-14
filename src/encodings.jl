@@ -49,7 +49,7 @@ function decode_plain_int64(data::AbstractVector{UInt8}, count::Int)
 end
 
 function decode_plain_int96(data::AbstractVector{UInt8}, count::Int)
-    [data[(i-1)*12+1 : i*12] for i in 1:count]
+    reinterpret(Int96, data[1:12count])
 end
 
 function decode_plain_float32(data::AbstractVector{UInt8}, count::Int)

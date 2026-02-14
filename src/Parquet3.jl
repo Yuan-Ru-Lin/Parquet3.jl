@@ -2,6 +2,9 @@ module Parquet3
 
 using Dates
 using ArraysOfArrays: nestedview
+using BitIntegers: @define_integers
+
+@define_integers 96
 
 include("types.jl")
 include("thrift.jl")

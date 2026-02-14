@@ -183,6 +183,8 @@ function element_julia_type(ptype, ctype)
         DateTime
     elseif (T = _converted_int_type(ptype, ctype)) !== nothing
         T
+    elseif ptype == INT96
+        Int96
     elseif ptype == BOOLEAN
         Bool
     elseif ptype == INT32

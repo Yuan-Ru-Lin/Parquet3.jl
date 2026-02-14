@@ -6,6 +6,7 @@ authors = ["Yuan-Ru Lin <yuanruleonlin@gmail.com>"]
 [deps]
 ArraysOfArrays = "65a8f2f4-9b39-5baf-92e2-a9cc46fdf018"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
+BitIntegers = "c3b6d118-76ef-56ca-8cc7-ebb389d030a1"
 CodecLz4 = "5ba52731-8f18-5e0d-9241-30f10d1ec561"
 CodecZlib = "944b1d66-785c-5afd-91f1-9de20f533193"
 CodecZstd = "6b39b394-51ab-5f42-8807-6242bab2b4c2"
@@ -19,6 +20,7 @@ TypedTables = "9d95f2ec-7b3d-5a63-8d20-e2491e220bb9"
 [compat]
 ArraysOfArrays = "0.6.6"
 Base64 = "1.11.0"
+BitIntegers = "0.3.7"
 CodecLz4 = "0.4"
 CodecZlib = "0.7"
 CodecZstd = "0.7,0.8"
