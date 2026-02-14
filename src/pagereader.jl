@@ -11,8 +11,8 @@ end
 ColumnReader(io::IO, meta::ColumnMetaData, node::SchemaNode, type_len::Int=0) =
     ColumnReader(io, meta, node, type_len, nothing)
 
-struct DecodedPage{T}
-    values::Vector{T}
+struct DecodedPage{T, V<:AbstractVector{T}}
+    values::V
     def_levels::Union{Vector{Int}, Nothing}
     rep_levels::Union{Vector{Int}, Nothing}
     num_values::Int
@@ -50,12 +50,13 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
         dict === nothing && error("No dictionary for dictionary encoding")
         decode_dictionary(dict, data, count)
     elseif encoding == DELTA_BINARY_PACKED
-        decode_delta_binary_packed(data, count)
+        vals = decode_delta_binary_packed(data, count)
+        ptype == INT32 ? Int32.(vals) : vals
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
         decode_delta_length_byte_array(data, count)
     elseif encoding == BYTE_STREAM_SPLIT
-        ptype == FLOAT ? decode_byte_stream_split_float(data, count) :
-                         decode_byte_stream_split_double(data, count)
+        ptype == FLOAT ? decode_byte_stream_split_float32(data, count) :
+                         decode_byte_stream_split_float64(data, count)
     else
         error("Unsupported encoding: $encoding")
     end

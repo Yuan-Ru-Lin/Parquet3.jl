@@ -56,7 +56,7 @@ end
 
 """Read column data from all row groups."""
 function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode, schema_tree::SchemaNode)
-    type_length = something(node.element.type_length, 0)
+    type_length = Int(something(node.element.type_length, 0))
 
     all_pages = DecodedPage[]
     for rg in pf.metadata.row_groups

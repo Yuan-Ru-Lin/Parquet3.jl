@@ -262,3 +262,255 @@ table = pa.table({
         end
     end
 end
+
+# =============================================================================
+# Apache parquet-testing suite
+# =============================================================================
+
+const PARQUET_TESTING_DIR = joinpath(@__DIR__, "parquet-testing", "data")
+const HAS_PARQUET_TESTING = isdir(PARQUET_TESTING_DIR)
+
+if HAS_PARQUET_TESTING
+    @info "Running parquet-testing suite"
+
+    @testset "parquet-testing: Smoke (all files open)" begin
+        files = filter(f -> endswith(f, ".parquet"), readdir(PARQUET_TESTING_DIR))
+        for f in files
+            @testset "$f" begin
+                pf = open_parquet(joinpath(PARQUET_TESTING_DIR, f))
+                @test num_rows(pf) >= 0
+                @test length(schema(pf)) > 0
+                close(pf)
+            end
+        end
+    end
+
+    @testset "parquet-testing: Row counts" begin
+        expected_rows = Dict(
+            "alltypes_dictionary.parquet" => 2,
+            "alltypes_plain.parquet" => 8,
+            "alltypes_plain.snappy.parquet" => 2,
+            "alltypes_tiny_pages.parquet" => 7300,
+            "alltypes_tiny_pages_plain.parquet" => 7300,
+            "binary.parquet" => 12,
+            "binary_truncated_min_max.parquet" => 12,
+            "byte_array_decimal.parquet" => 24,
+            "byte_stream_split.zstd.parquet" => 300,
+            "byte_stream_split_extended.gzip.parquet" => 200,
+            "column_chunk_key_value_metadata.parquet" => 0,
+            "concatenated_gzip_members.parquet" => 513,
+            "data_index_bloom_encoding_stats.parquet" => 14,
+            "datapage_v1-uncompressed-checksum.parquet" => 5120,
+            "datapage_v1-snappy-compressed-checksum.parquet" => 5120,
+            "datapage_v2.snappy.parquet" => 5,
+            "delta_binary_packed.parquet" => 200,
+            "delta_encoding_required_column.parquet" => 100,
+            "delta_encoding_optional_column.parquet" => 100,
+            "delta_length_byte_array.parquet" => 1000,
+            "fixed_length_decimal.parquet" => 24,
+            "fixed_length_decimal_legacy.parquet" => 24,
+            "int32_decimal.parquet" => 24,
+            "int32_with_null_pages.parquet" => 1000,
+            "int64_decimal.parquet" => 24,
+            "list_columns.parquet" => 3,
+            "lz4_raw_compressed.parquet" => 4,
+            "lz4_raw_compressed_larger.parquet" => 10000,
+            "nan_in_stats.parquet" => 2,
+            "nation.dict-malformed.parquet" => 25,
+            "nested_lists.snappy.parquet" => 3,
+            "null_list.parquet" => 1,
+            "nulls.snappy.parquet" => 8,
+            "old_list_structure.parquet" => 1,
+            "overflow_i16_page_cnt.parquet" => 40000,
+            "page_v2_empty_compressed.parquet" => 10,
+            "plain-dict-uncompressed-checksum.parquet" => 1000,
+            "rle-dict-snappy-checksum.parquet" => 1000,
+            "single_nan.parquet" => 1,
+            "sort_columns.parquet" => 6,
+            "unknown-logical-type.parquet" => 3,
+        )
+        for (f, exp) in sort(collect(expected_rows))
+            @testset "$f" begin
+                pf = open_parquet(joinpath(PARQUET_TESTING_DIR, f))
+                @test Int(num_rows(pf)) == exp
+                close(pf)
+            end
+        end
+    end
+
+    @testset "parquet-testing: Full read" begin
+
+        @testset "alltypes_plain" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "alltypes_plain.parquet"))
+            @test length(Tables.columnnames(t)) == 11
+            @test t.id == Int32[4, 5, 6, 7, 2, 3, 0, 1]
+            @test t.bool_col == Bool[1, 0, 1, 0, 1, 0, 1, 0]
+            @test eltype(t.float_col) == Float32
+            @test t.float_col ≈ Float32[0, 1.1, 0, 1.1, 0, 1.1, 0, 1.1]
+            @test t.double_col ≈ [0.0, 10.1, 0.0, 10.1, 0.0, 10.1, 0.0, 10.1]
+        end
+
+        @testset "alltypes_dictionary" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "alltypes_dictionary.parquet"))
+            @test length(Tables.columnnames(t)) == 11
+            @test t.id == Int32[0, 1]
+            @test t.bool_col == Bool[true, false]
+        end
+
+        @testset "alltypes_plain.snappy" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "alltypes_plain.snappy.parquet"))
+            @test length(Tables.columnnames(t)) == 11
+            @test t.id == Int32[6, 7]
+        end
+
+        @testset "alltypes_tiny_pages" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "alltypes_tiny_pages.parquet"))
+            @test length(Tables.columnnames(t)) == 13
+            @test length(t.id) == 7300
+        end
+
+        @testset "binary" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "binary.parquet"))
+            @test length(t.foo) == 12
+        end
+
+        @testset "binary_truncated_min_max" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "binary_truncated_min_max.parquet"))
+            @test length(Tables.columnnames(t)) == 6
+            @test t.utf8_full_truncation[1] == "Blart Versenwald III"
+            @test t.utf8_no_truncation[2] == "Al"
+        end
+
+        @testset "concatenated_gzip_members" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "concatenated_gzip_members.parquet"))
+            @test length(t.long_col) == 513
+            @test t.long_col[1] == 1
+            @test t.long_col[end] == 513
+        end
+
+        @testset "lz4_raw_compressed" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "lz4_raw_compressed.parquet"))
+            @test length(Tables.columnnames(t)) == 3
+            @test t.c0 == [1593604800, 1593604800, 1593604801, 1593604801]
+            @test t.v11 ≈ [42.0, 7.7, 42.125, 7.7]
+        end
+
+        @testset "lz4_raw_compressed_larger" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "lz4_raw_compressed_larger.parquet"))
+            @test length(Tables.getcolumn(t, first(Tables.columnnames(t)))) == 10000
+        end
+
+        @testset "nan_in_stats" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "nan_in_stats.parquet"))
+            @test t.x[1] == 1.0
+            @test isnan(t.x[2])
+        end
+
+        @testset "single_nan" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "single_nan.parquet"))
+            @test t.mycol[1] === missing
+        end
+
+        @testset "nulls.snappy" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "nulls.snappy.parquet"))
+            col = Tables.getcolumn(t, first(Tables.columnnames(t)))
+            @test length(col) == 8
+            @test all(ismissing, col)
+        end
+
+        @testset "sort_columns" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "sort_columns.parquet"))
+            @test t.a[3] == 2
+            @test t.a[5] == 1
+            @test t.b == ["a", "b", "c", "a", "b", "c"]
+        end
+
+        @testset "page_v2_empty_compressed" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "page_v2_empty_compressed.parquet"))
+            @test length(t.integer_column) == 10
+            @test all(ismissing, t.integer_column)
+        end
+
+        @testset "nation.dict-malformed" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "nation.dict-malformed.parquet"))
+            @test length(Tables.columnnames(t)) == 4
+            @test length(t.nation_key) == 25
+            @test t.nation_key[1:3] == Int32[0, 1, 2]
+        end
+
+        @testset "byte_stream_split.zstd" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "byte_stream_split.zstd.parquet"))
+            @test length(Tables.columnnames(t)) == 2
+            @test length(t.f32) == 300
+            @test length(t.f64) == 300
+            @test eltype(t.f32) == Float32
+            @test eltype(t.f64) == Float64
+        end
+
+        @testset "datapage_v1 checksum files" begin
+            for f in ["datapage_v1-uncompressed-checksum.parquet",
+                       "datapage_v1-snappy-compressed-checksum.parquet",
+                       "datapage_v1-corrupt-checksum.parquet"]
+                t = read_parquet(joinpath(PARQUET_TESTING_DIR, f))
+                @test length(Tables.columnnames(t)) == 2
+                @test length(t.a) == 5120
+            end
+        end
+
+        @testset "dict encoding files" begin
+            for f in ["plain-dict-uncompressed-checksum.parquet",
+                       "rle-dict-snappy-checksum.parquet",
+                       "rle-dict-uncompressed-corrupt-checksum.parquet"]
+                t = read_parquet(joinpath(PARQUET_TESTING_DIR, f))
+                @test length(Tables.columnnames(t)) == 2
+                @test length(Tables.getcolumn(t, first(Tables.columnnames(t)))) == 1000
+            end
+        end
+
+        @testset "overflow_i16_page_cnt" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "overflow_i16_page_cnt.parquet"))
+            @test length(Tables.getcolumn(t, first(Tables.columnnames(t)))) == 40000
+        end
+
+        @testset "int32_with_null_pages" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "int32_with_null_pages.parquet"))
+            col = Tables.getcolumn(t, first(Tables.columnnames(t)))
+            @test length(col) == 1000
+            @test any(ismissing, col)
+        end
+    end
+
+    @testset "parquet-testing: Nested types" begin
+
+        @testset "nested_lists.snappy" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "nested_lists.snappy.parquet"))
+            @test length(Tables.columnnames(t)) == 2
+            a = t.a
+            @test length(a) == 3
+            @test a[1][1][1] == ["a", "b"]
+            @test a[1][1][2] == ["c"]
+            @test t.b == Int32[1, 1, 1]
+        end
+
+        @testset "null_list" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "null_list.parquet"))
+            @test length(t.emptylist) == 1
+            @test t.emptylist[1] == Int32[]
+        end
+    end
+
+    @testset "parquet-testing: Byte Stream Split cross-check" begin
+        t = read_parquet(joinpath(PARQUET_TESTING_DIR, "byte_stream_split_extended.gzip.parquet"))
+        cn = Tables.columnnames(t)
+        for base in [:float, :double]
+            plain_name = Symbol("$(base)_plain")
+            bss_name = Symbol("$(base)_byte_stream_split")
+            if plain_name in cn && bss_name in cn
+                @test Tables.getcolumn(t, plain_name) ≈ Tables.getcolumn(t, bss_name)
+            end
+        end
+    end
+
+else
+    @warn "Skipping parquet-testing suite: submodule not found at $PARQUET_TESTING_DIR"
+end
