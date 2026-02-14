@@ -1,11 +1,9 @@
-# High-level API for reading Parquet files -> Arrow Tables
-
-using Arrow: Arrow, Table
+# High-level API for reading Parquet files
 
 """
-    read_parquet(path::String; columns=nothing) -> Arrow.Table
+    read_parquet(path::String; columns=nothing) -> ParquetTable
 
-Read a Parquet file and return an Arrow Table.
+Read a Parquet file and return a ParquetTable (Tables.jl-compatible).
 """
 function read_parquet(path::String; columns::Union{Vector{String}, Nothing}=nothing)
     pf = open_parquet(path)
@@ -19,12 +17,13 @@ end
 function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=nothing)
     schema_tree = build_schema_tree(pf.metadata.schema)
     leaf_columns = get_leaf_columns(schema_tree)
+    fsl_info = parse_arrow_schema(pf.metadata.key_value_metadata)
 
     # Filter columns if specified
     if columns !== nothing
         leaf_columns = filter(leaf_columns) do (path, node)
             col_name = join(path, ".")
-            col_name in columns || path[end] in columns
+            col_name in columns || path[1] in columns || path[end] in columns
         end
     end
 
@@ -33,20 +32,26 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     col_vectors = []
 
     for (path, node) in leaf_columns
+        top_name = path[1]
         col_name = join(path, ".")
 
         try
             values, nulls = read_column_data(pf, path, node)
-            converted = convert_to_julia_type(values, nulls, node.element)
-            push!(col_names, Symbol(col_name))
+            is_nested = node.max_rep_level > 0
+
+            name, converted = if is_nested && haskey(fsl_info, top_name)
+                top_name, convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+            else
+                (is_nested ? top_name : col_name), convert_to_julia_type(values, nulls, node.element, is_nested)
+            end
+            push!(col_names, Symbol(name))
             push!(col_vectors, converted)
         catch e
             @warn "Failed to read column $col_name" exception=(e, catch_backtrace())
         end
     end
 
-    # Create Arrow Table
-    Arrow.Table(NamedTuple{Tuple(col_names)}(Tuple(col_vectors)))
+    ParquetTable(col_names, col_vectors)
 end
 
 """Read column data from all row groups."""
@@ -54,33 +59,40 @@ function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::Sc
     type_length = something(node.element.type_length, 0)
 
     all_pages = DecodedPage[]
-
     for rg in pf.metadata.row_groups
-        chunk = nothing
-        for col in rg.columns
-            if col.meta_data !== nothing && col.meta_data.path_in_schema == column_path
-                chunk = col
-                break
-            end
-        end
-
-        chunk === nothing && error("Column chunk not found: $(join(column_path, "."))")
-
-        reader = ColumnReader(pf.io, chunk.meta_data, node, type_length)
+        idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == column_path, rg.columns)
+        idx === nothing && error("Column chunk not found: $(join(column_path, "."))")
+        reader = ColumnReader(pf.io, rg.columns[idx].meta_data, node, type_length)
         append!(all_pages, read_all_pages(reader))
     end
 
     isempty(all_pages) && return ([], falses(0))
-    assemble_column(all_pages, node.max_def_level)
+    assemble_column(all_pages, node.max_def_level, node.max_rep_level)
 end
 
 """Convert Parquet values to appropriate Julia types with nulls as missing."""
-function convert_to_julia_type(values, nulls::BitVector, elem::SchemaElement)
-    ptype = elem.type
-    ctype = elem.converted_type
+function convert_to_julia_type(values, nulls::BitVector, elem::SchemaElement, is_nested::Bool=false)
+    is_nested && return convert_nested_type(values, nulls, elem)
 
-    # Convert raw values based on type
-    converted = if ctype == CT_UTF8 && ptype == BYTE_ARRAY
+    converted = convert_primitive_values(values, elem.type, elem.converted_type)
+    any(nulls) || return converted
+
+    result = Vector{Union{Missing, eltype(converted)}}(undef, length(nulls))
+    val_idx = 1
+    for i in eachindex(nulls)
+        if nulls[i]
+            result[i] = missing
+        else
+            result[i] = converted[val_idx]
+            val_idx += 1
+        end
+    end
+    result
+end
+
+"""Convert primitive values based on Parquet and converted types."""
+function convert_primitive_values(values, ptype, ctype)
+    if ctype == CT_UTF8 && ptype == BYTE_ARRAY
         [String(copy(v)) for v in values]
     elseif ctype == CT_DATE && ptype == INT32
         [Date(1970, 1, 1) + Day(v) for v in values]
@@ -89,35 +101,116 @@ function convert_to_julia_type(values, nulls::BitVector, elem::SchemaElement)
     elseif ctype == CT_TIMESTAMP_MICROS && ptype == INT64
         [DateTime(1970, 1, 1) + Microsecond(v) for v in values]
     elseif ptype == BYTE_ARRAY
-        [copy(v) for v in values]  # Keep as Vector{UInt8}
+        [copy(v) for v in values]
+    elseif (T = _converted_int_type(ptype, ctype)) !== nothing
+        T.(values)
     else
         values
     end
-
-    # Handle nulls - create vector with missing values
-    if any(nulls)
-        result = Vector{Union{Missing, eltype(converted)}}(undef, length(nulls))
-        val_idx = 1
-        for i in eachindex(nulls)
-            if nulls[i]
-                result[i] = missing
-            else
-                result[i] = converted[val_idx]
-                val_idx += 1
-            end
-        end
-        return result
-    else
-        return converted
-    end
 end
 
-"""
-    metadata(pf::ParquetFile) -> FileMetaData
+"""Map ConvertedType integer annotations to Julia types. Returns nothing if no conversion needed."""
+function _converted_int_type(ptype, ctype)
+    ctype === nothing && return nothing
+    ctype == CT_INT_8   && return Int8
+    ctype == CT_INT_16  && return Int16
+    ctype == CT_INT_32  && return Int32
+    ctype == CT_INT_64  && return Int64
+    ctype == CT_UINT_8  && return UInt8
+    ctype == CT_UINT_16 && return UInt16
+    ctype == CT_UINT_32 && return UInt32
+    ctype == CT_UINT_64 && return UInt64
+    nothing
+end
 
-Get the file metadata.
-"""
-metadata(pf::ParquetFile) = pf.metadata
+"""Convert a FixedSizeList column to an ArrayOfSimilarArrays (backed by list_size × nrows Matrix)."""
+function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int)
+    ptype = elem.type
+    ctype = elem.converted_type
+    T = element_julia_type(ptype, ctype)
+    nrows = length(values)
+
+    mat = Matrix{T}(undef, list_size, nrows)
+    for row in 1:nrows
+        inner = values[row]
+        for col in 1:list_size
+            v = inner[col]
+            mat[col, row] = v === missing ? zero(T) : convert(T, v)
+        end
+    end
+    nestedview(mat)
+end
+
+"""Convert nested (list) column values."""
+function convert_nested_type(values, nulls::BitVector, elem::SchemaElement)
+    converted = map(v -> _convert_nested_recursive(v, elem), values)
+    any(nulls) || return converted
+
+    T = isempty(converted) ? Any : eltype(first(converted))
+    result = Vector{Union{Missing, Vector{T}}}(undef, length(nulls))
+    for i in eachindex(nulls)
+        result[i] = nulls[i] ? missing : converted[i]
+    end
+    result
+end
+
+"""Recursively convert nested list values, applying type conversion only at leaf level."""
+function _convert_nested_recursive(list, elem::SchemaElement)
+    isempty(list) && return list
+
+    first_non_missing = findfirst(x -> x !== missing, list)
+    first_non_missing === nothing && return list
+
+    # Recurse into sub-lists (but not raw byte arrays)
+    sample = list[first_non_missing]
+    if sample isa AbstractVector && !(sample isa Vector{UInt8})
+        return map(x -> x === missing ? missing : _convert_nested_recursive(x, elem), list)
+    end
+
+    # Leaf level -- convert primitives
+    non_missing_vals = filter(!ismissing, list)
+    converted_vals = convert_primitive_values(non_missing_vals, elem.type, elem.converted_type)
+
+    T = eltype(converted_vals)
+    result = Vector{Union{Missing, T}}(undef, length(list))
+    conv_idx = 1
+    for i in eachindex(list)
+        if list[i] === missing
+            result[i] = missing
+        else
+            result[i] = converted_vals[conv_idx]
+            conv_idx += 1
+        end
+    end
+    result
+end
+
+"""Get Julia type for a Parquet primitive type."""
+function element_julia_type(ptype, ctype)
+    if ctype == CT_UTF8 && ptype == BYTE_ARRAY
+        String
+    elseif ctype == CT_DATE && ptype == INT32
+        Date
+    elseif ctype in (CT_TIMESTAMP_MILLIS, CT_TIMESTAMP_MICROS) && ptype == INT64
+        DateTime
+    elseif (T = _converted_int_type(ptype, ctype)) !== nothing
+        T
+    elseif ptype == BOOLEAN
+        Bool
+    elseif ptype == INT32
+        Int32
+    elseif ptype == INT64
+        Int64
+    elseif ptype == FLOAT
+        Float32
+    elseif ptype == DOUBLE
+        Float64
+    elseif ptype == BYTE_ARRAY
+        Vector{UInt8}
+    else
+        Any
+    end
+end
 
 """
     schema_string(pf::ParquetFile) -> String

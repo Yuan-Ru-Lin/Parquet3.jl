@@ -1,49 +1,16 @@
 # Page reader for Parquet column data
 
-"""
-    ColumnReader
-
-Reads pages from a column chunk and decodes the data.
-"""
 mutable struct ColumnReader
     io::IO
     meta::ColumnMetaData
     schema_node::SchemaNode
-    type_length::Int  # For FIXED_LEN_BYTE_ARRAY
-
-    # Current state
+    type_length::Int
     dictionary::Union{DictionaryDecoder, Nothing}
-    pages_read::Int
-    values_read::Int64
 end
 
-function ColumnReader(io::IO, meta::ColumnMetaData, schema_node::SchemaNode, type_length::Int=0)
-    ColumnReader(io, meta, schema_node, type_length, nothing, 0, 0)
-end
+ColumnReader(io::IO, meta::ColumnMetaData, node::SchemaNode, type_len::Int=0) =
+    ColumnReader(io, meta, node, type_len, nothing)
 
-"""Read a page header from the current position."""
-function read_page_header(io::IO)::PageHeader
-    # Read enough bytes for the header (headers are typically small)
-    # We need to read incrementally since we don't know the size
-    start_pos = position(io)
-
-    # Read up to 1KB for header (should be more than enough)
-    header_data = read(io, min(1024, filesize(io) - start_pos))
-
-    decoder = ThriftDecoder(header_data)
-    header = parse_page_header(decoder)
-
-    # Seek back to just after the header
-    seek(io, start_pos + decoder.pos - 1)
-
-    header
-end
-
-"""
-    DecodedPage
-
-Represents decoded data from a page.
-"""
 struct DecodedPage{T}
     values::Vector{T}
     def_levels::Union{Vector{Int}, Nothing}
@@ -51,281 +18,178 @@ struct DecodedPage{T}
     num_values::Int
 end
 
-"""Read and decode definition levels."""
-function read_levels(data::Vector{UInt8}, count::Int, max_level::Int, encoding::Encoding)::Tuple{Vector{Int}, Int}
-    if max_level == 0
-        return (zeros(Int, count), 0)
-    end
+function read_page_header(io::IO)::Tuple{PageHeader, Int}
+    start = position(io)
+    data = read(io, min(1024, max(0, filesize(io) - start)))
+    decoder = ThriftDecoder(data)
+    header = parse_page_header(decoder)
+    seek(io, start + decoder.pos - 1)
+    (header, decoder.pos - 1)
+end
 
-    bit_width = ceil(Int, log2(max_level + 1))
-    bit_width = max(1, bit_width)
+function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, encoding::Encoding)
+    max_level == 0 && return (zeros(Int, count), 0)
+
+    bit_width = max(1, ceil(Int, log2(max_level + 1)))
 
     if encoding == RLE
-        # RLE/Bit-packed hybrid with length prefix
-        len = ltoh(reinterpret(UInt32, data[1:4])[1])
-        levels_data = data[5:4+len]
-        levels = decode_rle_bitpacked(levels_data, count, bit_width)
+        len = ltoh(reinterpret(UInt32, @view data[1:4])[1])
+        levels = decode_rle_bitpacked(@view(data[5:4+len]), count, bit_width)
         return (Int.(levels), 4 + Int(len))
     else
-        # BIT_PACKED (deprecated but may appear)
-        bytes_needed = cld(count * bit_width, 8)
-        levels = unpack_bits(data[1:bytes_needed], count, bit_width)
-        return (Int.(levels), bytes_needed)
+        bytes = cld(count * bit_width, 8)
+        levels = unpack_bits(@view(data[1:bytes]), count, bit_width)
+        return (Int.(levels), bytes)
     end
 end
 
-"""Decode values from a data page based on encoding and type."""
-function decode_values(
-    data::Vector{UInt8},
-    count::Int,
-    parquet_type::ParquetType,
-    encoding::Encoding,
-    type_length::Int,
-    dictionary::Union{DictionaryDecoder, Nothing}
-)
+function decode_values(data, count, ptype, encoding, type_len, dict)
     if encoding == PLAIN
-        return decode_plain_values(data, count, parquet_type, type_length)
-    elseif encoding == PLAIN_DICTIONARY || encoding == RLE_DICTIONARY
-        if dictionary === nothing
-            error("Dictionary encoding but no dictionary available")
-        end
-        return decode_dictionary_page(dictionary, data, count)
+        collect(decode_plain(ptype, data, count, type_len))
+    elseif encoding in (PLAIN_DICTIONARY, RLE_DICTIONARY)
+        dict === nothing && error("No dictionary for dictionary encoding")
+        decode_dictionary(dict, data, count)
     elseif encoding == DELTA_BINARY_PACKED
-        return decode_delta_binary_packed(data, count)
+        decode_delta_binary_packed(data, count)
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
-        return decode_delta_length_byte_array(data, count)
-    elseif encoding == DELTA_BYTE_ARRAY
-        return decode_delta_byte_array(data, count)
+        decode_delta_length_byte_array(data, count)
     elseif encoding == BYTE_STREAM_SPLIT
-        if parquet_type == FLOAT
-            return decode_byte_stream_split_float(data, count)
-        elseif parquet_type == DOUBLE
-            return decode_byte_stream_split_double(data, count)
-        else
-            error("BYTE_STREAM_SPLIT only supported for FLOAT/DOUBLE")
-        end
+        ptype == FLOAT ? decode_byte_stream_split_float(data, count) :
+                         decode_byte_stream_split_double(data, count)
     else
         error("Unsupported encoding: $encoding")
     end
 end
 
-"""Decode plain-encoded values based on type."""
-function decode_plain_values(data::Vector{UInt8}, count::Int, parquet_type::ParquetType, type_length::Int)
-    if parquet_type == BOOLEAN
-        return decode_plain_boolean(data, count)
-    elseif parquet_type == INT32
-        return decode_plain_int32(data, count)
-    elseif parquet_type == INT64
-        return decode_plain_int64(data, count)
-    elseif parquet_type == INT96
-        return decode_plain_int96(data, count)
-    elseif parquet_type == FLOAT
-        return decode_plain_float(data, count)
-    elseif parquet_type == DOUBLE
-        return decode_plain_double(data, count)
-    elseif parquet_type == BYTE_ARRAY
-        return decode_plain_byte_array(data, count)
-    elseif parquet_type == FIXED_LEN_BYTE_ARRAY
-        return decode_plain_fixed_byte_array(data, count, type_length)
-    else
-        error("Unknown parquet type: $parquet_type")
-    end
-end
-
-"""Read and decode a single page from a column chunk."""
-function read_page(reader::ColumnReader)::Union{DecodedPage, Nothing}
+function read_page(reader::ColumnReader)
     meta = reader.meta
+    chunk_end = something(meta.dictionary_page_offset, meta.data_page_offset) + meta.total_compressed_size
+    position(reader.io) >= chunk_end && return nothing
 
-    # Calculate end of column chunk data
-    chunk_start = something(meta.dictionary_page_offset, meta.data_page_offset)
-    chunk_end = chunk_start + meta.total_compressed_size
-
-    if position(reader.io) >= chunk_end
-        return nothing
-    end
-
-    # Read page header
-    header = read_page_header(reader.io)
-
-    # Read page data
+    header, _ = read_page_header(reader.io)
     page_data = read(reader.io, header.compressed_page_size)
 
-    # Decompress if needed
-    if header.compressed_page_size != header.uncompressed_page_size
+    # Decompress for DICTIONARY_PAGE and DATA_PAGE (v1) — entire page is compressed.
+    # DATA_PAGE_V2 handles decompression of data portion separately.
+    if header.type != DATA_PAGE_V2 && meta.codec != UNCOMPRESSED
         page_data = decompress(page_data, meta.codec, Int(header.uncompressed_page_size))
     end
 
     if header.type == DICTIONARY_PAGE
-        # Parse dictionary page
-        dict_header = header.dictionary_page_header
-        num_values = dict_header.num_values
-
-        # Find type_length for FIXED_LEN_BYTE_ARRAY
-        type_length = reader.type_length
-
-        reader.dictionary = DictionaryDecoder(page_data, Int(num_values), meta.type, type_length)
-        reader.pages_read += 1
-
-        # Recursively read next page (should be data page)
+        dh = header.dictionary_page_header
+        reader.dictionary = DictionaryDecoder(page_data, Int(dh.num_values), meta.type, reader.type_length)
         return read_page(reader)
+    end
 
-    elseif header.type == DATA_PAGE
-        data_header = header.data_page_header
-        num_values = data_header.num_values
+    max_def = reader.schema_node.max_def_level
+    max_rep = reader.schema_node.max_rep_level
 
+    if header.type == DATA_PAGE
+        dh = header.data_page_header
+        nv = Int(dh.num_values)
         pos = 1
-        def_levels = nothing
+
         rep_levels = nothing
+        def_levels = nothing
 
-        max_def = reader.schema_node.max_def_level
-        max_rep = reader.schema_node.max_rep_level
-
-        # Read repetition levels
         if max_rep > 0
-            rep_levels, bytes_read = read_levels(
-                page_data[pos:end], Int(num_values), max_rep,
-                data_header.repetition_level_encoding
-            )
-            pos += bytes_read
+            rep_levels, bytes = read_levels(@view(page_data[pos:end]), nv, max_rep, dh.repetition_level_encoding)
+            pos += bytes
         end
-
-        # Read definition levels
         if max_def > 0
-            def_levels, bytes_read = read_levels(
-                page_data[pos:end], Int(num_values), max_def,
-                data_header.definition_level_encoding
-            )
-            pos += bytes_read
+            def_levels, bytes = read_levels(@view(page_data[pos:end]), nv, max_def, dh.definition_level_encoding)
+            pos += bytes
         end
 
-        # Count non-null values
-        num_non_null = if def_levels !== nothing
-            count(d -> d == max_def, def_levels)
-        else
-            Int(num_values)
-        end
+        non_null = def_levels === nothing ? nv : count(==(max_def), def_levels)
+        values = decode_values(@view(page_data[pos:end]), non_null, meta.type, dh.encoding, reader.type_length, reader.dictionary)
 
-        # Decode values
-        values = decode_values(
-            page_data[pos:end],
-            num_non_null,
-            meta.type,
-            data_header.encoding,
-            reader.type_length,
-            reader.dictionary
-        )
-
-        reader.pages_read += 1
-        reader.values_read += num_values
-
-        return DecodedPage(values, def_levels, rep_levels, Int(num_values))
+        return DecodedPage(values, def_levels, rep_levels, nv)
 
     elseif header.type == DATA_PAGE_V2
-        data_header = header.data_page_header_v2
-        num_values = data_header.num_values
-
+        dh = header.data_page_header_v2
+        nv = Int(dh.num_values)
         pos = 1
-        def_levels = nothing
+
         rep_levels = nothing
+        def_levels = nothing
 
-        max_def = reader.schema_node.max_def_level
-        max_rep = reader.schema_node.max_rep_level
-
-        # In V2, rep and def levels are not compressed
-        rep_bytes = data_header.repetition_levels_byte_length
-        def_bytes = data_header.definition_levels_byte_length
-
-        # Read repetition levels (RLE encoded, no length prefix in V2)
-        if max_rep > 0 && rep_bytes > 0
-            bit_width = ceil(Int, log2(max_rep + 1))
-            bit_width = max(1, bit_width)
-            rep_levels = Int.(decode_rle_bitpacked(page_data[pos:pos+rep_bytes-1], Int(num_values), bit_width))
-            pos += rep_bytes
+        if max_rep > 0 && dh.repetition_levels_byte_length > 0
+            bw = max(1, ceil(Int, log2(max_rep + 1)))
+            rep_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.repetition_levels_byte_length-1]), nv, bw))
+            pos += dh.repetition_levels_byte_length
+        end
+        if max_def > 0 && dh.definition_levels_byte_length > 0
+            bw = max(1, ceil(Int, log2(max_def + 1)))
+            def_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.definition_levels_byte_length-1]), nv, bw))
+            pos += dh.definition_levels_byte_length
         end
 
-        # Read definition levels
-        if max_def > 0 && def_bytes > 0
-            bit_width = ceil(Int, log2(max_def + 1))
-            bit_width = max(1, bit_width)
-            def_levels = Int.(decode_rle_bitpacked(page_data[pos:pos+def_bytes-1], Int(num_values), bit_width))
-            pos += def_bytes
+        data_part = @view page_data[pos:end]
+        if dh.is_compressed && meta.codec != UNCOMPRESSED
+            expected = header.uncompressed_page_size - dh.repetition_levels_byte_length - dh.definition_levels_byte_length
+            data_part = decompress(collect(data_part), meta.codec, Int(expected))
         end
 
-        # Decompress data portion if needed
-        data_portion = page_data[pos:end]
-        if data_header.is_compressed && meta.codec != UNCOMPRESSED
-            expected_size = header.uncompressed_page_size - rep_bytes - def_bytes
-            data_portion = decompress(data_portion, meta.codec, Int(expected_size))
-        end
+        non_null = nv - Int(dh.num_nulls)
+        values = decode_values(data_part, non_null, meta.type, dh.encoding, reader.type_length, reader.dictionary)
 
-        # Count non-null values
-        num_non_null = Int(num_values) - Int(data_header.num_nulls)
-
-        # Decode values
-        values = decode_values(
-            data_portion,
-            num_non_null,
-            meta.type,
-            data_header.encoding,
-            reader.type_length,
-            reader.dictionary
-        )
-
-        reader.pages_read += 1
-        reader.values_read += num_values
-
-        return DecodedPage(values, def_levels, rep_levels, Int(num_values))
+        return DecodedPage(values, def_levels, rep_levels, nv)
     else
-        # Skip unknown page types
         return read_page(reader)
     end
 end
 
-"""Read all pages from a column chunk."""
-function read_all_pages(reader::ColumnReader)::Vector{DecodedPage}
+function read_all_pages(reader::ColumnReader)
+    start = something(reader.meta.dictionary_page_offset, reader.meta.data_page_offset)
+    seek(reader.io, start)
+
     pages = DecodedPage[]
-
-    # Seek to start of column data
-    start_offset = something(reader.meta.dictionary_page_offset, reader.meta.data_page_offset)
-    seek(reader.io, start_offset)
-
     while true
         page = read_page(reader)
         page === nothing && break
         push!(pages, page)
     end
-
     pages
 end
 
 """
-    assemble_column(pages::Vector{DecodedPage}, max_def::Int) -> (values, nulls)
+    assemble_column(pages, max_def, max_rep) -> (values, nulls) or nested structure
 
-Assemble column values from decoded pages, handling nulls based on definition levels.
-Returns a vector of values and a BitVector indicating null positions.
+Reconstruct column data from decoded pages. Handles:
+- Flat columns (max_rep = 0)
+- List columns (max_rep > 0) - returns Vector{Vector{T}}
 """
-function assemble_column(pages::Vector{DecodedPage{T}}, max_def::Int) where T
-    total_values = sum(p.num_values for p in pages)
-    values = Vector{T}(undef, total_values)
-    nulls = falses(total_values)
+function assemble_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int=0)
+    isempty(pages) && return ([], falses(0))
 
-    out_idx = 1
+    # Flat column - simple assembly
+    if max_rep == 0
+        return assemble_flat_column(pages, max_def)
+    end
+
+    # Nested column - reconstruct lists
+    return assemble_nested_column(pages, max_def, max_rep)
+end
+
+"""Assemble a flat (non-repeated) column."""
+function assemble_flat_column(pages::Vector{<:DecodedPage}, max_def::Int)
+    total = sum(p.num_values for p in pages)
+    T = eltype(first(pages).values)
+    values = Vector{T}(undef, total)
+    nulls = falses(total)
+
+    out = 1
     for page in pages
-        value_idx = 1
+        val = 1
         for i in 1:page.num_values
-            if page.def_levels !== nothing
-                def = page.def_levels[i]
-                if def < max_def
-                    # Null value
-                    nulls[out_idx] = true
-                    out_idx += 1
-                    continue
-                end
+            if page.def_levels !== nothing && page.def_levels[i] < max_def
+                nulls[out] = true
+            else
+                values[out] = page.values[val]
+                val += 1
             end
-
-            values[out_idx] = page.values[value_idx]
-            value_idx += 1
-            out_idx += 1
+            out += 1
         end
     end
 
@@ -333,47 +197,179 @@ function assemble_column(pages::Vector{DecodedPage{T}}, max_def::Int) where T
 end
 
 """
-    assemble_nested(pages::Vector{DecodedPage}, max_def::Int, max_rep::Int)
+    assemble_nested_column(pages, max_def, max_rep) -> (nested_values, nulls)
 
-Assemble nested data from decoded pages using repetition and definition levels.
-Returns a vector of vectors (for repeated fields) or handles optionality.
+Reconstruct nested lists using repetition and definition levels.
+Handles arbitrary nesting depth based on max_rep.
+- max_rep = 1: Vector{Vector{T}} (single list)
+- max_rep = 2: Vector{Vector{Vector{T}}} (list of lists)
+- etc.
 """
-function assemble_nested(pages::Vector{DecodedPage{T}}, max_def::Int, max_rep::Int) where T
-    if max_rep == 0
-        # Not repeated, just handle nulls
-        return assemble_column(pages, max_def)
-    end
+function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int)
+    T = eltype(first(pages).values)
 
-    # Repeated field: build list structure
-    result = Vector{Vector{Union{T, Nothing}}}()
-    current_list = Union{T, Nothing}[]
+    # Collect all rep/def levels and values
+    all_rep = Int[]
+    all_def = Int[]
+    all_values = T[]
 
     for page in pages
-        value_idx = 1
-        for i in 1:page.num_values
-            rep_level = page.rep_levels !== nothing ? page.rep_levels[i] : 0
-            def_level = page.def_levels !== nothing ? page.def_levels[i] : max_def
+        if page.rep_levels !== nothing
+            append!(all_rep, page.rep_levels)
+        else
+            append!(all_rep, zeros(Int, page.num_values))
+        end
 
-            if rep_level == 0 && !isempty(current_list)
-                # New record, save previous list
-                push!(result, current_list)
-                current_list = Union{T, Nothing}[]
-            end
+        if page.def_levels !== nothing
+            append!(all_def, page.def_levels)
+        else
+            append!(all_def, fill(max_def, page.num_values))
+        end
 
-            if def_level < max_def
-                # Null value
-                push!(current_list, nothing)
-            else
-                push!(current_list, page.values[value_idx])
-                value_idx += 1
+        append!(all_values, page.values)
+    end
+
+    isempty(all_rep) && return ([], falses(0))
+
+    # For single-level nesting, use optimized path
+    if max_rep == 1
+        return assemble_single_nested(all_rep, all_def, all_values, max_def, T)
+    end
+
+    # For deeper nesting, use recursive approach
+    return assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, T)
+end
+
+"""Optimized assembly for single-level nesting (List<T>)."""
+function assemble_single_nested(all_rep, all_def, all_values, max_def, ::Type{T}) where T
+    num_records = count(==(0), all_rep)
+    result = Vector{Vector{Union{Missing, T}}}(undef, num_records)
+    record_nulls = falses(num_records)
+
+    record_idx = 0
+    value_idx = 1
+    current_list = Union{Missing, T}[]
+
+    for i in eachindex(all_rep)
+        rep = all_rep[i]
+        def = all_def[i]
+
+        if rep == 0
+            if record_idx > 0
+                result[record_idx] = current_list
             end
+            record_idx += 1
+            current_list = Union{Missing, T}[]
+
+            if def == 0 && max_def > 0
+                record_nulls[record_idx] = true
+                continue
+            end
+        end
+
+        if def == max_def
+            push!(current_list, all_values[value_idx])
+            value_idx += 1
+        elseif def > 0
+            push!(current_list, missing)
         end
     end
 
-    # Don't forget the last list
-    if !isempty(current_list)
-        push!(result, current_list)
+    if record_idx > 0 && record_idx <= num_records
+        result[record_idx] = current_list
     end
 
-    result
+    (result, record_nulls)
+end
+
+"""
+Assembly for deeply nested structures (List<List<T>>, etc.).
+
+Uses a stack-based approach:
+- Stack has max_rep levels, each holding a list being built
+- rep_level = k means: finalize and push lists at levels > k, start new lists at level k
+"""
+function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}) where T
+    num_records = count(==(0), all_rep)
+
+    # Result is the outermost list of records
+    records = []
+    record_nulls = falses(num_records)
+
+    # Stack of lists being built, indexed by rep level (1 to max_rep)
+    # Level 1 = outermost list (per record), Level max_rep = innermost list
+    ListType = Vector{Union{Missing, T}}
+    for level in max_rep-1:-1:1
+        ListType = Vector{Union{Missing, ListType}}
+    end
+
+    # Initialize stack - each level holds current list being built
+    stack = Vector{Any}(undef, max_rep)
+    for level in 1:max_rep
+        stack[level] = []
+    end
+
+    record_idx = 0
+    value_idx = 1
+
+    function finalize_level(level)
+        # Push current list at `level` into parent (level-1)
+        if level > 1
+            push!(stack[level-1], stack[level])
+        end
+        stack[level] = []
+    end
+
+    function finalize_from(start_level)
+        # Finalize all levels from innermost up to start_level
+        for level in max_rep:-1:start_level
+            finalize_level(level)
+        end
+    end
+
+    function save_record()
+        if record_idx > 0
+            # Finalize all levels and save to records
+            finalize_from(2)
+            push!(records, stack[1])
+            stack[1] = []
+        end
+    end
+
+    for i in eachindex(all_rep)
+        rep = all_rep[i]
+        def = all_def[i]
+
+        if rep == 0
+            # New record - save previous and reset all levels
+            save_record()
+            record_idx += 1
+
+            # Check for null record
+            if def == 0 && max_def > 0
+                record_nulls[record_idx] = true
+                push!(records, missing)
+                continue
+            end
+        elseif rep < max_rep
+            # Repeat at level rep+1 - finalize levels > rep, start new at rep+1
+            finalize_from(rep + 1)
+        end
+        # rep == max_rep means continue innermost list
+
+        # Add value to innermost list
+        if def == max_def
+            push!(stack[max_rep], all_values[value_idx])
+            value_idx += 1
+        elseif def > 0
+            # Null at some level - add missing to innermost for now
+            # More sophisticated handling would track which level is null
+            push!(stack[max_rep], missing)
+        end
+    end
+
+    # Save last record
+    save_record()
+
+    (records, record_nulls)
 end

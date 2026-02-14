@@ -1,6 +1,5 @@
-# Parquet types and enums based on parquet.thrift specification
+# Parquet types and enums
 
-"""Parquet physical types"""
 @enum ParquetType::Int32 begin
     BOOLEAN = 0
     INT32 = 1
@@ -12,7 +11,6 @@
     FIXED_LEN_BYTE_ARRAY = 7
 end
 
-"""Converted types for logical type mapping"""
 @enum ConvertedType::Int32 begin
     CT_NONE = -1
     CT_UTF8 = 0
@@ -39,17 +37,10 @@ end
     CT_INTERVAL = 21
 end
 
-"""Field repetition types"""
-@enum FieldRepetitionType::Int32 begin
-    REQUIRED = 0
-    OPTIONAL = 1
-    REPEATED = 2
-end
+@enum FieldRepetitionType::Int32 REQUIRED=0 OPTIONAL=1 REPEATED=2
 
-"""Encoding types"""
 @enum Encoding::Int32 begin
     PLAIN = 0
-    # GROUP_VAR_INT = 1  # deprecated
     PLAIN_DICTIONARY = 2
     RLE = 3
     BIT_PACKED = 4
@@ -60,7 +51,6 @@ end
     BYTE_STREAM_SPLIT = 9
 end
 
-"""Compression codecs"""
 @enum CompressionCodec::Int32 begin
     UNCOMPRESSED = 0
     SNAPPY = 1
@@ -72,177 +62,118 @@ end
     LZ4_RAW = 7
 end
 
-"""Page types"""
-@enum PageType::Int32 begin
-    DATA_PAGE = 0
-    INDEX_PAGE = 1
-    DICTIONARY_PAGE = 2
-    DATA_PAGE_V2 = 3
-end
+@enum PageType::Int32 DATA_PAGE=0 INDEX_PAGE=1 DICTIONARY_PAGE=2 DATA_PAGE_V2=3
 
-"""Boundary order for statistics"""
-@enum BoundaryOrder::Int32 begin
-    UNORDERED = 0
-    ASCENDING = 1
-    DESCENDING = 2
-end
-
-# Thrift field IDs for Parquet structures
 const PARQUET_MAGIC = UInt8[0x50, 0x41, 0x52, 0x31]  # "PAR1"
 
-"""Schema element in Parquet file"""
-mutable struct SchemaElement
-    type::Union{ParquetType, Nothing}
-    type_length::Union{Int32, Nothing}
-    repetition_type::Union{FieldRepetitionType, Nothing}
-    name::String
-    num_children::Union{Int32, Nothing}
-    converted_type::Union{ConvertedType, Nothing}
-    scale::Union{Int32, Nothing}
-    precision::Union{Int32, Nothing}
-    field_id::Union{Int32, Nothing}
-    # logical_type omitted for simplicity initially
+#=============================================================================
+# Metadata structs using @kwdef for clean keyword constructors
+=============================================================================#
+
+@kwdef struct SchemaElement
+    type::Union{ParquetType, Nothing} = nothing
+    type_length::Union{Int32, Nothing} = nothing
+    repetition_type::Union{FieldRepetitionType, Nothing} = nothing
+    name::String = ""
+    num_children::Union{Int32, Nothing} = nothing
+    converted_type::Union{ConvertedType, Nothing} = nothing
+    scale::Union{Int32, Nothing} = nothing
+    precision::Union{Int32, Nothing} = nothing
+    field_id::Union{Int32, Nothing} = nothing
 end
 
-SchemaElement() = SchemaElement(nothing, nothing, nothing, "", nothing, nothing, nothing, nothing, nothing)
-
-"""Statistics for a column chunk or page"""
-mutable struct Statistics
-    max::Union{Vector{UInt8}, Nothing}
-    min::Union{Vector{UInt8}, Nothing}
-    null_count::Union{Int64, Nothing}
-    distinct_count::Union{Int64, Nothing}
-    max_value::Union{Vector{UInt8}, Nothing}
-    min_value::Union{Vector{UInt8}, Nothing}
+@kwdef struct Statistics
+    max::Union{Vector{UInt8}, Nothing} = nothing
+    min::Union{Vector{UInt8}, Nothing} = nothing
+    null_count::Union{Int64, Nothing} = nothing
+    distinct_count::Union{Int64, Nothing} = nothing
+    max_value::Union{Vector{UInt8}, Nothing} = nothing
+    min_value::Union{Vector{UInt8}, Nothing} = nothing
 end
 
-Statistics() = Statistics(nothing, nothing, nothing, nothing, nothing, nothing)
-
-"""Page encoding statistics"""
-mutable struct PageEncodingStats
-    page_type::PageType
-    encoding::Encoding
-    count::Int32
+@kwdef struct ColumnMetaData
+    type::ParquetType = BOOLEAN
+    encodings::Vector{Encoding} = Encoding[]
+    path_in_schema::Vector{String} = String[]
+    codec::CompressionCodec = UNCOMPRESSED
+    num_values::Int64 = 0
+    total_uncompressed_size::Int64 = 0
+    total_compressed_size::Int64 = 0
+    data_page_offset::Int64 = 0
+    index_page_offset::Union{Int64, Nothing} = nothing
+    dictionary_page_offset::Union{Int64, Nothing} = nothing
+    statistics::Union{Statistics, Nothing} = nothing
 end
 
-"""Column metadata within a row group"""
-mutable struct ColumnMetaData
-    type::ParquetType
-    encodings::Vector{Encoding}
-    path_in_schema::Vector{String}
-    codec::CompressionCodec
-    num_values::Int64
-    total_uncompressed_size::Int64
-    total_compressed_size::Int64
-    key_value_metadata::Union{Vector{Pair{String,String}}, Nothing}
-    data_page_offset::Int64
-    index_page_offset::Union{Int64, Nothing}
-    dictionary_page_offset::Union{Int64, Nothing}
-    statistics::Union{Statistics, Nothing}
-    encoding_stats::Union{Vector{PageEncodingStats}, Nothing}
+@kwdef struct ColumnChunk
+    file_path::Union{String, Nothing} = nothing
+    file_offset::Int64 = 0
+    meta_data::Union{ColumnMetaData, Nothing} = nothing
 end
 
-ColumnMetaData() = ColumnMetaData(
-    BOOLEAN, Encoding[], String[], UNCOMPRESSED,
-    0, 0, 0, nothing, 0, nothing, nothing, nothing, nothing
-)
-
-"""Column chunk information"""
-mutable struct ColumnChunk
-    file_path::Union{String, Nothing}
-    file_offset::Int64
-    meta_data::Union{ColumnMetaData, Nothing}
-    offset_index_offset::Union{Int64, Nothing}
-    offset_index_length::Union{Int32, Nothing}
-    column_index_offset::Union{Int64, Nothing}
-    column_index_length::Union{Int32, Nothing}
+@kwdef struct RowGroup
+    columns::Vector{ColumnChunk} = ColumnChunk[]
+    total_byte_size::Int64 = 0
+    num_rows::Int64 = 0
+    file_offset::Union{Int64, Nothing} = nothing
+    total_compressed_size::Union{Int64, Nothing} = nothing
 end
 
-ColumnChunk() = ColumnChunk(nothing, 0, nothing, nothing, nothing, nothing, nothing)
-
-"""Sorting column specification"""
-mutable struct SortingColumn
-    column_idx::Int32
-    descending::Bool
-    nulls_first::Bool
+@kwdef struct KeyValue
+    key::String = ""
+    value::Union{String, Nothing} = nothing
 end
 
-"""Row group metadata"""
-mutable struct RowGroup
-    columns::Vector{ColumnChunk}
-    total_byte_size::Int64
-    num_rows::Int64
-    sorting_columns::Union{Vector{SortingColumn}, Nothing}
-    file_offset::Union{Int64, Nothing}
-    total_compressed_size::Union{Int64, Nothing}
-    ordinal::Union{Int16, Nothing}
+@kwdef struct FileMetaData
+    version::Int32 = 0
+    schema::Vector{SchemaElement} = SchemaElement[]
+    num_rows::Int64 = 0
+    row_groups::Vector{RowGroup} = RowGroup[]
+    key_value_metadata::Union{Vector{KeyValue}, Nothing} = nothing
+    created_by::Union{String, Nothing} = nothing
 end
 
-RowGroup() = RowGroup(ColumnChunk[], 0, 0, nothing, nothing, nothing, nothing)
-
-"""Key-value metadata"""
-struct KeyValue
-    key::String
-    value::Union{String, Nothing}
+@kwdef struct DataPageHeader
+    num_values::Int32 = 0
+    encoding::Encoding = PLAIN
+    definition_level_encoding::Encoding = RLE
+    repetition_level_encoding::Encoding = RLE
+    statistics::Union{Statistics, Nothing} = nothing
 end
 
-"""File metadata (footer)"""
-mutable struct FileMetaData
-    version::Int32
-    schema::Vector{SchemaElement}
-    num_rows::Int64
-    row_groups::Vector{RowGroup}
-    key_value_metadata::Union{Vector{KeyValue}, Nothing}
-    created_by::Union{String, Nothing}
-    column_orders::Union{Vector{Int}, Nothing}  # simplified
+@kwdef struct DataPageHeaderV2
+    num_values::Int32 = 0
+    num_nulls::Int32 = 0
+    num_rows::Int32 = 0
+    encoding::Encoding = PLAIN
+    definition_levels_byte_length::Int32 = 0
+    repetition_levels_byte_length::Int32 = 0
+    is_compressed::Bool = true
+    statistics::Union{Statistics, Nothing} = nothing
 end
 
-FileMetaData() = FileMetaData(0, SchemaElement[], 0, RowGroup[], nothing, nothing, nothing)
-
-"""Data page header"""
-mutable struct DataPageHeader
-    num_values::Int32
-    encoding::Encoding
-    definition_level_encoding::Encoding
-    repetition_level_encoding::Encoding
-    statistics::Union{Statistics, Nothing}
+@kwdef struct DictionaryPageHeader
+    num_values::Int32 = 0
+    encoding::Encoding = PLAIN_DICTIONARY
+    is_sorted::Bool = false
 end
 
-DataPageHeader() = DataPageHeader(0, PLAIN, RLE, RLE, nothing)
-
-"""Data page header V2"""
-mutable struct DataPageHeaderV2
-    num_values::Int32
-    num_nulls::Int32
-    num_rows::Int32
-    encoding::Encoding
-    definition_levels_byte_length::Int32
-    repetition_levels_byte_length::Int32
-    is_compressed::Bool
-    statistics::Union{Statistics, Nothing}
+@kwdef struct PageHeader
+    type::PageType = DATA_PAGE
+    uncompressed_page_size::Int32 = 0
+    compressed_page_size::Int32 = 0
+    crc::Union{Int32, Nothing} = nothing
+    data_page_header::Union{DataPageHeader, Nothing} = nothing
+    dictionary_page_header::Union{DictionaryPageHeader, Nothing} = nothing
+    data_page_header_v2::Union{DataPageHeaderV2, Nothing} = nothing
 end
 
-DataPageHeaderV2() = DataPageHeaderV2(0, 0, 0, PLAIN, 0, 0, true, nothing)
-
-"""Dictionary page header"""
-mutable struct DictionaryPageHeader
-    num_values::Int32
-    encoding::Encoding
-    is_sorted::Bool
+@kwdef struct SchemaNode
+    element::SchemaElement
+    children::Vector{SchemaNode} = SchemaNode[]
+    max_def_level::Int = 0
+    max_rep_level::Int = 0
+    # Level at which this specific node contributes to def/rep
+    own_def_level::Int = 0
+    own_rep_level::Int = 0
 end
-
-DictionaryPageHeader() = DictionaryPageHeader(0, PLAIN_DICTIONARY, false)
-
-"""Page header"""
-mutable struct PageHeader
-    type::PageType
-    uncompressed_page_size::Int32
-    compressed_page_size::Int32
-    crc::Union{Int32, Nothing}
-    data_page_header::Union{DataPageHeader, Nothing}
-    index_page_header::Nothing  # not commonly used
-    dictionary_page_header::Union{DictionaryPageHeader, Nothing}
-    data_page_header_v2::Union{DataPageHeaderV2, Nothing}
-end
-
-PageHeader() = PageHeader(DATA_PAGE, 0, 0, nothing, nothing, nothing, nothing, nothing)

@@ -1,346 +1,377 @@
-# Parquet metadata parsing using Thrift decoder
+# Parquet metadata parsing - builds immutable structs
 
-"""Parse a SchemaElement from Thrift"""
 function parse_schema_element(d::ThriftDecoder)::SchemaElement
-    elem = SchemaElement()
-    push_struct(d)
+    type = nothing
+    type_length = nothing
+    repetition_type = nothing
+    name = ""
+    num_children = nothing
+    converted_type = nothing
+    scale = nothing
+    precision = nothing
+    field_id = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # type
-            elem.type = ParquetType(Int32(read_zigzag(d)))
-        elseif field_id == 2 && type_id == THRIFT_I32  # type_length
-            elem.type_length = Int32(read_zigzag(d))
-        elseif field_id == 3 && type_id == THRIFT_I32  # repetition_type
-            elem.repetition_type = FieldRepetitionType(Int32(read_zigzag(d)))
-        elseif field_id == 4 && type_id == THRIFT_BINARY  # name
-            elem.name = read_string(d)
-        elseif field_id == 5 && type_id == THRIFT_I32  # num_children
-            elem.num_children = Int32(read_zigzag(d))
-        elseif field_id == 6 && type_id == THRIFT_I32  # converted_type
-            elem.converted_type = ConvertedType(Int32(read_zigzag(d)))
-        elseif field_id == 7 && type_id == THRIFT_I32  # scale
-            elem.scale = Int32(read_zigzag(d))
-        elseif field_id == 8 && type_id == THRIFT_I32  # precision
-            elem.precision = Int32(read_zigzag(d))
-        elseif field_id == 9 && type_id == THRIFT_I32  # field_id
-            elem.field_id = Int32(read_zigzag(d))
+        if fid == 1 && type_id == THRIFT_I32
+            type = ParquetType(Int32(read_zigzag(d)))
+        elseif fid == 2 && type_id == THRIFT_I32
+            type_length = Int32(read_zigzag(d))
+        elseif fid == 3 && type_id == THRIFT_I32
+            repetition_type = FieldRepetitionType(Int32(read_zigzag(d)))
+        elseif fid == 4 && type_id == THRIFT_BINARY
+            name = read_string(d)
+        elseif fid == 5 && type_id == THRIFT_I32
+            num_children = Int32(read_zigzag(d))
+        elseif fid == 6 && type_id == THRIFT_I32
+            converted_type = ConvertedType(Int32(read_zigzag(d)))
+        elseif fid == 7 && type_id == THRIFT_I32
+            scale = Int32(read_zigzag(d))
+        elseif fid == 8 && type_id == THRIFT_I32
+            precision = Int32(read_zigzag(d))
+        elseif fid == 9 && type_id == THRIFT_I32
+            field_id = Int32(read_zigzag(d))
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    elem
+
+    SchemaElement(type, type_length, repetition_type, name, num_children,
+                  converted_type, scale, precision, field_id)
 end
 
-"""Parse Statistics from Thrift"""
 function parse_statistics(d::ThriftDecoder)::Statistics
-    stats = Statistics()
-    push_struct(d)
+    max = min = null_count = distinct_count = max_value = min_value = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_BINARY  # max
-            stats.max = read_binary(d)
-        elseif field_id == 2 && type_id == THRIFT_BINARY  # min
-            stats.min = read_binary(d)
-        elseif field_id == 3 && type_id == THRIFT_I64  # null_count
-            stats.null_count = read_zigzag(d)
-        elseif field_id == 4 && type_id == THRIFT_I64  # distinct_count
-            stats.distinct_count = read_zigzag(d)
-        elseif field_id == 5 && type_id == THRIFT_BINARY  # max_value
-            stats.max_value = read_binary(d)
-        elseif field_id == 6 && type_id == THRIFT_BINARY  # min_value
-            stats.min_value = read_binary(d)
+        if fid == 1 && type_id == THRIFT_BINARY
+            max = read_binary(d)
+        elseif fid == 2 && type_id == THRIFT_BINARY
+            min = read_binary(d)
+        elseif fid == 3 && type_id == THRIFT_I64
+            null_count = read_zigzag(d)
+        elseif fid == 4 && type_id == THRIFT_I64
+            distinct_count = read_zigzag(d)
+        elseif fid == 5 && type_id == THRIFT_BINARY
+            max_value = read_binary(d)
+        elseif fid == 6 && type_id == THRIFT_BINARY
+            min_value = read_binary(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    stats
+
+    Statistics(max, min, null_count, distinct_count, max_value, min_value)
 end
 
-"""Parse ColumnMetaData from Thrift"""
 function parse_column_metadata(d::ThriftDecoder)::ColumnMetaData
-    meta = ColumnMetaData()
-    push_struct(d)
+    type = BOOLEAN
+    encodings = Encoding[]
+    path_in_schema = String[]
+    codec = UNCOMPRESSED
+    num_values = Int64(0)
+    total_uncompressed_size = Int64(0)
+    total_compressed_size = Int64(0)
+    data_page_offset = Int64(0)
+    index_page_offset = nothing
+    dictionary_page_offset = nothing
+    statistics = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # type
-            meta.type = ParquetType(Int32(read_zigzag(d)))
-        elseif field_id == 2 && type_id == THRIFT_LIST  # encodings
-            elem_type, size = read_list_header(d)
-            meta.encodings = [Encoding(Int32(read_zigzag(d))) for _ in 1:size]
-        elseif field_id == 3 && type_id == THRIFT_LIST  # path_in_schema
-            elem_type, size = read_list_header(d)
-            meta.path_in_schema = [read_string(d) for _ in 1:size]
-        elseif field_id == 4 && type_id == THRIFT_I32  # codec
-            meta.codec = CompressionCodec(Int32(read_zigzag(d)))
-        elseif field_id == 5 && type_id == THRIFT_I64  # num_values
-            meta.num_values = read_zigzag(d)
-        elseif field_id == 6 && type_id == THRIFT_I64  # total_uncompressed_size
-            meta.total_uncompressed_size = read_zigzag(d)
-        elseif field_id == 7 && type_id == THRIFT_I64  # total_compressed_size
-            meta.total_compressed_size = read_zigzag(d)
-        elseif field_id == 9 && type_id == THRIFT_I64  # data_page_offset
-            meta.data_page_offset = read_zigzag(d)
-        elseif field_id == 10 && type_id == THRIFT_I64  # index_page_offset
-            meta.index_page_offset = read_zigzag(d)
-        elseif field_id == 11 && type_id == THRIFT_I64  # dictionary_page_offset
-            meta.dictionary_page_offset = read_zigzag(d)
-        elseif field_id == 12 && type_id == THRIFT_STRUCT  # statistics
-            meta.statistics = parse_statistics(d)
+        if fid == 1 && type_id == THRIFT_I32
+            type = ParquetType(Int32(read_zigzag(d)))
+        elseif fid == 2 && type_id == THRIFT_LIST
+            _, size = read_list_header(d)
+            encodings = [Encoding(Int32(read_zigzag(d))) for _ in 1:size]
+        elseif fid == 3 && type_id == THRIFT_LIST
+            _, size = read_list_header(d)
+            path_in_schema = [read_string(d) for _ in 1:size]
+        elseif fid == 4 && type_id == THRIFT_I32
+            codec = CompressionCodec(Int32(read_zigzag(d)))
+        elseif fid == 5 && type_id == THRIFT_I64
+            num_values = read_zigzag(d)
+        elseif fid == 6 && type_id == THRIFT_I64
+            total_uncompressed_size = read_zigzag(d)
+        elseif fid == 7 && type_id == THRIFT_I64
+            total_compressed_size = read_zigzag(d)
+        elseif fid == 9 && type_id == THRIFT_I64
+            data_page_offset = read_zigzag(d)
+        elseif fid == 10 && type_id == THRIFT_I64
+            index_page_offset = read_zigzag(d)
+        elseif fid == 11 && type_id == THRIFT_I64
+            dictionary_page_offset = read_zigzag(d)
+        elseif fid == 12 && type_id == THRIFT_STRUCT
+            statistics = parse_statistics(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    meta
+
+    ColumnMetaData(type, encodings, path_in_schema, codec, num_values,
+                   total_uncompressed_size, total_compressed_size, data_page_offset,
+                   index_page_offset, dictionary_page_offset, statistics)
 end
 
-"""Parse ColumnChunk from Thrift"""
 function parse_column_chunk(d::ThriftDecoder)::ColumnChunk
-    chunk = ColumnChunk()
-    push_struct(d)
+    file_path = nothing
+    file_offset = Int64(0)
+    meta_data = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_BINARY  # file_path
-            chunk.file_path = read_string(d)
-        elseif field_id == 2 && type_id == THRIFT_I64  # file_offset
-            chunk.file_offset = read_zigzag(d)
-        elseif field_id == 3 && type_id == THRIFT_STRUCT  # meta_data
-            chunk.meta_data = parse_column_metadata(d)
-        elseif field_id == 4 && type_id == THRIFT_I64  # offset_index_offset
-            chunk.offset_index_offset = read_zigzag(d)
-        elseif field_id == 5 && type_id == THRIFT_I32  # offset_index_length
-            chunk.offset_index_length = Int32(read_zigzag(d))
-        elseif field_id == 6 && type_id == THRIFT_I64  # column_index_offset
-            chunk.column_index_offset = read_zigzag(d)
-        elseif field_id == 7 && type_id == THRIFT_I32  # column_index_length
-            chunk.column_index_length = Int32(read_zigzag(d))
+        if fid == 1 && type_id == THRIFT_BINARY
+            file_path = read_string(d)
+        elseif fid == 2 && type_id == THRIFT_I64
+            file_offset = read_zigzag(d)
+        elseif fid == 3 && type_id == THRIFT_STRUCT
+            meta_data = parse_column_metadata(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    chunk
+
+    ColumnChunk(file_path, file_offset, meta_data)
 end
 
-"""Parse RowGroup from Thrift"""
 function parse_row_group(d::ThriftDecoder)::RowGroup
-    rg = RowGroup()
-    push_struct(d)
+    columns = ColumnChunk[]
+    total_byte_size = Int64(0)
+    num_rows = Int64(0)
+    file_offset = nothing
+    total_compressed_size = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_LIST  # columns
-            elem_type, size = read_list_header(d)
-            rg.columns = [parse_column_chunk(d) for _ in 1:size]
-        elseif field_id == 2 && type_id == THRIFT_I64  # total_byte_size
-            rg.total_byte_size = read_zigzag(d)
-        elseif field_id == 3 && type_id == THRIFT_I64  # num_rows
-            rg.num_rows = read_zigzag(d)
-        elseif field_id == 6 && type_id == THRIFT_I64  # file_offset
-            rg.file_offset = read_zigzag(d)
-        elseif field_id == 7 && type_id == THRIFT_I64  # total_compressed_size
-            rg.total_compressed_size = read_zigzag(d)
-        elseif field_id == 8 && type_id == THRIFT_I16  # ordinal
-            rg.ordinal = Int16(read_zigzag(d))
+        if fid == 1 && type_id == THRIFT_LIST
+            _, size = read_list_header(d)
+            columns = [parse_column_chunk(d) for _ in 1:size]
+        elseif fid == 2 && type_id == THRIFT_I64
+            total_byte_size = read_zigzag(d)
+        elseif fid == 3 && type_id == THRIFT_I64
+            num_rows = read_zigzag(d)
+        elseif fid == 6 && type_id == THRIFT_I64
+            file_offset = read_zigzag(d)
+        elseif fid == 7 && type_id == THRIFT_I64
+            total_compressed_size = read_zigzag(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    rg
+
+    RowGroup(columns, total_byte_size, num_rows, file_offset, total_compressed_size)
 end
 
-"""Parse KeyValue from Thrift"""
 function parse_key_value(d::ThriftDecoder)::KeyValue
     key = ""
     value = nothing
-    push_struct(d)
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_BINARY
+        if fid == 1 && type_id == THRIFT_BINARY
             key = read_string(d)
-        elseif field_id == 2 && type_id == THRIFT_BINARY
+        elseif fid == 2 && type_id == THRIFT_BINARY
             value = read_string(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
+
     KeyValue(key, value)
 end
 
-"""Parse FileMetaData from Thrift"""
 function parse_file_metadata(d::ThriftDecoder)::FileMetaData
-    meta = FileMetaData()
-    push_struct(d)
+    version = Int32(0)
+    schema = SchemaElement[]
+    num_rows = Int64(0)
+    row_groups = RowGroup[]
+    key_value_metadata = nothing
+    created_by = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # version
-            meta.version = Int32(read_zigzag(d))
-        elseif field_id == 2 && type_id == THRIFT_LIST  # schema
-            elem_type, size = read_list_header(d)
-            meta.schema = [parse_schema_element(d) for _ in 1:size]
-        elseif field_id == 3 && type_id == THRIFT_I64  # num_rows
-            meta.num_rows = read_zigzag(d)
-        elseif field_id == 4 && type_id == THRIFT_LIST  # row_groups
-            elem_type, size = read_list_header(d)
-            meta.row_groups = [parse_row_group(d) for _ in 1:size]
-        elseif field_id == 5 && type_id == THRIFT_LIST  # key_value_metadata
-            elem_type, size = read_list_header(d)
-            meta.key_value_metadata = [parse_key_value(d) for _ in 1:size]
-        elseif field_id == 6 && type_id == THRIFT_BINARY  # created_by
-            meta.created_by = read_string(d)
+        if fid == 1 && type_id == THRIFT_I32
+            version = Int32(read_zigzag(d))
+        elseif fid == 2 && type_id == THRIFT_LIST
+            _, size = read_list_header(d)
+            schema = [parse_schema_element(d) for _ in 1:size]
+        elseif fid == 3 && type_id == THRIFT_I64
+            num_rows = read_zigzag(d)
+        elseif fid == 4 && type_id == THRIFT_LIST
+            _, size = read_list_header(d)
+            row_groups = [parse_row_group(d) for _ in 1:size]
+        elseif fid == 5 && type_id == THRIFT_LIST
+            _, size = read_list_header(d)
+            key_value_metadata = [parse_key_value(d) for _ in 1:size]
+        elseif fid == 6 && type_id == THRIFT_BINARY
+            created_by = read_string(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    meta
+
+    FileMetaData(version, schema, num_rows, row_groups, key_value_metadata, created_by)
 end
 
-"""Parse DataPageHeader from Thrift"""
 function parse_data_page_header(d::ThriftDecoder)::DataPageHeader
-    hdr = DataPageHeader()
-    push_struct(d)
+    num_values = Int32(0)
+    encoding = PLAIN
+    def_encoding = RLE
+    rep_encoding = RLE
+    statistics = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # num_values
-            hdr.num_values = Int32(read_zigzag(d))
-        elseif field_id == 2 && type_id == THRIFT_I32  # encoding
-            hdr.encoding = Encoding(Int32(read_zigzag(d)))
-        elseif field_id == 3 && type_id == THRIFT_I32  # definition_level_encoding
-            hdr.definition_level_encoding = Encoding(Int32(read_zigzag(d)))
-        elseif field_id == 4 && type_id == THRIFT_I32  # repetition_level_encoding
-            hdr.repetition_level_encoding = Encoding(Int32(read_zigzag(d)))
-        elseif field_id == 5 && type_id == THRIFT_STRUCT  # statistics
-            hdr.statistics = parse_statistics(d)
+        if fid == 1 && type_id == THRIFT_I32
+            num_values = Int32(read_zigzag(d))
+        elseif fid == 2 && type_id == THRIFT_I32
+            encoding = Encoding(Int32(read_zigzag(d)))
+        elseif fid == 3 && type_id == THRIFT_I32
+            def_encoding = Encoding(Int32(read_zigzag(d)))
+        elseif fid == 4 && type_id == THRIFT_I32
+            rep_encoding = Encoding(Int32(read_zigzag(d)))
+        elseif fid == 5 && type_id == THRIFT_STRUCT
+            statistics = parse_statistics(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    hdr
+
+    DataPageHeader(num_values, encoding, def_encoding, rep_encoding, statistics)
 end
 
-"""Parse DataPageHeaderV2 from Thrift"""
 function parse_data_page_header_v2(d::ThriftDecoder)::DataPageHeaderV2
-    hdr = DataPageHeaderV2()
-    push_struct(d)
+    num_values = Int32(0)
+    num_nulls = Int32(0)
+    num_rows = Int32(0)
+    encoding = PLAIN
+    def_bytes = Int32(0)
+    rep_bytes = Int32(0)
+    is_compressed = true
+    statistics = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # num_values
-            hdr.num_values = Int32(read_zigzag(d))
-        elseif field_id == 2 && type_id == THRIFT_I32  # num_nulls
-            hdr.num_nulls = Int32(read_zigzag(d))
-        elseif field_id == 3 && type_id == THRIFT_I32  # num_rows
-            hdr.num_rows = Int32(read_zigzag(d))
-        elseif field_id == 4 && type_id == THRIFT_I32  # encoding
-            hdr.encoding = Encoding(Int32(read_zigzag(d)))
-        elseif field_id == 5 && type_id == THRIFT_I32  # definition_levels_byte_length
-            hdr.definition_levels_byte_length = Int32(read_zigzag(d))
-        elseif field_id == 6 && type_id == THRIFT_I32  # repetition_levels_byte_length
-            hdr.repetition_levels_byte_length = Int32(read_zigzag(d))
-        elseif field_id == 7 && (type_id == THRIFT_TRUE || type_id == THRIFT_FALSE)  # is_compressed
-            hdr.is_compressed = type_id == THRIFT_TRUE
-        elseif field_id == 8 && type_id == THRIFT_STRUCT  # statistics
-            hdr.statistics = parse_statistics(d)
+        if fid == 1 && type_id == THRIFT_I32
+            num_values = Int32(read_zigzag(d))
+        elseif fid == 2 && type_id == THRIFT_I32
+            num_nulls = Int32(read_zigzag(d))
+        elseif fid == 3 && type_id == THRIFT_I32
+            num_rows = Int32(read_zigzag(d))
+        elseif fid == 4 && type_id == THRIFT_I32
+            encoding = Encoding(Int32(read_zigzag(d)))
+        elseif fid == 5 && type_id == THRIFT_I32
+            def_bytes = Int32(read_zigzag(d))
+        elseif fid == 6 && type_id == THRIFT_I32
+            rep_bytes = Int32(read_zigzag(d))
+        elseif fid == 7 && type_id in (THRIFT_TRUE, THRIFT_FALSE)
+            is_compressed = type_id == THRIFT_TRUE
+        elseif fid == 8 && type_id == THRIFT_STRUCT
+            statistics = parse_statistics(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    hdr
+
+    DataPageHeaderV2(num_values, num_nulls, num_rows, encoding, def_bytes, rep_bytes, is_compressed, statistics)
 end
 
-"""Parse DictionaryPageHeader from Thrift"""
 function parse_dictionary_page_header(d::ThriftDecoder)::DictionaryPageHeader
-    hdr = DictionaryPageHeader()
-    push_struct(d)
+    num_values = Int32(0)
+    encoding = PLAIN_DICTIONARY
+    is_sorted = false
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # num_values
-            hdr.num_values = Int32(read_zigzag(d))
-        elseif field_id == 2 && type_id == THRIFT_I32  # encoding
-            hdr.encoding = Encoding(Int32(read_zigzag(d)))
-        elseif field_id == 3 && (type_id == THRIFT_TRUE || type_id == THRIFT_FALSE)  # is_sorted
-            hdr.is_sorted = type_id == THRIFT_TRUE
+        if fid == 1 && type_id == THRIFT_I32
+            num_values = Int32(read_zigzag(d))
+        elseif fid == 2 && type_id == THRIFT_I32
+            encoding = Encoding(Int32(read_zigzag(d)))
+        elseif fid == 3 && type_id in (THRIFT_TRUE, THRIFT_FALSE)
+            is_sorted = type_id == THRIFT_TRUE
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    hdr
+
+    DictionaryPageHeader(num_values, encoding, is_sorted)
 end
 
-"""Parse PageHeader from Thrift"""
 function parse_page_header(d::ThriftDecoder)::PageHeader
-    hdr = PageHeader()
-    push_struct(d)
+    type = DATA_PAGE
+    uncompressed_size = Int32(0)
+    compressed_size = Int32(0)
+    crc = nothing
+    data_page_header = nothing
+    dictionary_page_header = nothing
+    data_page_header_v2 = nothing
 
+    push_struct(d)
     while true
-        type_id, field_id = read_field_header(d)
+        type_id, fid = read_field_header(d)
         type_id == THRIFT_STOP && break
 
-        if field_id == 1 && type_id == THRIFT_I32  # type
-            hdr.type = PageType(Int32(read_zigzag(d)))
-        elseif field_id == 2 && type_id == THRIFT_I32  # uncompressed_page_size
-            hdr.uncompressed_page_size = Int32(read_zigzag(d))
-        elseif field_id == 3 && type_id == THRIFT_I32  # compressed_page_size
-            hdr.compressed_page_size = Int32(read_zigzag(d))
-        elseif field_id == 4 && type_id == THRIFT_I32  # crc
-            hdr.crc = Int32(read_zigzag(d))
-        elseif field_id == 5 && type_id == THRIFT_STRUCT  # data_page_header
-            hdr.data_page_header = parse_data_page_header(d)
-        elseif field_id == 7 && type_id == THRIFT_STRUCT  # dictionary_page_header
-            hdr.dictionary_page_header = parse_dictionary_page_header(d)
-        elseif field_id == 8 && type_id == THRIFT_STRUCT  # data_page_header_v2
-            hdr.data_page_header_v2 = parse_data_page_header_v2(d)
+        if fid == 1 && type_id == THRIFT_I32
+            type = PageType(Int32(read_zigzag(d)))
+        elseif fid == 2 && type_id == THRIFT_I32
+            uncompressed_size = Int32(read_zigzag(d))
+        elseif fid == 3 && type_id == THRIFT_I32
+            compressed_size = Int32(read_zigzag(d))
+        elseif fid == 4 && type_id == THRIFT_I32
+            crc = Int32(read_zigzag(d))
+        elseif fid == 5 && type_id == THRIFT_STRUCT
+            data_page_header = parse_data_page_header(d)
+        elseif fid == 7 && type_id == THRIFT_STRUCT
+            dictionary_page_header = parse_dictionary_page_header(d)
+        elseif fid == 8 && type_id == THRIFT_STRUCT
+            data_page_header_v2 = parse_data_page_header_v2(d)
         else
             skip_value(d, type_id)
         end
     end
-
     pop_struct(d)
-    hdr
+
+    PageHeader(type, uncompressed_size, compressed_size, crc,
+               data_page_header, dictionary_page_header, data_page_header_v2)
 end
