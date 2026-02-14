@@ -98,6 +98,29 @@ function find_column(root::SchemaNode, path::Vector{String})
     node
 end
 
+"""
+    compute_def_thresholds(root::SchemaNode, path::Vector{String}) -> Vector{Int}
+
+Compute the definition level threshold for each repetition level.
+`thresholds[i]` is the minimum def_level at which rep_level `i` has a defined element.
+Used by nested column assembly to distinguish "empty inner list" from "null leaf value".
+"""
+function compute_def_thresholds(root::SchemaNode, path::Vector{String})
+    thresholds = Int[]
+    cum_def = 0
+    node = root
+    for name in path
+        idx = findfirst(c -> c.element.name == name, node.children)
+        idx === nothing && break
+        child = node.children[idx]
+        rt = child.element.repetition_type
+        cum_def += (rt == OPTIONAL || rt == REPEATED) ? 1 : 0
+        rt == REPEATED && push!(thresholds, cum_def)
+        node = child
+    end
+    thresholds
+end
+
 function get_leaf_columns(root::SchemaNode)
     result = Tuple{Vector{String}, SchemaNode}[]
 

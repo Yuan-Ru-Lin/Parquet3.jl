@@ -154,13 +154,15 @@ function read_all_pages(reader::ColumnReader)
 end
 
 """
-    assemble_column(pages, max_def, max_rep) -> (values, nulls) or nested structure
+    assemble_column(pages, max_def, max_rep, def_thresholds) -> (values, nulls) or nested structure
 
 Reconstruct column data from decoded pages. Handles:
 - Flat columns (max_rep = 0)
 - List columns (max_rep > 0) - returns Vector{Vector{T}}
+
+`def_thresholds[i]` = min def_level at which rep_level `i` has a defined element.
 """
-function assemble_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int=0)
+function assemble_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int=0, def_thresholds::Vector{Int}=Int[])
     isempty(pages) && return ([], falses(0))
 
     # Flat column - simple assembly
@@ -169,7 +171,7 @@ function assemble_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::In
     end
 
     # Nested column - reconstruct lists
-    return assemble_nested_column(pages, max_def, max_rep)
+    return assemble_nested_column(pages, max_def, max_rep, def_thresholds)
 end
 
 """Assemble a flat (non-repeated) column."""
@@ -205,7 +207,7 @@ Handles arbitrary nesting depth based on max_rep.
 - max_rep = 2: Vector{Vector{Vector{T}}} (list of lists)
 - etc.
 """
-function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int)
+function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int, def_thresholds::Vector{Int}=Int[])
     T = eltype(first(pages).values)
 
     # Collect all rep/def levels and values
@@ -233,15 +235,17 @@ function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_
 
     # For single-level nesting, use optimized path
     if max_rep == 1
-        return assemble_single_nested(all_rep, all_def, all_values, max_def, T)
+        leaf_threshold = isempty(def_thresholds) ? 1 : def_thresholds[1]
+        return assemble_single_nested(all_rep, all_def, all_values, max_def, T, leaf_threshold)
     end
 
     # For deeper nesting, use recursive approach
-    return assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, T)
+    return assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, T, def_thresholds)
 end
 
-"""Optimized assembly for single-level nesting (List<T>)."""
-function assemble_single_nested(all_rep, all_def, all_values, max_def, ::Type{T}) where T
+"""Optimized assembly for single-level nesting (List<T>).
+`leaf_threshold` = min def_level at which a list element exists."""
+function assemble_single_nested(all_rep, all_def, all_values, max_def, ::Type{T}, leaf_threshold::Int=1) where T
     num_records = count(==(0), all_rep)
     result = Vector{Vector{Union{Missing, T}}}(undef, num_records)
     record_nulls = falses(num_records)
@@ -270,9 +274,11 @@ function assemble_single_nested(all_rep, all_def, all_values, max_def, ::Type{T}
         if def == max_def
             push!(current_list, all_values[value_idx])
             value_idx += 1
-        elseif def > 0
+        elseif def >= leaf_threshold
+            # Element exists but value is null
             push!(current_list, missing)
         end
+        # def < leaf_threshold: list exists but no element (empty list entry) — don't push
     end
 
     if record_idx > 0 && record_idx <= num_records
@@ -288,20 +294,13 @@ Assembly for deeply nested structures (List<List<T>>, etc.).
 Uses a stack-based approach:
 - Stack has max_rep levels, each holding a list being built
 - rep_level = k means: finalize and push lists at levels > k, start new lists at level k
+- def_thresholds[i] = min def_level at which rep_level i has a defined element
 """
-function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}) where T
+function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}, def_thresholds::Vector{Int}=Int[]) where T
     num_records = count(==(0), all_rep)
 
-    # Result is the outermost list of records
     records = []
     record_nulls = falses(num_records)
-
-    # Stack of lists being built, indexed by rep level (1 to max_rep)
-    # Level 1 = outermost list (per record), Level max_rep = innermost list
-    ListType = Vector{Union{Missing, T}}
-    for level in max_rep-1:-1:1
-        ListType = Vector{Union{Missing, ListType}}
-    end
 
     # Initialize stack - each level holds current list being built
     stack = Vector{Any}(undef, max_rep)
@@ -313,7 +312,6 @@ function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::
     value_idx = 1
 
     function finalize_level(level)
-        # Push current list at `level` into parent (level-1)
         if level > 1
             push!(stack[level-1], stack[level])
         end
@@ -321,7 +319,6 @@ function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::
     end
 
     function finalize_from(start_level)
-        # Finalize all levels from innermost up to start_level
         for level in max_rep:-1:start_level
             finalize_level(level)
         end
@@ -329,46 +326,44 @@ function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::
 
     function save_record()
         if record_idx > 0
-            # Finalize all levels and save to records
             finalize_from(2)
             push!(records, stack[1])
             stack[1] = []
         end
     end
 
+    # Innermost threshold: min def_level for a leaf element to exist
+    inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
+
     for i in eachindex(all_rep)
         rep = all_rep[i]
         def = all_def[i]
 
         if rep == 0
-            # New record - save previous and reset all levels
             save_record()
             record_idx += 1
 
-            # Check for null record
             if def == 0 && max_def > 0
                 record_nulls[record_idx] = true
                 push!(records, missing)
                 continue
             end
         elseif rep < max_rep
-            # Repeat at level rep+1 - finalize levels > rep, start new at rep+1
             finalize_from(rep + 1)
         end
-        # rep == max_rep means continue innermost list
 
-        # Add value to innermost list
+        # Only push to innermost list if def reaches the inner threshold
         if def == max_def
             push!(stack[max_rep], all_values[value_idx])
             value_idx += 1
-        elseif def > 0
-            # Null at some level - add missing to innermost for now
-            # More sophisticated handling would track which level is null
+        elseif def >= inner_threshold
+            # Innermost element exists but leaf value is null
             push!(stack[max_rep], missing)
         end
+        # def < inner_threshold: some intermediate list is null/empty — don't push.
+        # The empty stack at that level will be finalized as [] by the next entry.
     end
 
-    # Save last record
     save_record()
 
     (records, record_nulls)

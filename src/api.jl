@@ -36,7 +36,7 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         col_name = join(path, ".")
 
         try
-            values, nulls = read_column_data(pf, path, node)
+            values, nulls = read_column_data(pf, path, node, schema_tree)
             is_nested = node.max_rep_level > 0
 
             name, converted = if is_nested && haskey(fsl_info, top_name)
@@ -55,7 +55,7 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
 end
 
 """Read column data from all row groups."""
-function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode)
+function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode, schema_tree::SchemaNode)
     type_length = something(node.element.type_length, 0)
 
     all_pages = DecodedPage[]
@@ -67,7 +67,8 @@ function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::Sc
     end
 
     isempty(all_pages) && return ([], falses(0))
-    assemble_column(all_pages, node.max_def_level, node.max_rep_level)
+    def_thresholds = compute_def_thresholds(schema_tree, column_path)
+    assemble_column(all_pages, node.max_def_level, node.max_rep_level, def_thresholds)
 end
 
 """Convert Parquet values to appropriate Julia types with nulls as missing."""
@@ -105,7 +106,9 @@ function convert_primitive_values(values, ptype, ctype)
     elseif (T = _converted_int_type(ptype, ctype)) !== nothing
         T.(values)
     else
-        values
+        # Narrow type for values from untyped containers (e.g. deep nested assembly)
+        T = element_julia_type(ptype, ctype)
+        T === Any ? values : T.(values)
     end
 end
 
@@ -156,7 +159,10 @@ end
 
 """Recursively convert nested list values, applying type conversion only at leaf level."""
 function _convert_nested_recursive(list, elem::SchemaElement)
-    isempty(list) && return list
+    if isempty(list)
+        T = element_julia_type(elem.type, elem.converted_type)
+        return Union{Missing, T}[]
+    end
 
     first_non_missing = findfirst(x -> x !== missing, list)
     first_non_missing === nothing && return list
