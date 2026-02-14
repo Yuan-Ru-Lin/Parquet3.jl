@@ -199,19 +199,9 @@ function assemble_flat_column(pages::Vector{<:DecodedPage}, max_def::Int)
     (values, nulls)
 end
 
-"""
-    assemble_nested_column(pages, max_def, max_rep) -> (nested_values, nulls)
-
-Reconstruct nested lists using repetition and definition levels.
-Handles arbitrary nesting depth based on max_rep.
-- max_rep = 1: Vector{Vector{T}} (single list)
-- max_rep = 2: Vector{Vector{Vector{T}}} (list of lists)
-- etc.
-"""
-function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int, def_thresholds::Vector{Int}=Int[])
+"""Collect rep/def levels and raw values from decoded pages."""
+function collect_page_data(pages::Vector{<:DecodedPage}, max_def::Int)
     T = eltype(first(pages).values)
-
-    # Collect all rep/def levels and values
     all_rep = Int[]
     all_def = Int[]
     all_values = T[]
@@ -232,81 +222,44 @@ function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_
         append!(all_values, page.values)
     end
 
-    isempty(all_rep) && return ([], falses(0))
-
-    # For single-level nesting, use optimized path
-    if max_rep == 1
-        leaf_threshold = isempty(def_thresholds) ? 1 : def_thresholds[1]
-        return assemble_single_nested(all_rep, all_def, all_values, max_def, T, leaf_threshold)
-    end
-
-    # For deeper nesting, use recursive approach
-    return assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, T, def_thresholds)
+    (all_rep, all_def, all_values)
 end
 
-"""Optimized assembly for single-level nesting (List<T>).
-`leaf_threshold` = min def_level at which a list element exists."""
-function assemble_single_nested(all_rep, all_def, all_values, max_def, ::Type{T}, leaf_threshold::Int=1) where T
-    num_records = count(==(0), all_rep)
-    result = Vector{Vector{Union{Missing, T}}}(undef, num_records)
-    record_nulls = falses(num_records)
-
-    record_idx = 0
-    value_idx = 1
-    current_list = Union{Missing, T}[]
-
-    for i in eachindex(all_rep)
-        rep = all_rep[i]
-        def = all_def[i]
-
-        if rep == 0
-            if record_idx > 0
-                result[record_idx] = current_list
-            end
-            record_idx += 1
-            current_list = Union{Missing, T}[]
-
-            if def == 0 && max_def > 0
-                record_nulls[record_idx] = true
-                continue
-            end
-        end
-
-        if def == max_def
-            push!(current_list, all_values[value_idx])
-            value_idx += 1
-        elseif def >= leaf_threshold
-            # Element exists but value is null
-            push!(current_list, missing)
-        end
-        # def < leaf_threshold: list exists but no element (empty list entry) — don't push
-    end
-
-    if record_idx > 0 && record_idx <= num_records
-        result[record_idx] = current_list
-    end
-
-    (result, record_nulls)
+function assemble_nested_column(pages::Vector{<:DecodedPage}, max_def::Int, max_rep::Int, def_thresholds::Vector{Int}=Int[])
+    all_rep, all_def, all_values = collect_page_data(pages, max_def)
+    isempty(all_rep) && return ([], falses(0))
+    T = eltype(all_values)
+    assemble_nested(all_rep, all_def, all_values, max_def, max_rep, T, def_thresholds)
 end
 
 """
-Assembly for deeply nested structures (List<List<T>>, etc.).
+Assembly for nested structures (List<T>, List<List<T>>, etc.).
 
 Uses a stack-based approach:
 - Stack has max_rep levels, each holding a list being built
 - rep_level = k means: finalize and push lists at levels > k, start new lists at level k
 - def_thresholds[i] = min def_level at which rep_level i has a defined element
 """
-function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}, def_thresholds::Vector{Int}=Int[]) where T
+function assemble_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}, def_thresholds::Vector{Int}=Int[]) where T
     num_records = count(==(0), all_rep)
 
     records = []
     record_nulls = falses(num_records)
 
+    # Innermost threshold: min def_level for a leaf element to exist
+    inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
+
+    # Check data for actual leaf nulls (inner_threshold <= def < max_def)
+    has_leaf_nulls = inner_threshold < max_def && any(d -> inner_threshold <= d < max_def, all_def)
+    LeafT = has_leaf_nulls ? Union{Missing, T} : T
+
+    new_leaf() = LeafT[]
+
     # Initialize stack - each level holds current list being built
+    # Innermost level is typed; intermediate levels stay Any[]
     stack = Vector{Any}(undef, max_rep)
     for level in 1:max_rep
-        stack[level] = []
+        stack[level] = level == max_rep ? new_leaf() : []
     end
 
     record_idx = 0
@@ -316,7 +269,7 @@ function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::
         if level > 1
             push!(stack[level-1], stack[level])
         end
-        stack[level] = []
+        stack[level] = level == max_rep ? new_leaf() : []
     end
 
     function finalize_from(start_level)
@@ -329,12 +282,9 @@ function assemble_deep_nested(all_rep, all_def, all_values, max_def, max_rep, ::
         if record_idx > 0
             finalize_from(2)
             push!(records, stack[1])
-            stack[1] = []
+            stack[1] = 1 == max_rep ? new_leaf() : []
         end
     end
-
-    # Innermost threshold: min def_level for a leaf element to exist
-    inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
 
     for i in eachindex(all_rep)
         rep = all_rep[i]

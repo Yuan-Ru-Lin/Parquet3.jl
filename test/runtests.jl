@@ -92,7 +92,7 @@ using Tables
             5
         )
 
-        values, nulls = Parquet3.assemble_deep_nested(
+        values, nulls = Parquet3.assemble_nested(
             [0, 2, 1, 0, 2],
             [3, 3, 3, 3, 3],
             Int32[1, 2, 3, 4, 5],
@@ -116,7 +116,7 @@ using Tables
         # Single record with deeply nested structure
         # rep_levels: [0, 3] - 0 starts everything, 3 continues innermost
         # def_levels: [4, 4] - all defined
-        values, nulls = Parquet3.assemble_deep_nested(
+        values, nulls = Parquet3.assemble_nested(
             [0, 3],
             [4, 4],
             Int32[1, 2],

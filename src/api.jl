@@ -41,8 +41,10 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
 
             name, converted = if is_nested && haskey(fsl_info, top_name)
                 top_name, convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+            elseif is_nested
+                top_name, convert_nested_type(values, nulls, node.max_rep_level)
             else
-                (is_nested ? top_name : col_name), convert_to_julia_type(values, nulls, node.element, is_nested)
+                col_name, convert_to_julia_type(values, nulls, node.element)
             end
             push!(col_names, Symbol(name))
             push!(col_vectors, converted)
@@ -68,13 +70,23 @@ function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::Sc
 
     isempty(all_pages) && return ([], falses(0))
     def_thresholds = compute_def_thresholds(schema_tree, column_path)
-    assemble_column(all_pages, node.max_def_level, node.max_rep_level, def_thresholds)
+    max_def = node.max_def_level
+    max_rep = node.max_rep_level
+
+    # Flat columns: assemble directly
+    max_rep == 0 && return assemble_column(all_pages, max_def, max_rep, def_thresholds)
+
+    # Nested columns: pre-convert values before assembly so the structure
+    # contains final Julia types (String, Date, etc.) instead of raw Parquet primitives
+    all_rep, all_def, raw_values = collect_page_data(all_pages, max_def)
+    isempty(all_rep) && return ([], falses(0))
+    converted = convert_primitive_values(raw_values, node.element.type, node.element.converted_type)
+    T = eltype(converted)
+    assemble_nested(all_rep, all_def, converted, max_def, max_rep, T, def_thresholds)
 end
 
 """Convert Parquet values to appropriate Julia types with nulls as missing."""
-function convert_to_julia_type(values, nulls::BitVector, elem::SchemaElement, is_nested::Bool=false)
-    is_nested && return convert_nested_type(values, nulls, elem)
-
+function convert_to_julia_type(values, nulls::BitVector, elem::SchemaElement)
     converted = convert_primitive_values(values, elem.type, elem.converted_type)
     any(nulls) || return converted
 
@@ -106,7 +118,6 @@ function convert_primitive_values(values, ptype, ctype)
     elseif (T = _converted_int_type(ptype, ctype)) !== nothing
         T.(values)
     else
-        # Narrow type for values from untyped containers (e.g. deep nested assembly)
         T = element_julia_type(ptype, ctype)
         T === Any ? values : T.(values)
     end
@@ -126,11 +137,10 @@ function _converted_int_type(ptype, ctype)
     nothing
 end
 
-"""Convert a FixedSizeList column to an ArrayOfSimilarArrays (backed by list_size × nrows Matrix)."""
+"""Convert a FixedSizeList column to an ArrayOfSimilarArrays (backed by list_size × nrows Matrix).
+Values are already converted; only missing needs replacing with zero."""
 function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int)
-    ptype = elem.type
-    ctype = elem.converted_type
-    T = element_julia_type(ptype, ctype)
+    T = element_julia_type(elem.type, elem.converted_type)
     nrows = length(values)
 
     mat = Matrix{T}(undef, list_size, nrows)
@@ -138,61 +148,30 @@ function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, 
         inner = values[row]
         for col in 1:list_size
             v = inner[col]
-            mat[col, row] = v === missing ? zero(T) : convert(T, v)
+            mat[col, row] = v === missing ? zero(T) : v
         end
     end
     nestedview(mat)
 end
 
-"""Convert nested (list) column values."""
-function convert_nested_type(values, nulls::BitVector, elem::SchemaElement)
-    converted = map(v -> _convert_nested_recursive(v, elem), values)
-    any(nulls) || return converted
+"""Type nested containers and apply top-level nulls.
+Values are already converted; only intermediate container types need fixing."""
+function convert_nested_type(values, nulls::BitVector, max_rep::Int)
+    typed = _type_containers(values, max_rep)
+    any(nulls) || return typed
 
-    T = isempty(converted) ? Any : eltype(first(converted))
-    result = Vector{Union{Missing, Vector{T}}}(undef, length(nulls))
+    result = Vector{Union{Missing, eltype(typed)}}(undef, length(nulls))
     for i in eachindex(nulls)
-        result[i] = nulls[i] ? missing : converted[i]
+        result[i] = nulls[i] ? missing : typed[i]
     end
     result
 end
 
-"""Recursively convert nested list values, applying type conversion only at leaf level."""
-function _convert_nested_recursive(list, elem::SchemaElement)
-    if isempty(list)
-        T = element_julia_type(elem.type, elem.converted_type)
-        return T[]
-    end
-
-    first_non_missing = findfirst(x -> x !== missing, list)
-    first_non_missing === nothing && return list
-
-    # Recurse into sub-lists (but not raw byte arrays)
-    sample = list[first_non_missing]
-    if sample isa AbstractVector && !(sample isa Vector{UInt8})
-        return map(x -> x === missing ? missing : _convert_nested_recursive(x, elem), list)
-    end
-
-    # Leaf level -- convert primitives
-    has_nulls = any(ismissing, list)
-    to_convert = has_nulls ? filter(!ismissing, list) : list
-    converted_vals = convert_primitive_values(to_convert, elem.type, elem.converted_type)
-
-    has_nulls || return converted_vals
-
-    T = eltype(converted_vals)
-    result = Vector{Union{Missing, T}}(undef, length(list))
-    conv_idx = 1
-    for i in eachindex(list)
-        if list[i] === missing
-            result[i] = missing
-        else
-            result[i] = converted_vals[conv_idx]
-            conv_idx += 1
-        end
-    end
-    result
-end
+"""Recursively narrow container types from Any[] to concrete vectors.
+Leaf lists (depth 0) are already correctly typed from assembly."""
+_type_containers(list, depth) =
+    depth <= 0 ? list :
+    [x === missing ? missing : _type_containers(x, depth - 1) for x in list]
 
 """Get Julia type for a Parquet primitive type."""
 function element_julia_type(ptype, ctype)
