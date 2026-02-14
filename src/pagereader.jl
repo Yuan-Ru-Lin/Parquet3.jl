@@ -45,7 +45,7 @@ end
 
 function decode_values(data, count, ptype, encoding, type_len, dict)
     if encoding == PLAIN
-        collect(decode_plain(ptype, data, count, type_len))
+        decode_plain(ptype, data, count, type_len)
     elseif encoding in (PLAIN_DICTIONARY, RLE_DICTIONARY)
         dict === nothing && error("No dictionary for dictionary encoding")
         decode_dictionary(dict, data, count)

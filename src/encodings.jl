@@ -41,19 +41,19 @@ function decode_plain_boolean(data::AbstractVector{UInt8}, count::Int)
 end
 
 decode_plain_int32(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Int32, data[1:4count])
+    reinterpret(Int32, @view data[1:4count])
 
 decode_plain_int64(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Int64, data[1:8count])
+    reinterpret(Int64, @view data[1:8count])
 
 decode_plain_int96(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Int96, data[1:12count])
+    reinterpret(Int96, @view data[1:12count])
 
 decode_plain_float32(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Float32, data[1:4count])
+    reinterpret(Float32, @view data[1:4count])
 
 decode_plain_float64(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Float64, data[1:8count])
+    reinterpret(Float64, @view data[1:8count])
 
 function decode_plain_byte_array(data::AbstractVector{UInt8}, count::Int)
     result = Vector{Vector{UInt8}}(undef, count)
@@ -68,7 +68,7 @@ function decode_plain_byte_array(data::AbstractVector{UInt8}, count::Int)
 end
 
 decode_plain_fixed_byte_array(data::AbstractVector{UInt8}, count::Int, type_length::Int) =
-    nestedview(reshape(data[1:type_length*count], type_length, count))
+    nestedview(reshape(@view(data[1:type_length*count]), type_length, count))
 
 #=============================================================================
 # Bit Unpacking
