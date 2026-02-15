@@ -22,7 +22,7 @@ function read_footer(io::IO)::FileMetaData
     read(io, 4) == PARQUET_MAGIC || error("Missing leading magic")
 
     seek(io, file_size - 8 - footer_len)
-    parse_file_metadata(ThriftDecoder(read(io, footer_len)))
+    parse_file_metadata(read(io, footer_len))
 end
 
 function open_parquet(path::String)::ParquetFile

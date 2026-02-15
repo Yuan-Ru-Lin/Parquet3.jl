@@ -1,377 +1,140 @@
-# Parquet metadata parsing - builds immutable structs
+# Parquet metadata parsing — table-driven Thrift deserialization via Thrift.jl
 
-function parse_schema_element(d::ThriftDecoder)::SchemaElement
-    type = nothing
-    type_length = nothing
-    repetition_type = nothing
-    name = ""
-    num_children = nothing
-    converted_type = nothing
-    scale = nothing
-    precision = nothing
-    field_id = nothing
+import Thrift: julia_type
 
-    push_struct(d)
+"""Generic Thrift struct reader driven by a field table.
+Each entry in `fields` is `(field_id, kwarg_name, reader_function)`."""
+function read_thrift(p, ::Type{T}, fields) where T
+    readStructBegin(p)
+    kw = Dict{Symbol,Any}()
     while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_I32
-            type = ParquetType(Int32(read_zigzag(d)))
-        elseif fid == 2 && type_id == THRIFT_I32
-            type_length = Int32(read_zigzag(d))
-        elseif fid == 3 && type_id == THRIFT_I32
-            repetition_type = FieldRepetitionType(Int32(read_zigzag(d)))
-        elseif fid == 4 && type_id == THRIFT_BINARY
-            name = read_string(d)
-        elseif fid == 5 && type_id == THRIFT_I32
-            num_children = Int32(read_zigzag(d))
-        elseif fid == 6 && type_id == THRIFT_I32
-            converted_type = ConvertedType(Int32(read_zigzag(d)))
-        elseif fid == 7 && type_id == THRIFT_I32
-            scale = Int32(read_zigzag(d))
-        elseif fid == 8 && type_id == THRIFT_I32
-            precision = Int32(read_zigzag(d))
-        elseif fid == 9 && type_id == THRIFT_I32
-            field_id = Int32(read_zigzag(d))
+        _, ttype, fid = readFieldBegin(p)
+        ttype == TType.STOP && break
+        idx = findfirst(f -> first(f) == fid, fields)
+        if idx !== nothing
+            _, name, reader = fields[idx]
+            kw[name] = reader(p)
         else
-            skip_value(d, type_id)
+            skip(p, julia_type(ttype))
         end
+        readFieldEnd(p)
     end
-    pop_struct(d)
-
-    SchemaElement(type, type_length, repetition_type, name, num_children,
-                  converted_type, scale, precision, field_id)
+    readStructEnd(p)
+    T(; kw...)
 end
 
-function parse_statistics(d::ThriftDecoder)::Statistics
-    max = min = null_count = distinct_count = max_value = min_value = nothing
-
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_BINARY
-            max = read_binary(d)
-        elseif fid == 2 && type_id == THRIFT_BINARY
-            min = read_binary(d)
-        elseif fid == 3 && type_id == THRIFT_I64
-            null_count = read_zigzag(d)
-        elseif fid == 4 && type_id == THRIFT_I64
-            distinct_count = read_zigzag(d)
-        elseif fid == 5 && type_id == THRIFT_BINARY
-            max_value = read_binary(d)
-        elseif fid == 6 && type_id == THRIFT_BINARY
-            min_value = read_binary(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    Statistics(max, min, null_count, distinct_count, max_value, min_value)
+"""Read a Thrift list, calling `reader` for each element."""
+function read_list(p, reader)
+    _, n = readListBegin(p)
+    items = [reader(p) for _ in 1:n]
+    readListEnd(p)
+    items
 end
 
-function parse_column_metadata(d::ThriftDecoder)::ColumnMetaData
-    type = BOOLEAN
-    encodings = Encoding[]
-    path_in_schema = String[]
-    codec = UNCOMPRESSED
-    num_values = Int64(0)
-    total_uncompressed_size = Int64(0)
-    total_compressed_size = Int64(0)
-    data_page_offset = Int64(0)
-    index_page_offset = nothing
-    dictionary_page_offset = nothing
-    statistics = nothing
+# ── Field tables ──────────────────────────────────────────────────────────
 
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
+const SCHEMA_ELEMENT_FIELDS = [
+    (1, :type,            p -> ParquetType(read(p, Int32))),
+    (2, :type_length,     p -> read(p, Int32)),
+    (3, :repetition_type, p -> FieldRepetitionType(read(p, Int32))),
+    (4, :name,            p -> read(p, String)),
+    (5, :num_children,    p -> read(p, Int32)),
+    (6, :converted_type,  p -> ConvertedType(read(p, Int32))),
+    (7, :scale,           p -> read(p, Int32)),
+    (8, :precision,       p -> read(p, Int32)),
+    (9, :field_id,        p -> read(p, Int32)),
+]
 
-        if fid == 1 && type_id == THRIFT_I32
-            type = ParquetType(Int32(read_zigzag(d)))
-        elseif fid == 2 && type_id == THRIFT_LIST
-            _, size = read_list_header(d)
-            encodings = [Encoding(Int32(read_zigzag(d))) for _ in 1:size]
-        elseif fid == 3 && type_id == THRIFT_LIST
-            _, size = read_list_header(d)
-            path_in_schema = [read_string(d) for _ in 1:size]
-        elseif fid == 4 && type_id == THRIFT_I32
-            codec = CompressionCodec(Int32(read_zigzag(d)))
-        elseif fid == 5 && type_id == THRIFT_I64
-            num_values = read_zigzag(d)
-        elseif fid == 6 && type_id == THRIFT_I64
-            total_uncompressed_size = read_zigzag(d)
-        elseif fid == 7 && type_id == THRIFT_I64
-            total_compressed_size = read_zigzag(d)
-        elseif fid == 9 && type_id == THRIFT_I64
-            data_page_offset = read_zigzag(d)
-        elseif fid == 10 && type_id == THRIFT_I64
-            index_page_offset = read_zigzag(d)
-        elseif fid == 11 && type_id == THRIFT_I64
-            dictionary_page_offset = read_zigzag(d)
-        elseif fid == 12 && type_id == THRIFT_STRUCT
-            statistics = parse_statistics(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
+const STATISTICS_FIELDS = [
+    (1, :max,            p -> read(p, Vector{UInt8})),
+    (2, :min,            p -> read(p, Vector{UInt8})),
+    (3, :null_count,     p -> read(p, Int64)),
+    (4, :distinct_count, p -> read(p, Int64)),
+    (5, :max_value,      p -> read(p, Vector{UInt8})),
+    (6, :min_value,      p -> read(p, Vector{UInt8})),
+]
 
-    ColumnMetaData(type, encodings, path_in_schema, codec, num_values,
-                   total_uncompressed_size, total_compressed_size, data_page_offset,
-                   index_page_offset, dictionary_page_offset, statistics)
-end
+const COLUMN_METADATA_FIELDS = [
+    (1,  :type,                    p -> ParquetType(read(p, Int32))),
+    (2,  :encodings,               p -> read_list(p, q -> Encoding(read(q, Int32)))),
+    (3,  :path_in_schema,          p -> read_list(p, q -> read(q, String))),
+    (4,  :codec,                   p -> CompressionCodec(read(p, Int32))),
+    (5,  :num_values,              p -> read(p, Int64)),
+    (6,  :total_uncompressed_size, p -> read(p, Int64)),
+    (7,  :total_compressed_size,   p -> read(p, Int64)),
+    (9,  :data_page_offset,        p -> read(p, Int64)),
+    (10, :index_page_offset,       p -> read(p, Int64)),
+    (11, :dictionary_page_offset,  p -> read(p, Int64)),
+    (12, :statistics,              p -> read_thrift(p, Statistics, STATISTICS_FIELDS)),
+]
 
-function parse_column_chunk(d::ThriftDecoder)::ColumnChunk
-    file_path = nothing
-    file_offset = Int64(0)
-    meta_data = nothing
+const COLUMN_CHUNK_FIELDS = [
+    (1, :file_path,  p -> read(p, String)),
+    (2, :file_offset, p -> read(p, Int64)),
+    (3, :meta_data,  p -> read_thrift(p, ColumnMetaData, COLUMN_METADATA_FIELDS)),
+]
 
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
+const ROW_GROUP_FIELDS = [
+    (1, :columns,               p -> read_list(p, q -> read_thrift(q, ColumnChunk, COLUMN_CHUNK_FIELDS))),
+    (2, :total_byte_size,       p -> read(p, Int64)),
+    (3, :num_rows,              p -> read(p, Int64)),
+    (6, :file_offset,           p -> read(p, Int64)),
+    (7, :total_compressed_size, p -> read(p, Int64)),
+]
 
-        if fid == 1 && type_id == THRIFT_BINARY
-            file_path = read_string(d)
-        elseif fid == 2 && type_id == THRIFT_I64
-            file_offset = read_zigzag(d)
-        elseif fid == 3 && type_id == THRIFT_STRUCT
-            meta_data = parse_column_metadata(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
+const KEY_VALUE_FIELDS = [
+    (1, :key,   p -> read(p, String)),
+    (2, :value, p -> read(p, String)),
+]
 
-    ColumnChunk(file_path, file_offset, meta_data)
-end
+const FILE_METADATA_FIELDS = [
+    (1, :version,            p -> read(p, Int32)),
+    (2, :schema,             p -> read_list(p, q -> read_thrift(q, SchemaElement, SCHEMA_ELEMENT_FIELDS))),
+    (3, :num_rows,           p -> read(p, Int64)),
+    (4, :row_groups,         p -> read_list(p, q -> read_thrift(q, RowGroup, ROW_GROUP_FIELDS))),
+    (5, :key_value_metadata, p -> read_list(p, q -> read_thrift(q, KeyValue, KEY_VALUE_FIELDS))),
+    (6, :created_by,         p -> read(p, String)),
+]
 
-function parse_row_group(d::ThriftDecoder)::RowGroup
-    columns = ColumnChunk[]
-    total_byte_size = Int64(0)
-    num_rows = Int64(0)
-    file_offset = nothing
-    total_compressed_size = nothing
+const DATA_PAGE_HEADER_FIELDS = [
+    (1, :num_values,                  p -> read(p, Int32)),
+    (2, :encoding,                    p -> Encoding(read(p, Int32))),
+    (3, :definition_level_encoding,   p -> Encoding(read(p, Int32))),
+    (4, :repetition_level_encoding,   p -> Encoding(read(p, Int32))),
+    (5, :statistics,                  p -> read_thrift(p, Statistics, STATISTICS_FIELDS)),
+]
 
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
+const DATA_PAGE_HEADER_V2_FIELDS = [
+    (1, :num_values,                      p -> read(p, Int32)),
+    (2, :num_nulls,                       p -> read(p, Int32)),
+    (3, :num_rows,                        p -> read(p, Int32)),
+    (4, :encoding,                        p -> Encoding(read(p, Int32))),
+    (5, :definition_levels_byte_length,   p -> read(p, Int32)),
+    (6, :repetition_levels_byte_length,   p -> read(p, Int32)),
+    (7, :is_compressed,                   p -> read(p, Bool)),
+    (8, :statistics,                      p -> read_thrift(p, Statistics, STATISTICS_FIELDS)),
+]
 
-        if fid == 1 && type_id == THRIFT_LIST
-            _, size = read_list_header(d)
-            columns = [parse_column_chunk(d) for _ in 1:size]
-        elseif fid == 2 && type_id == THRIFT_I64
-            total_byte_size = read_zigzag(d)
-        elseif fid == 3 && type_id == THRIFT_I64
-            num_rows = read_zigzag(d)
-        elseif fid == 6 && type_id == THRIFT_I64
-            file_offset = read_zigzag(d)
-        elseif fid == 7 && type_id == THRIFT_I64
-            total_compressed_size = read_zigzag(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
+const DICTIONARY_PAGE_HEADER_FIELDS = [
+    (1, :num_values, p -> read(p, Int32)),
+    (2, :encoding,   p -> Encoding(read(p, Int32))),
+    (3, :is_sorted,  p -> read(p, Bool)),
+]
 
-    RowGroup(columns, total_byte_size, num_rows, file_offset, total_compressed_size)
-end
+const PAGE_HEADER_FIELDS = [
+    (1, :type,                    p -> PageType(read(p, Int32))),
+    (2, :uncompressed_page_size,  p -> read(p, Int32)),
+    (3, :compressed_page_size,    p -> read(p, Int32)),
+    (4, :crc,                     p -> read(p, Int32)),
+    (5, :data_page_header,        p -> read_thrift(p, DataPageHeader, DATA_PAGE_HEADER_FIELDS)),
+    (7, :dictionary_page_header,  p -> read_thrift(p, DictionaryPageHeader, DICTIONARY_PAGE_HEADER_FIELDS)),
+    (8, :data_page_header_v2,     p -> read_thrift(p, DataPageHeaderV2, DATA_PAGE_HEADER_V2_FIELDS)),
+]
 
-function parse_key_value(d::ThriftDecoder)::KeyValue
-    key = ""
-    value = nothing
+# ── Public API (matches old signatures) ──────────────────────────────────
 
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
+parse_file_metadata(data::Vector{UInt8}) =
+    read_thrift(TCompactProtocol(TMemoryTransport(data)), FileMetaData, FILE_METADATA_FIELDS)
 
-        if fid == 1 && type_id == THRIFT_BINARY
-            key = read_string(d)
-        elseif fid == 2 && type_id == THRIFT_BINARY
-            value = read_string(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    KeyValue(key, value)
-end
-
-function parse_file_metadata(d::ThriftDecoder)::FileMetaData
-    version = Int32(0)
-    schema = SchemaElement[]
-    num_rows = Int64(0)
-    row_groups = RowGroup[]
-    key_value_metadata = nothing
-    created_by = nothing
-
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_I32
-            version = Int32(read_zigzag(d))
-        elseif fid == 2 && type_id == THRIFT_LIST
-            _, size = read_list_header(d)
-            schema = [parse_schema_element(d) for _ in 1:size]
-        elseif fid == 3 && type_id == THRIFT_I64
-            num_rows = read_zigzag(d)
-        elseif fid == 4 && type_id == THRIFT_LIST
-            _, size = read_list_header(d)
-            row_groups = [parse_row_group(d) for _ in 1:size]
-        elseif fid == 5 && type_id == THRIFT_LIST
-            _, size = read_list_header(d)
-            key_value_metadata = [parse_key_value(d) for _ in 1:size]
-        elseif fid == 6 && type_id == THRIFT_BINARY
-            created_by = read_string(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    FileMetaData(version, schema, num_rows, row_groups, key_value_metadata, created_by)
-end
-
-function parse_data_page_header(d::ThriftDecoder)::DataPageHeader
-    num_values = Int32(0)
-    encoding = PLAIN
-    def_encoding = RLE
-    rep_encoding = RLE
-    statistics = nothing
-
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_I32
-            num_values = Int32(read_zigzag(d))
-        elseif fid == 2 && type_id == THRIFT_I32
-            encoding = Encoding(Int32(read_zigzag(d)))
-        elseif fid == 3 && type_id == THRIFT_I32
-            def_encoding = Encoding(Int32(read_zigzag(d)))
-        elseif fid == 4 && type_id == THRIFT_I32
-            rep_encoding = Encoding(Int32(read_zigzag(d)))
-        elseif fid == 5 && type_id == THRIFT_STRUCT
-            statistics = parse_statistics(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    DataPageHeader(num_values, encoding, def_encoding, rep_encoding, statistics)
-end
-
-function parse_data_page_header_v2(d::ThriftDecoder)::DataPageHeaderV2
-    num_values = Int32(0)
-    num_nulls = Int32(0)
-    num_rows = Int32(0)
-    encoding = PLAIN
-    def_bytes = Int32(0)
-    rep_bytes = Int32(0)
-    is_compressed = true
-    statistics = nothing
-
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_I32
-            num_values = Int32(read_zigzag(d))
-        elseif fid == 2 && type_id == THRIFT_I32
-            num_nulls = Int32(read_zigzag(d))
-        elseif fid == 3 && type_id == THRIFT_I32
-            num_rows = Int32(read_zigzag(d))
-        elseif fid == 4 && type_id == THRIFT_I32
-            encoding = Encoding(Int32(read_zigzag(d)))
-        elseif fid == 5 && type_id == THRIFT_I32
-            def_bytes = Int32(read_zigzag(d))
-        elseif fid == 6 && type_id == THRIFT_I32
-            rep_bytes = Int32(read_zigzag(d))
-        elseif fid == 7 && type_id in (THRIFT_TRUE, THRIFT_FALSE)
-            is_compressed = type_id == THRIFT_TRUE
-        elseif fid == 8 && type_id == THRIFT_STRUCT
-            statistics = parse_statistics(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    DataPageHeaderV2(num_values, num_nulls, num_rows, encoding, def_bytes, rep_bytes, is_compressed, statistics)
-end
-
-function parse_dictionary_page_header(d::ThriftDecoder)::DictionaryPageHeader
-    num_values = Int32(0)
-    encoding = PLAIN_DICTIONARY
-    is_sorted = false
-
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_I32
-            num_values = Int32(read_zigzag(d))
-        elseif fid == 2 && type_id == THRIFT_I32
-            encoding = Encoding(Int32(read_zigzag(d)))
-        elseif fid == 3 && type_id in (THRIFT_TRUE, THRIFT_FALSE)
-            is_sorted = type_id == THRIFT_TRUE
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    DictionaryPageHeader(num_values, encoding, is_sorted)
-end
-
-function parse_page_header(d::ThriftDecoder)::PageHeader
-    type = DATA_PAGE
-    uncompressed_size = Int32(0)
-    compressed_size = Int32(0)
-    crc = nothing
-    data_page_header = nothing
-    dictionary_page_header = nothing
-    data_page_header_v2 = nothing
-
-    push_struct(d)
-    while true
-        type_id, fid = read_field_header(d)
-        type_id == THRIFT_STOP && break
-
-        if fid == 1 && type_id == THRIFT_I32
-            type = PageType(Int32(read_zigzag(d)))
-        elseif fid == 2 && type_id == THRIFT_I32
-            uncompressed_size = Int32(read_zigzag(d))
-        elseif fid == 3 && type_id == THRIFT_I32
-            compressed_size = Int32(read_zigzag(d))
-        elseif fid == 4 && type_id == THRIFT_I32
-            crc = Int32(read_zigzag(d))
-        elseif fid == 5 && type_id == THRIFT_STRUCT
-            data_page_header = parse_data_page_header(d)
-        elseif fid == 7 && type_id == THRIFT_STRUCT
-            dictionary_page_header = parse_dictionary_page_header(d)
-        elseif fid == 8 && type_id == THRIFT_STRUCT
-            data_page_header_v2 = parse_data_page_header_v2(d)
-        else
-            skip_value(d, type_id)
-        end
-    end
-    pop_struct(d)
-
-    PageHeader(type, uncompressed_size, compressed_size, crc,
-               data_page_header, dictionary_page_header, data_page_header_v2)
-end
+parse_page_header(data::Vector{UInt8}) =
+    read_thrift(TCompactProtocol(TMemoryTransport(data)), PageHeader, PAGE_HEADER_FIELDS)

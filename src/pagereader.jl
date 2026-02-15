@@ -21,10 +21,12 @@ end
 function read_page_header(io::IO)::Tuple{PageHeader, Int}
     start = position(io)
     data = read(io, min(1024, max(0, filesize(io) - start)))
-    decoder = ThriftDecoder(data)
-    header = parse_page_header(decoder)
-    seek(io, start + decoder.pos - 1)
-    (header, decoder.pos - 1)
+    t = TMemoryTransport(data)
+    p = TCompactProtocol(t)
+    header = read_thrift(p, PageHeader, PAGE_HEADER_FIELDS)
+    bytes_consumed = position(t.buff)
+    seek(io, start + bytes_consumed)
+    (header, bytes_consumed)
 end
 
 function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, encoding::Encoding)

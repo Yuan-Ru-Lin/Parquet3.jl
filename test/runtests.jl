@@ -4,17 +4,6 @@ using Tables
 
 @testset "Parquet3.jl" begin
 
-    @testset "Thrift Decoder" begin
-        d = Parquet3.ThriftDecoder(UInt8[0x96, 0x01])
-        @test Parquet3.read_varint(d) == 150
-
-        d = Parquet3.ThriftDecoder(UInt8[0x01])
-        @test Parquet3.read_zigzag(d) == -1
-
-        d = Parquet3.ThriftDecoder(UInt8[0x02])
-        @test Parquet3.read_zigzag(d) == 1
-    end
-
     @testset "Plain Encoding" begin
         data = collect(reinterpret(UInt8, Int32[1, 2, 3, 4, 5]))
         @test collect(Parquet3.decode_plain_int32(data, 5)) == Int32[1, 2, 3, 4, 5]

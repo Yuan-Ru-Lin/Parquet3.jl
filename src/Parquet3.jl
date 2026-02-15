@@ -3,11 +3,13 @@ module Parquet3
 using Dates
 using ArraysOfArrays: nestedview, VectorOfVectors
 using BitIntegers: @define_integers
+using Thrift: TCompactProtocol, TMemoryTransport, TType,
+    readStructBegin, readStructEnd, readFieldBegin, readFieldEnd,
+    readListBegin, readListEnd, skip
 
 @define_integers 96
 
 include("types.jl")
-include("thrift.jl")
 include("metadata.jl")
 include("encodings.jl")
 include("compression.jl")
