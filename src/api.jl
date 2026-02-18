@@ -45,12 +45,22 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
                 pages = _read_pages(pf, path, node)
                 col_name, (isempty(pages) ? Arrow.List{String, Int32, Vector{UInt8}}(UInt8[], Arrow.ValidityBitmap(UInt8[], 1, 0, 0), Arrow.Offsets(UInt8[], Int32[0]), UInt8[], 0, nothing) :
                     _to_arrow_bytes(pages, node.max_def_level, node.element.converted_type == CT_UTF8))
+            elseif is_nested && !haskey(fsl_info, top_name)
+                pages = _read_pages(pf, path, node)
+                if isempty(pages)
+                    top_name, Vector{Any}()
+                else
+                    all_rep, all_def, raw = collect_page_data(pages, node.max_def_level)
+                    converted = convert_primitive_values(raw, node.element.type, node.element.converted_type)
+                    def_thresholds = compute_def_thresholds(schema_tree, path)
+                    top_name, _to_arrow_nested(all_rep, all_def, converted,
+                        node.max_def_level, node.max_rep_level, def_thresholds,
+                        node.element.type, node.element.converted_type)
+                end
             else
                 values, nulls = read_column_data(pf, path, node, schema_tree)
                 if is_nested && haskey(fsl_info, top_name)
                     top_name, convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
-                elseif is_nested
-                    top_name, convert_nested_type(values, nulls, node.max_rep_level)
                 else
                     col_name, _to_arrow(values, nulls, node.element)
                 end
@@ -171,6 +181,151 @@ function _validity(nulls::BitVector)
     Arrow.ValidityBitmap(bytes, 1, length(nulls), nc)
 end
 
+"""Build the appropriate Arrow leaf array from flat leaf values and nulls."""
+function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector, ptype, ctype) where T
+    v = _validity(leaf_nulls)
+    has_nulls = v.nc > 0
+    n = length(leaf_nulls)
+
+    if ptype == BYTE_ARRAY
+        # String/bytes: build Arrow.List with flat byte data + offsets
+        is_utf8 = ctype == CT_UTF8
+        flat = UInt8[]
+        offsets = Int32[0]
+        for i in 1:n
+            if !leaf_nulls[i]
+                append!(flat, codeunits(leaf_values[i]))
+            end
+            push!(offsets, Int32(length(flat)))
+        end
+        BT = is_utf8 ? String : Vector{UInt8}
+        ET = has_nulls ? Union{Missing,BT} : BT
+        return Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, n, nothing)
+    elseif ptype == BOOLEAN
+        bytes = zeros(UInt8, cld(n, 8))
+        for i in 1:n
+            if !leaf_nulls[i] && leaf_values[i]
+                bytes[((i-1) >> 3) + 1] |= UInt8(1) << ((i-1) & 7)
+            end
+        end
+        ET = has_nulls ? Union{Missing,Bool} : Bool
+        return Arrow.BoolVector{ET}(bytes, 1, v, Int64(n), nothing)
+    else
+        ET = has_nulls ? Union{Missing,T} : T
+        return Arrow.Primitive(ET, UInt8[], v, leaf_values, n, nothing)
+    end
+end
+
+"""Build Arrow.List directly from rep/def levels — single pass, no intermediate Vector{Vector{T}}."""
+function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, max_rep,
+                          def_thresholds, ptype, ctype) where T
+    # Innermost threshold: min def_level for a leaf element to exist
+    inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
+
+    # Pre-scan for leaf nulls
+    has_leaf_nulls = inner_threshold < max_def && any(d -> inner_threshold <= d < max_def, all_def)
+
+    # Offset arrays for each nesting depth (1-indexed, k=1 is outermost list)
+    offsets = [Int32[0] for _ in 1:max_rep]
+    child_count = zeros(Int32, max_rep)
+
+    # Record-level nulls (top level)
+    num_records = count(==(0), all_rep)
+    record_nulls = falses(num_records)
+
+    # Flat leaf data
+    leaf_values = T[]
+    leaf_nulls = BitVector()
+
+    record_idx = 0
+    value_idx = 1
+
+    for i in eachindex(all_rep)
+        rep = all_rep[i]
+        def = all_def[i]
+
+        # Finalization: when rep = j, push offsets at levels j+1 .. max_rep
+        # For rep=0, this means all levels 1..max_rep get finalized
+        if rep == 0
+            # Finalize all levels for previous record
+            if record_idx > 0
+                for k in max_rep:-1:1
+                    push!(offsets[k], child_count[k])
+                end
+            end
+            record_idx += 1
+
+            # Null record: def=0 means the entire record is null
+            if def == 0 && max_def > 0
+                record_nulls[record_idx] = true
+                # Still need to push offset entries for this null record at the end
+                # (handled by the finalization on next rep=0 or after loop)
+                # Increment child counts for levels that get empty slices: none
+                continue
+            end
+        else
+            # Finalize levels from max_rep down to rep+1
+            for k in max_rep:-1:(rep + 1)
+                push!(offsets[k], child_count[k])
+            end
+        end
+
+        # Item creation: new items at levels max(1,rep)..max_rep
+        # Level k item exists when def >= def_thresholds[k]
+        for k in max(1, rep):max_rep
+            if k <= length(def_thresholds) && def >= def_thresholds[k]
+                if k < max_rep
+                    child_count[k] += 1
+                end
+            end
+        end
+        # The innermost level (max_rep) always gets a child count bump from the leaf push below
+
+        # Leaf handling
+        if def == max_def
+            push!(leaf_values, values[value_idx])
+            push!(leaf_nulls, false)
+            child_count[max_rep] += 1
+            value_idx += 1
+        elseif def >= inner_threshold
+            # Leaf element exists but value is null — push placeholder
+            push!(leaf_values, value_idx <= length(values) ? values[1] : zero(T))
+            push!(leaf_nulls, true)
+            child_count[max_rep] += 1
+        end
+        # def < inner_threshold: intermediate empty list, no leaf push
+    end
+
+    # Final finalization for last record
+    if record_idx > 0
+        for k in max_rep:-1:1
+            push!(offsets[k], child_count[k])
+        end
+    end
+
+    # Build bottom-up: leaf array → wrap with List at each level
+    child = _build_leaf_array(leaf_values, leaf_nulls, ptype, ctype)
+
+    for k in max_rep:-1:1
+        ST = SubArray{eltype(child), 1, typeof(child), Tuple{UnitRange{Int64}}, true}
+        offs = Arrow.Offsets(UInt8[], offsets[k])
+        n = length(offsets[k]) - 1
+
+        if k == 1
+            # Top level: apply record nulls
+            v = _validity(record_nulls)
+            ET = v.nc > 0 ? Union{Missing,ST} : ST
+            child = Arrow.List{ET, Int32, typeof(child)}(UInt8[], v, offs, child, n, nothing)
+        else
+            # Intermediate levels: all-valid
+            v = Arrow.ValidityBitmap(UInt8[], 1, n, 0)
+            child = Arrow.List{ST, Int32, typeof(child)}(UInt8[], v, offs, child, n, nothing)
+        end
+    end
+
+    child
+end
+
 """Parse Parquet key-value metadata into Arrow-compatible ImmutableDict."""
 function _parse_kv_metadata(kv::Union{Vector{KeyValue}, Nothing})
     kv === nothing && return nothing
@@ -233,24 +388,6 @@ function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, 
     nestedview(mat)
 end
 
-"""Type nested containers and apply top-level nulls.
-Values are already converted; only intermediate container types need fixing."""
-function convert_nested_type(values, nulls::BitVector, max_rep::Int)
-    typed = _type_containers(values, max_rep)
-    any(nulls) || return typed
-
-    result = Vector{Union{Missing, eltype(typed)}}(undef, length(nulls))
-    for i in eachindex(nulls)
-        result[i] = nulls[i] ? missing : typed[i]
-    end
-    result
-end
-
-"""Recursively narrow container types from Any[] to concrete vectors.
-Leaf lists (depth 0) are already correctly typed from assembly."""
-_type_containers(list, depth) =
-    depth <= 0 ? list :
-    [x === missing ? missing : _type_containers(x, depth - 1) for x in list]
 
 """Get Julia type for a Parquet primitive type."""
 function element_julia_type(ptype, ctype)
