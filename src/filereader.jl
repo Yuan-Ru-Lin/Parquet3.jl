@@ -33,10 +33,14 @@ schema(pf::ParquetFile) = pf.metadata.schema
 metadata(pf::ParquetFile) = pf.metadata
 
 function column_names(pf::ParquetFile)::Vector{String}
+    tree = build_schema_tree(pf.metadata.schema)
+    seen = Set{String}()
     names = String[]
-    for (i, elem) in enumerate(pf.metadata.schema)
-        i == 1 && continue  # Skip root
-        (elem.num_children === nothing || elem.num_children == 0) && push!(names, elem.name)
+    for (path, node) in get_leaf_columns(tree)
+        name = node.max_rep_level > 0 ? path[1] : join(path, ".")
+        name in seen && continue
+        push!(seen, name)
+        push!(names, name)
     end
     names
 end

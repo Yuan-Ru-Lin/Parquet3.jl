@@ -166,6 +166,22 @@ table = pa.table({
     end
 end
 
+@testset "column_names matches read_parquet keys" begin
+    _with_pyarrow_file("column_names consistency", "test_colnames.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+table = pa.table({
+    'id': [1, 2, 3],
+    'name': ['a', 'b', 'c'],
+    'tags': [['x', 'y'], ['z'], ['w']],
+    'scores': [[1, 2], [3, 4], [5, 6]],
+})""") do tbl
+        pf = open_parquet("test_colnames.parquet")
+        expected = collect(string.(Tables.columnnames(tbl)))
+        @test column_names(pf) == expected
+        close(pf)
+    end
+end
+
 @testset "Nested Data (Lists)" begin
     _with_pyarrow_file("nested data (lists)", "test_nested.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
