@@ -62,7 +62,9 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     row_groups = pf.metadata.row_groups
     multi_rg = length(row_groups) > 1
 
-    # Per-column parallelism: each column reads its own row groups from the shared mmap'd data
+    # Per-column parallelism: each column reads its own row groups from the shared mmap'd data.
+    # NUMA optimization opportunity: with ThreadPinning.jl, per-RG decompression/decoding tasks
+    # could be pinned to NUMA-local threads, keeping data close to where it's consumed downstream.
     tasks = map(leaf_columns) do (path, node)
         Threads.@spawn begin
             top_name = path[1]
