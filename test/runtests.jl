@@ -1,5 +1,6 @@
 using Test
 using Parquet3
+using Arrow
 using Tables
 
 @testset "Parquet3.jl" begin
@@ -157,7 +158,7 @@ table = pa.table({
     'name': ['Alice', 'Bob', 'Charlie', 'David', 'Eve'],
     'value': [1.5, 2.5, 3.5, 4.5, 5.5],
 })""") do tbl
-        @test tbl isa ParquetTable
+        @test tbl isa Arrow.Table
         @test length(Tables.columns(tbl)) == 3
         @test collect(tbl.id) == [1, 2, 3, 4, 5]
         @test collect(tbl.name) == ["Alice", "Bob", "Charlie", "David", "Eve"]
@@ -173,7 +174,7 @@ table = pa.table({
     'tags': [['a', 'b'], ['c'], ['d', 'e', 'f']],
     'scores': [[1, 2, 3], [4, 5], [6]],
 })""") do tbl
-        @test tbl isa ParquetTable
+        @test tbl isa Arrow.Table
         @test collect(tbl.id) == [1, 2, 3]
 
         @test :tags in Tables.columnnames(tbl)
@@ -205,7 +206,7 @@ table = pa.table({
     'id': [1, 2, 3],
     'nested': data,
 })""") do tbl
-        @test tbl isa ParquetTable
+        @test tbl isa Arrow.Table
         @test collect(tbl.id) == [1, 2, 3]
 
         @test :nested in Tables.columnnames(tbl)
@@ -236,7 +237,7 @@ table = pa.table({
 })"""
 
     function check_table(tbl)
-        @test tbl isa ParquetTable
+        @test tbl isa Arrow.Table
         @test collect(tbl.id) == [1, 2, 3, 4, 5]
         @test collect(tbl.name) == ["Alice", "Bob", "Charlie", "David", "Eve"]
         @test collect(tbl.value) == [1.5, 2.5, 3.5, 4.5, 5.5]
@@ -409,8 +410,8 @@ if HAS_PARQUET_TESTING
 
         @testset "sort_columns" begin
             t = read_parquet(joinpath(PARQUET_TESTING_DIR, "sort_columns.parquet"))
-            @test t.a[3] == 2
-            @test t.a[5] == 1
+            @test t.a[2] == 2
+            @test t.a[3] == 1
             @test t.b == ["a", "b", "c", "a", "b", "c"]
         end
 

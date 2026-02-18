@@ -1,9 +1,9 @@
 # High-level API for reading Parquet files
 
 """
-    read_parquet(path::String; columns=nothing) -> ParquetTable
+    read_parquet(path::String; columns=nothing) -> Arrow.Table
 
-Read a Parquet file and return a ParquetTable (Tables.jl-compatible).
+Read a Parquet file and return an Arrow.Table (Tables.jl-compatible).
 """
 function read_parquet(path::String; columns::Union{Vector{String}, Nothing}=nothing)
     pf = open_parquet(path)
@@ -19,7 +19,6 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     leaf_columns = get_leaf_columns(schema_tree)
     fsl_info = parse_arrow_schema(pf.metadata.key_value_metadata)
 
-    # Filter columns if specified
     if columns !== nothing
         leaf_columns = filter(leaf_columns) do (path, node)
             col_name = join(path, ".")
@@ -27,24 +26,34 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         end
     end
 
-    # Build column data
     col_names = Symbol[]
-    col_vectors = []
+    col_vectors = AbstractVector[]
 
     for (path, node) in leaf_columns
         top_name = path[1]
         col_name = join(path, ".")
 
         try
-            values, nulls = read_column_data(pf, path, node, schema_tree)
             is_nested = node.max_rep_level > 0
+            ptype = node.element.type
 
-            name, converted = if is_nested && haskey(fsl_info, top_name)
-                top_name, convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
-            elseif is_nested
-                top_name, convert_nested_type(values, nulls, node.max_rep_level)
+            name, converted = if !is_nested && ptype == BOOLEAN
+                pages = _read_pages(pf, path, node)
+                col_name, (isempty(pages) ? Arrow.BoolVector{Bool}(UInt8[], 1, Arrow.ValidityBitmap(UInt8[], 1, 0, 0), Int64(0), nothing) :
+                    _to_arrow_bool(pages, node.max_def_level))
+            elseif !is_nested && ptype == BYTE_ARRAY
+                pages = _read_pages(pf, path, node)
+                col_name, (isempty(pages) ? Arrow.List{String, Int32, Vector{UInt8}}(UInt8[], Arrow.ValidityBitmap(UInt8[], 1, 0, 0), Arrow.Offsets(UInt8[], Int32[0]), UInt8[], 0, nothing) :
+                    _to_arrow_bytes(pages, node.max_def_level, node.element.converted_type == CT_UTF8))
             else
-                col_name, convert_to_julia_type(values, nulls, node.element)
+                values, nulls = read_column_data(pf, path, node, schema_tree)
+                if is_nested && haskey(fsl_info, top_name)
+                    top_name, convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+                elseif is_nested
+                    top_name, convert_nested_type(values, nulls, node.max_rep_level)
+                else
+                    col_name, _to_arrow(values, nulls, node.element)
+                end
             end
             push!(col_names, Symbol(name))
             push!(col_vectors, converted)
@@ -53,13 +62,17 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         end
     end
 
-    ParquetTable(col_names, col_vectors)
+    col_types = Type[eltype(v) for v in col_vectors]
+    lookup = Dict{Symbol,AbstractVector}(zip(col_names, col_vectors))
+    meta = _parse_kv_metadata(pf.metadata.key_value_metadata)
+    Arrow.Table(col_names, col_types, col_vectors, lookup,
+        Ref{Arrow.Meta.Schema}(),
+        Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(meta))
 end
 
-"""Read column data from all row groups."""
-function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode, schema_tree::SchemaNode)
+"""Collect decoded pages from all row groups for a column."""
+function _read_pages(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode)
     type_length = Int(something(node.element.type_length, 0))
-
     all_pages = DecodedPage[]
     for rg in pf.metadata.row_groups
         idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == column_path, rg.columns)
@@ -67,7 +80,12 @@ function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::Sc
         reader = ColumnReader(pf.io, rg.columns[idx].meta_data, node, type_length)
         append!(all_pages, read_all_pages(reader))
     end
+    all_pages
+end
 
+"""Read column data from all row groups."""
+function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode, schema_tree::SchemaNode)
+    all_pages = _read_pages(pf, column_path, node)
     isempty(all_pages) && return ([], falses(0))
     def_thresholds = compute_def_thresholds(schema_tree, column_path)
     max_def = node.max_def_level
@@ -85,22 +103,83 @@ function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::Sc
     assemble_nested(all_rep, all_def, converted, max_def, max_rep, T, def_thresholds)
 end
 
-"""Convert Parquet values to appropriate Julia types with nulls as missing."""
-function convert_to_julia_type(values, nulls::BitVector, elem::SchemaElement)
-    converted = convert_primitive_values(values, elem.type, elem.converted_type)
-    any(nulls) || return converted
-
-    result = Vector{Union{Missing, eltype(converted)}}(undef, length(nulls))
-    val_idx = 1
-    for i in eachindex(nulls)
-        if nulls[i]
-            result[i] = missing
-        else
-            result[i] = converted[val_idx]
-            val_idx += 1
+"""Build Arrow.BoolVector directly from decoded pages, preserving bit-packing."""
+function _to_arrow_bool(pages::Vector{<:DecodedPage}, max_def::Int)
+    total = sum(p.num_values for p in pages)
+    bytes = zeros(UInt8, cld(total, 8))
+    nulls = falses(total)
+    out = 0
+    for page in pages
+        src = page.values::BitVector
+        val = 0
+        for i in 1:page.num_values
+            out += 1
+            if page.def_levels !== nothing && page.def_levels[i] < max_def
+                nulls[out] = true
+            else
+                val += 1
+                # Copy bit directly from source BitVector chunk to output byte
+                src_bit = (src.chunks[((val-1) >> 6) + 1] >> ((val-1) & 63)) & UInt64(1)
+                bytes[((out-1) >> 3) + 1] |= UInt8(src_bit) << ((out-1) & 7)
+            end
         end
     end
-    result
+    v = _validity(nulls)
+    ET = v.nc > 0 ? Union{Missing,Bool} : Bool
+    Arrow.BoolVector{ET}(bytes, 1, v, Int64(total), nothing)
+end
+
+"""Build Arrow.List directly from decoded pages — one pass, no intermediate Vector{SubArray}."""
+function _to_arrow_bytes(pages::Vector{<:DecodedPage}, max_def::Int, is_utf8::Bool)
+    total = sum(p.num_values for p in pages)
+    flat = UInt8[]
+    offsets = Int32[0]
+    nulls = falses(total)
+    out = 0
+    for page in pages
+        val = 0
+        for i in 1:page.num_values
+            out += 1
+            if page.def_levels !== nothing && page.def_levels[i] < max_def
+                nulls[out] = true
+            else
+                val += 1
+                append!(flat, page.values[val])
+            end
+            push!(offsets, Int32(length(flat)))
+        end
+    end
+    v = _validity(nulls)
+    T = is_utf8 ? String : Vector{UInt8}
+    ET = v.nc > 0 ? Union{Missing,T} : T
+    Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, total, nothing)
+end
+
+"""Wrap flat numeric column (values, nulls) from assemble_flat_column into Arrow.Primitive."""
+function _to_arrow(values, nulls::BitVector, elem::SchemaElement)
+    v = _validity(nulls)
+    converted = convert_primitive_values(values, elem.type, elem.converted_type)
+    T = eltype(converted)
+    Arrow.Primitive(v.nc > 0 ? Union{Missing,T} : T, UInt8[], v, converted, length(nulls), nothing)
+end
+
+"""Invert a Parquet nulls BitVector into an Arrow ValidityBitmap."""
+function _validity(nulls::BitVector)
+    nc = count(nulls)
+    nc == 0 && return Arrow.ValidityBitmap(UInt8[], 1, length(nulls), 0)
+    bytes = Vector{UInt8}(reinterpret(UInt8, .~nulls.chunks))
+    Arrow.ValidityBitmap(bytes, 1, length(nulls), nc)
+end
+
+"""Parse Parquet key-value metadata into Arrow-compatible ImmutableDict."""
+function _parse_kv_metadata(kv::Union{Vector{KeyValue}, Nothing})
+    kv === nothing && return nothing
+    isempty(kv) && return nothing
+    d = Base.ImmutableDict(kv[1].key => something(kv[1].value, ""))
+    for i in 2:length(kv)
+        d = Base.ImmutableDict(d, kv[i].key => something(kv[i].value, ""))
+    end
+    d
 end
 
 """Convert primitive values based on Parquet and converted types."""

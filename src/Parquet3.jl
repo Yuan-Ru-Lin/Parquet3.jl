@@ -1,6 +1,7 @@
 module Parquet3
 
 using Dates
+using Arrow
 using ArraysOfArrays: nestedview, VectorOfVectors
 using BitIntegers: @define_integers
 using Thrift: TCompactProtocol, TMemoryTransport, TType,
@@ -15,7 +16,6 @@ include("encodings.jl")
 include("compression.jl")
 include("filereader.jl")
 include("pagereader.jl")
-include("table.jl")
 include("arrow_schema.jl")
 include("api.jl")
 
@@ -28,7 +28,6 @@ export
     column_names,
     schema_string,
     metadata,
-    ParquetFile,
-    ParquetTable
+    ParquetFile
 
 end # module Parquet3
