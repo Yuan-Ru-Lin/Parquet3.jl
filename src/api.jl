@@ -1,5 +1,38 @@
 # High-level API for reading Parquet files
 
+# ── FixedSizeList types ──────────────────────────────────────────────────────
+
+"""Lightweight zero-copy view into a flat array, carrying list size N in the type."""
+struct FixedSizeView{N, T} <: AbstractVector{T}
+    parent::Vector{T}
+    offset::Int  # 0-based; element j is at parent[offset + j]
+end
+
+Base.size(::FixedSizeView{N}) where N = (N,)
+Base.IndexStyle(::Type{<:FixedSizeView}) = Base.IndexLinear()
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeView{N,T}, i::Int) where {N,T}
+    @boundscheck checkbounds(v, i)
+    @inbounds v.parent[v.offset + i]
+end
+
+# Tell Arrow.write this is a FixedSizeList element
+ArrowTypes.ArrowKind(::Type{FixedSizeView{N,T}}) where {N,T} = ArrowTypes.FixedSizeListKind{N,T}()
+
+"""Fixed-size list column: flat child array with fixed stride N, plus record-level nulls."""
+struct FixedSizeListVector{N, T} <: AbstractVector{Union{Missing, FixedSizeView{N, T}}}
+    data::Vector{T}
+    nulls::BitVector    # true = record is null
+    len::Int
+end
+
+Base.size(v::FixedSizeListVector) = (v.len,)
+Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeListVector{N,T}, i::Int) where {N,T}
+    @boundscheck checkbounds(v, i)
+    v.nulls[i] && return missing
+    FixedSizeView{N,T}(v.data, (i - 1) * N)
+end
+
 """
     read_parquet(path::String; columns=nothing) -> Arrow.Table
 
@@ -371,21 +404,26 @@ function _converted_int_type(ptype, ctype)
     nothing
 end
 
-"""Convert a FixedSizeList column to an ArrayOfSimilarArrays (backed by list_size × nrows Matrix).
-Values are already converted; only missing needs replacing with zero."""
+"""Convert nested values into a FixedSizeListVector (flat child array + record-level nulls)."""
 function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int)
     T = element_julia_type(elem.type, elem.converted_type)
-    nrows = length(values)
-
-    mat = Matrix{T}(undef, list_size, nrows)
+    nrows = length(nulls)
+    data = Vector{T}(undef, list_size * nrows)
+    val_idx = 0
     for row in 1:nrows
-        inner = values[row]
-        for col in 1:list_size
-            v = inner[col]
-            mat[col, row] = v === missing ? zero(T) : v
+        base = (row - 1) * list_size
+        if nulls[row]
+            for j in 1:list_size; data[base + j] = zero(T); end
+        else
+            val_idx += 1
+            inner = values[val_idx]
+            for j in 1:list_size
+                v = inner[j]
+                data[base + j] = v === missing ? zero(T) : T(v)
+            end
         end
     end
-    nestedview(mat)
+    FixedSizeListVector{list_size, T}(data, nulls, nrows)
 end
 
 

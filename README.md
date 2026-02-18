@@ -53,7 +53,7 @@ Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Bin
 
 - `List<T>` — returned as `Vector{Vector{T}}`
 - `List<List<T>>` and deeper — arbitrary nesting depth supported
-- `FixedSizeList<T>` — returned as `ArrayOfSimilarArrays` (contiguous `Matrix{T}` memory, `Vector{Vector{T}}` interface); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.)
+- `FixedSizeList<T>` — returned as `FixedSizeListVector{N,T}` (flat `Vector{T}` with fixed stride, zero-copy `FixedSizeView{N,T}` element access); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.)
 
 ### Logical Types
 
@@ -63,4 +63,8 @@ ConvertedType annotations are respected: UTF8, Date, Timestamp (millis/micros), 
 
 - Read-only. No write support.
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
+- `FixedSizeListVector` is not an `Arrow.ArrowVector` subtype. It registers `ArrowKind = FixedSizeListKind{N,T}` so `Arrow.write` can serialize it correctly, but:
+  - Nested FixedSizeList (e.g., `FixedSizeList<FixedSizeList<T>>`) is not supported — only top-level FSL fields are detected from ARROW:schema.
+  - Composition with other Arrow types (e.g., `List<FixedSizeList<T>>`) falls back to variable-length lists at all levels.
+  - Reading back via `Arrow.read` returns Arrow.jl's native `FixedSizeList` (NTuple-based), not `FixedSizeListVector`.
 - LZ4 Hadoop framing (used by older Spark/Hadoop writers) is implemented but not tested end-to-end — only the standard LZ4 raw/frame format is covered by the test suite.
