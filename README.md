@@ -1,6 +1,6 @@
 # Parquet3.jl
 
-A pure Julia Parquet file reader. Returns Tables.jl-compatible tables with no Arrow.jl dependency.
+A pure Julia Parquet file reader. Returns `Arrow.Table` (Tables.jl-compatible) with memory-mapped IO and per-RowGroup parallelism.
 
 ## Usage
 
@@ -12,7 +12,7 @@ tbl.column_name          # access a column
 tbl = read_parquet("data.parquet"; columns=["id", "name"])  # read specific columns
 ```
 
-`ParquetTable` implements the Tables.jl interface, so it works with any consumer:
+`read_parquet` returns an `Arrow.Table`, which implements the Tables.jl interface:
 
 ```julia
 using DataFrames
@@ -51,13 +51,19 @@ Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Bin
 
 ### Nested Types
 
-- `List<T>` — returned as `Vector{Vector{T}}`
-- `List<List<T>>` and deeper — arbitrary nesting depth supported
+- `List<T>` — returned as `Arrow.List` (Tables.jl-compatible, iterable as nested arrays)
+- `List<List<T>>` and deeper — arbitrary nesting depth supported via nested `Arrow.List`
 - `FixedSizeList<T>` — returned as `FixedSizeListVector{N,T}` (flat `Vector{T}` with fixed stride, zero-copy `FixedSizeView{N,T}` element access); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.)
 
 ### Logical Types
 
 ConvertedType annotations are respected: UTF8, Date, Timestamp (millis/micros), Int8/16/32/64, UInt8/16/32/64.
+
+## Architecture
+
+- **Memory-mapped IO**: Files are read via `Mmap.mmap`, producing a shared read-only `Vector{UInt8}`. No `IOStream` seek/read — safe for concurrent access.
+- **Per-RowGroup parallelism**: Each column spawns tasks (`Threads.@spawn`) that process row groups in parallel. Results are composed via `ChainedVector` (zero-copy, no concatenation).
+- **Arrow-native arrays**: Decoded Parquet pages are assembled directly into `Arrow.Primitive`, `Arrow.BoolVector`, and `Arrow.List` — matching Parquet's Dremel encoding to Arrow's offset-based layout in a single pass.
 
 ## Known Limitations
 
