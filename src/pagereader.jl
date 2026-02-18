@@ -1,15 +1,16 @@
 # Page reader for Parquet column data
 
 mutable struct ColumnReader
-    io::IO
+    data::Vector{UInt8}    # shared mmapped bytes (read-only)
+    offset::Int            # current read position (0-based byte offset)
     meta::ColumnMetaData
     schema_node::SchemaNode
     type_length::Int
     dictionary::Union{DictionaryDecoder, Nothing}
 end
 
-ColumnReader(io::IO, meta::ColumnMetaData, node::SchemaNode, type_len::Int=0) =
-    ColumnReader(io, meta, node, type_len, nothing)
+ColumnReader(data::Vector{UInt8}, meta::ColumnMetaData, node::SchemaNode, type_len::Int=0) =
+    ColumnReader(data, 0, meta, node, type_len, nothing)
 
 struct DecodedPage{T, V<:AbstractVector{T}}
     values::V
@@ -18,14 +19,12 @@ struct DecodedPage{T, V<:AbstractVector{T}}
     num_values::Int
 end
 
-function read_page_header(io::IO)::Tuple{PageHeader, Int}
-    start = position(io)
-    data = read(io, min(1024, max(0, filesize(io) - start)))
-    t = TMemoryTransport(data)
+function read_page_header(data::Vector{UInt8}, offset::Int)::Tuple{PageHeader, Int}
+    slice = data[offset+1 : min(offset+1024, length(data))]
+    t = TMemoryTransport(slice)
     p = TCompactProtocol(t)
     header = read_thrift(p, PageHeader, PAGE_HEADER_FIELDS)
     bytes_consumed = position(t.buff)
-    seek(io, start + bytes_consumed)
     (header, bytes_consumed)
 end
 
@@ -67,10 +66,12 @@ end
 function read_page(reader::ColumnReader)
     meta = reader.meta
     chunk_end = something(meta.dictionary_page_offset, meta.data_page_offset) + meta.total_compressed_size
-    position(reader.io) >= chunk_end && return nothing
+    reader.offset >= chunk_end && return nothing
 
-    header, _ = read_page_header(reader.io)
-    page_data = read(reader.io, header.compressed_page_size)
+    header, bytes_consumed = read_page_header(reader.data, reader.offset)
+    reader.offset += bytes_consumed
+    page_data = reader.data[reader.offset+1 : reader.offset+header.compressed_page_size]
+    reader.offset += header.compressed_page_size
 
     # Decompress for DICTIONARY_PAGE and DATA_PAGE (v1) — entire page is compressed.
     # DATA_PAGE_V2 handles decompression of data portion separately.
@@ -144,8 +145,7 @@ function read_page(reader::ColumnReader)
 end
 
 function read_all_pages(reader::ColumnReader)
-    start = something(reader.meta.dictionary_page_offset, reader.meta.data_page_offset)
-    seek(reader.io, start)
+    reader.offset = something(reader.meta.dictionary_page_offset, reader.meta.data_page_offset)
 
     pages = DecodedPage[]
     while true

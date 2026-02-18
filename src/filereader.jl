@@ -1,41 +1,31 @@
 # Parquet file reader
 
 struct ParquetFile
-    io::IO
+    data::Vector{UInt8}   # Mmap.mmap'd file contents
     path::String
     metadata::FileMetaData
 end
 
-function read_footer(io::IO)::FileMetaData
-    seekend(io)
-    file_size = position(io)
+function read_footer(data::Vector{UInt8})::FileMetaData
+    file_size = length(data)
     file_size < 12 && error("File too small")
 
-    seek(io, file_size - 4)
-    read(io, 4) == PARQUET_MAGIC || error("Missing trailing magic")
+    data[end-3:end] == PARQUET_MAGIC || error("Missing trailing magic")
 
-    seek(io, file_size - 8)
-    footer_len = ltoh(read(io, UInt32))
+    footer_len = ltoh(reinterpret(UInt32, data[end-7:end-4])[1])
     footer_len > file_size - 12 && error("Invalid footer length")
 
-    seek(io, 0)
-    read(io, 4) == PARQUET_MAGIC || error("Missing leading magic")
+    data[1:4] == PARQUET_MAGIC || error("Missing leading magic")
 
-    seek(io, file_size - 8 - footer_len)
-    parse_file_metadata(read(io, footer_len))
+    parse_file_metadata(data[end-7-footer_len:end-8])
 end
 
 function open_parquet(path::String)::ParquetFile
-    io = open(path, "r")
-    try
-        ParquetFile(io, path, read_footer(io))
-    catch
-        close(io)
-        rethrow()
-    end
+    data = Mmap.mmap(path)
+    ParquetFile(data, path, read_footer(data))
 end
 
-Base.close(pf::ParquetFile) = close(pf.io)
+Base.close(::ParquetFile) = nothing
 
 num_rows(pf::ParquetFile) = pf.metadata.num_rows
 num_row_groups(pf::ParquetFile) = length(pf.metadata.row_groups)

@@ -120,7 +120,7 @@ function _read_pages(pf::ParquetFile, column_path::Vector{String}, node::SchemaN
     for rg in pf.metadata.row_groups
         idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == column_path, rg.columns)
         idx === nothing && error("Column chunk not found: $(join(column_path, "."))")
-        reader = ColumnReader(pf.io, rg.columns[idx].meta_data, node, type_length)
+        reader = ColumnReader(pf.data, rg.columns[idx].meta_data, node, type_length)
         append!(all_pages, read_all_pages(reader))
     end
     all_pages

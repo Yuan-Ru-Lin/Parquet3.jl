@@ -1,5 +1,6 @@
 module Parquet3
 
+using Mmap
 using Dates
 using Arrow
 using ArraysOfArrays: nestedview, VectorOfVectors
