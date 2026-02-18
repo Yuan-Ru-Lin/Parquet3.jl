@@ -59,50 +59,46 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         end
     end
 
-    col_names = Symbol[]
-    col_vectors = AbstractVector[]
+    row_groups = pf.metadata.row_groups
+    multi_rg = length(row_groups) > 1
 
-    for (path, node) in leaf_columns
-        top_name = path[1]
-        col_name = join(path, ".")
+    # Per-column parallelism: each column reads its own row groups from the shared mmap'd data
+    tasks = map(leaf_columns) do (path, node)
+        Threads.@spawn begin
+            top_name = path[1]
+            col_name = join(path, ".")
+            name = node.max_rep_level > 0 ? top_name : col_name
+            nullable = multi_rg && node.max_def_level > 0
 
-        try
-            is_nested = node.max_rep_level > 0
-            ptype = node.element.type
-
-            name, converted = if !is_nested && ptype == BOOLEAN
-                pages = _read_pages(pf, path, node)
-                col_name, (isempty(pages) ? Arrow.BoolVector{Bool}(UInt8[], 1, Arrow.ValidityBitmap(UInt8[], 1, 0, 0), Int64(0), nothing) :
-                    _to_arrow_bool(pages, node.max_def_level))
-            elseif !is_nested && ptype == BYTE_ARRAY
-                pages = _read_pages(pf, path, node)
-                col_name, (isempty(pages) ? Arrow.List{String, Int32, Vector{UInt8}}(UInt8[], Arrow.ValidityBitmap(UInt8[], 1, 0, 0), Arrow.Offsets(UInt8[], Int32[0]), UInt8[], 0, nothing) :
-                    _to_arrow_bytes(pages, node.max_def_level, node.element.converted_type == CT_UTF8))
-            elseif is_nested && !haskey(fsl_info, top_name)
-                pages = _read_pages(pf, path, node)
-                if isempty(pages)
-                    top_name, Vector{Any}()
-                else
-                    all_rep, all_def, raw = collect_page_data(pages, node.max_def_level)
-                    converted = convert_primitive_values(raw, node.element.type, node.element.converted_type)
-                    def_thresholds = compute_def_thresholds(schema_tree, path)
-                    top_name, _to_arrow_nested(all_rep, all_def, converted,
-                        node.max_def_level, node.max_rep_level, def_thresholds,
-                        node.element.type, node.element.converted_type)
-                end
-            else
-                values, nulls = read_column_data(pf, path, node, schema_tree)
-                if is_nested && haskey(fsl_info, top_name)
-                    top_name, convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
-                else
-                    col_name, _to_arrow(values, nulls, node.element)
+            # Per-row-group parallelism within each column
+            chunk_tasks = map(row_groups) do rg
+                Threads.@spawn begin
+                    pages = _read_pages_for_rg(pf.data, rg, path, node)
+                    _assemble_to_arrow(pages, node, schema_tree, path, fsl_info, top_name; nullable)
                 end
             end
-            push!(col_names, Symbol(name))
-            push!(col_vectors, converted)
-        catch e
-            @warn "Failed to read column $col_name" exception=(e, catch_backtrace())
+            chunks = fetch.(chunk_tasks)
+
+            isempty(chunks) && return nothing
+            column = length(chunks) == 1 ? only(chunks) : ChainedVector(chunks)
+            (Symbol(name), column)
         end
+    end
+
+    # Collect results in column order
+    col_names = Symbol[]
+    col_vectors = AbstractVector[]
+    for (i, task) in enumerate(tasks)
+        result = try
+            fetch(task)
+        catch e
+            col_name = join(first(leaf_columns[i]), ".")
+            @warn "Failed to read column $col_name" exception=(e, catch_backtrace())
+            nothing
+        end
+        result === nothing && continue
+        push!(col_names, result[1])
+        push!(col_vectors, result[2])
     end
 
     col_types = Type[eltype(v) for v in col_vectors]
@@ -113,41 +109,47 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(meta))
 end
 
-"""Collect decoded pages from all row groups for a column."""
-function _read_pages(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode)
+"""Read and decode all pages from one row group's column chunk."""
+function _read_pages_for_rg(data::Vector{UInt8}, rg::RowGroup, column_path::Vector{String}, node::SchemaNode)
+    idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == column_path, rg.columns)
+    idx === nothing && error("Column chunk not found: $(join(column_path, "."))")
     type_length = Int(something(node.element.type_length, 0))
-    all_pages = DecodedPage[]
-    for rg in pf.metadata.row_groups
-        idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == column_path, rg.columns)
-        idx === nothing && error("Column chunk not found: $(join(column_path, "."))")
-        reader = ColumnReader(pf.data, rg.columns[idx].meta_data, node, type_length)
-        append!(all_pages, read_all_pages(reader))
-    end
-    all_pages
+    reader = ColumnReader(data, rg.columns[idx].meta_data, node, type_length)
+    read_all_pages(reader)
 end
 
-"""Read column data from all row groups."""
-function read_column_data(pf::ParquetFile, column_path::Vector{String}, node::SchemaNode, schema_tree::SchemaNode)
-    all_pages = _read_pages(pf, column_path, node)
-    isempty(all_pages) && return ([], falses(0))
-    def_thresholds = compute_def_thresholds(schema_tree, column_path)
+"""Assemble one row group's decoded pages into an Arrow array chunk."""
+function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, schema_tree::SchemaNode,
+                            column_path::Vector{String}, fsl_info, top_name::String; nullable::Bool=false)
+    is_nested = node.max_rep_level > 0
+    ptype = node.element.type
     max_def = node.max_def_level
-    max_rep = node.max_rep_level
 
-    # Flat columns: assemble directly
-    max_rep == 0 && return assemble_column(all_pages, max_def, max_rep, def_thresholds)
-
-    # Nested columns: pre-convert values before assembly so the structure
-    # contains final Julia types (String, Date, etc.) instead of raw Parquet primitives
-    all_rep, all_def, raw_values = collect_page_data(all_pages, max_def)
-    isempty(all_rep) && return ([], falses(0))
-    converted = convert_primitive_values(raw_values, node.element.type, node.element.converted_type)
-    T = eltype(converted)
-    assemble_nested(all_rep, all_def, converted, max_def, max_rep, T, def_thresholds)
+    if !is_nested && ptype == BOOLEAN
+        _to_arrow_bool(pages, max_def; nullable)
+    elseif !is_nested && ptype == BYTE_ARRAY
+        _to_arrow_bytes(pages, max_def, node.element.converted_type == CT_UTF8; nullable)
+    elseif is_nested && !haskey(fsl_info, top_name)
+        all_rep, all_def, raw = collect_page_data(pages, max_def)
+        converted = convert_primitive_values(raw, ptype, node.element.converted_type)
+        def_thresholds = compute_def_thresholds(schema_tree, column_path)
+        _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
+                         def_thresholds, ptype, node.element.converted_type; nullable)
+    elseif is_nested && haskey(fsl_info, top_name)
+        def_thresholds = compute_def_thresholds(schema_tree, column_path)
+        all_rep, all_def, raw = collect_page_data(pages, max_def)
+        converted = convert_primitive_values(raw, ptype, node.element.converted_type)
+        T = eltype(converted)
+        values, nulls = assemble_nested(all_rep, all_def, converted, max_def, node.max_rep_level, T, def_thresholds)
+        convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+    else
+        values, nulls = assemble_flat_column(pages, max_def)
+        _to_arrow(values, nulls, node.element; nullable)
+    end
 end
 
 """Build Arrow.BoolVector directly from decoded pages, preserving bit-packing."""
-function _to_arrow_bool(pages::Vector{<:DecodedPage}, max_def::Int)
+function _to_arrow_bool(pages::Vector{<:DecodedPage}, max_def::Int; nullable::Bool=false)
     total = sum(p.num_values for p in pages)
     bytes = zeros(UInt8, cld(total, 8))
     nulls = falses(total)
@@ -168,12 +170,12 @@ function _to_arrow_bool(pages::Vector{<:DecodedPage}, max_def::Int)
         end
     end
     v = _validity(nulls)
-    ET = v.nc > 0 ? Union{Missing,Bool} : Bool
+    ET = (v.nc > 0 || nullable) ? Union{Missing,Bool} : Bool
     Arrow.BoolVector{ET}(bytes, 1, v, Int64(total), nothing)
 end
 
 """Build Arrow.List directly from decoded pages — one pass, no intermediate Vector{SubArray}."""
-function _to_arrow_bytes(pages::Vector{<:DecodedPage}, max_def::Int, is_utf8::Bool)
+function _to_arrow_bytes(pages::Vector{<:DecodedPage}, max_def::Int, is_utf8::Bool; nullable::Bool=false)
     total = sum(p.num_values for p in pages)
     flat = UInt8[]
     offsets = Int32[0]
@@ -194,16 +196,16 @@ function _to_arrow_bytes(pages::Vector{<:DecodedPage}, max_def::Int, is_utf8::Bo
     end
     v = _validity(nulls)
     T = is_utf8 ? String : Vector{UInt8}
-    ET = v.nc > 0 ? Union{Missing,T} : T
+    ET = (v.nc > 0 || nullable) ? Union{Missing,T} : T
     Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, total, nothing)
 end
 
 """Wrap flat numeric column (values, nulls) from assemble_flat_column into Arrow.Primitive."""
-function _to_arrow(values, nulls::BitVector, elem::SchemaElement)
+function _to_arrow(values, nulls::BitVector, elem::SchemaElement; nullable::Bool=false)
     v = _validity(nulls)
     converted = convert_primitive_values(values, elem.type, elem.converted_type)
     T = eltype(converted)
-    Arrow.Primitive(v.nc > 0 ? Union{Missing,T} : T, UInt8[], v, converted, length(nulls), nothing)
+    Arrow.Primitive((v.nc > 0 || nullable) ? Union{Missing,T} : T, UInt8[], v, converted, length(nulls), nothing)
 end
 
 """Invert a Parquet nulls BitVector into an Arrow ValidityBitmap."""
@@ -215,9 +217,9 @@ function _validity(nulls::BitVector)
 end
 
 """Build the appropriate Arrow leaf array from flat leaf values and nulls."""
-function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector, ptype, ctype) where T
+function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector, ptype, ctype; nullable::Bool=false) where T
     v = _validity(leaf_nulls)
-    has_nulls = v.nc > 0
+    has_nulls = v.nc > 0 || nullable
     n = length(leaf_nulls)
 
     if ptype == BYTE_ARRAY
@@ -251,7 +253,7 @@ end
 
 """Build Arrow.List directly from rep/def levels — single pass, no intermediate Vector{Vector{T}}."""
 function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, max_rep,
-                          def_thresholds, ptype, ctype) where T
+                          def_thresholds, ptype, ctype; nullable::Bool=false) where T
     # Innermost threshold: min def_level for a leaf element to exist
     inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
 
@@ -337,7 +339,7 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
     end
 
     # Build bottom-up: leaf array → wrap with List at each level
-    child = _build_leaf_array(leaf_values, leaf_nulls, ptype, ctype)
+    child = _build_leaf_array(leaf_values, leaf_nulls, ptype, ctype; nullable)
 
     for k in max_rep:-1:1
         ST = SubArray{eltype(child), 1, typeof(child), Tuple{UnitRange{Int64}}, true}
@@ -347,7 +349,7 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
         if k == 1
             # Top level: apply record nulls
             v = _validity(record_nulls)
-            ET = v.nc > 0 ? Union{Missing,ST} : ST
+            ET = (v.nc > 0 || nullable) ? Union{Missing,ST} : ST
             child = Arrow.List{ET, Int32, typeof(child)}(UInt8[], v, offs, child, n, nothing)
         else
             # Intermediate levels: all-valid

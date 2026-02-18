@@ -253,6 +253,41 @@ table = pa.table({
     end
 end
 
+@testset "Multi-RowGroup with ChainedVector" begin
+    _with_pyarrow_file("multi-rowgroup flat", "test_multi_rg.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+table = pa.table({
+    'id': list(range(100)),
+    'name': [f'name_{i}' for i in range(100)],
+    'value': [float(i) * 1.1 for i in range(100)],
+})
+write_kwargs = {'row_group_size': 10}""") do tbl
+        @test tbl isa Arrow.Table
+        @test length(tbl.id) == 100
+        @test collect(tbl.id) == collect(0:99)
+        @test tbl.name[1] == "name_0"
+        @test tbl.name[100] == "name_99"
+        @test tbl.value[1] ≈ 0.0
+        @test tbl.value[100] ≈ 99.0 * 1.1
+    end
+
+    _with_pyarrow_file("multi-rowgroup nested", "test_multi_rg_nested.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+table = pa.table({
+    'id': list(range(30)),
+    'tags': [[f't{i}_{j}' for j in range(i % 3 + 1)] for i in range(30)],
+})
+write_kwargs = {'row_group_size': 5}""") do tbl
+        @test tbl isa Arrow.Table
+        @test length(tbl.id) == 30
+        @test collect(tbl.id) == collect(0:29)
+        tags = tbl.tags
+        @test length(tags) == 30
+        @test collect(skipmissing(tags[1])) == ["t0_0"]
+        @test collect(skipmissing(tags[3])) == ["t2_0", "t2_1", "t2_2"]
+    end
+end
+
 # =============================================================================
 # Apache parquet-testing suite
 # =============================================================================

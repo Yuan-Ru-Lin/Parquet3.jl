@@ -74,3 +74,4 @@ ConvertedType annotations are respected: UTF8, Date, Timestamp (millis/micros), 
   - Composition with other Arrow types (e.g., `List<FixedSizeList<T>>`) falls back to variable-length lists at all levels.
   - Reading back via `Arrow.read` returns Arrow.jl's native `FixedSizeList` (NTuple-based), not `FixedSizeListVector`.
 - LZ4 Hadoop framing (used by older Spark/Hadoop writers) is implemented but not tested end-to-end — only the standard LZ4 raw/frame format is covered by the test suite.
+- `open_parquet` / `read_parquet` on a non-existent path gives "File too small" instead of "File not found" (Mmap.mmap silently creates an empty file). Needs a guard in the public API.
