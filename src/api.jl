@@ -127,87 +127,25 @@ function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, sche
     ptype = node.element.type
     max_def = node.max_def_level
 
-    if !is_nested && ptype == BOOLEAN
-        _to_arrow_bool(pages, max_def; nullable)
-    elseif !is_nested && ptype == BYTE_ARRAY
-        _to_arrow_bytes(pages, max_def, node.element.converted_type == CT_UTF8; nullable)
-    elseif is_nested && !haskey(fsl_info, top_name)
+    if is_nested
         all_rep, all_def, raw = collect_page_data(pages, max_def)
         converted = convert_primitive_values(raw, ptype, node.element.converted_type)
         def_thresholds = compute_def_thresholds(schema_tree, column_path)
-        _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
-                         def_thresholds, ptype, node.element.converted_type; nullable)
-    elseif is_nested && haskey(fsl_info, top_name)
-        def_thresholds = compute_def_thresholds(schema_tree, column_path)
-        all_rep, all_def, raw = collect_page_data(pages, max_def)
-        converted = convert_primitive_values(raw, ptype, node.element.converted_type)
-        T = eltype(converted)
-        values, nulls = assemble_nested(all_rep, all_def, converted, max_def, node.max_rep_level, T, def_thresholds)
-        convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+
+        if haskey(fsl_info, top_name)
+            T = eltype(converted)
+            values, nulls = assemble_nested(all_rep, all_def, converted, max_def, node.max_rep_level, T, def_thresholds)
+            convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+        else
+            _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
+                             def_thresholds, ptype, node.element.converted_type; nullable)
+        end
     else
+        # All flat columns: bool, bytes, numeric
         values, nulls = assemble_flat_column(pages, max_def)
-        _to_arrow(values, nulls, node.element; nullable)
+        converted = convert_primitive_values(values, ptype, node.element.converted_type)
+        _build_leaf_array(converted, nulls, ptype, node.element.converted_type; nullable)
     end
-end
-
-"""Build Arrow.BoolVector directly from decoded pages, preserving bit-packing."""
-function _to_arrow_bool(pages::Vector{<:DecodedPage}, max_def::Int; nullable::Bool=false)
-    total = sum(p.num_values for p in pages)
-    bytes = zeros(UInt8, cld(total, 8))
-    nulls = falses(total)
-    out = 0
-    for page in pages
-        src = page.values::BitVector
-        val = 0
-        for i in 1:page.num_values
-            out += 1
-            if page.def_levels !== nothing && page.def_levels[i] < max_def
-                nulls[out] = true
-            else
-                val += 1
-                # Copy bit directly from source BitVector chunk to output byte
-                src_bit = (src.chunks[((val-1) >> 6) + 1] >> ((val-1) & 63)) & UInt64(1)
-                bytes[((out-1) >> 3) + 1] |= UInt8(src_bit) << ((out-1) & 7)
-            end
-        end
-    end
-    v = _validity(nulls)
-    ET = (v.nc > 0 || nullable) ? Union{Missing,Bool} : Bool
-    Arrow.BoolVector{ET}(bytes, 1, v, Int64(total), nothing)
-end
-
-"""Build Arrow.List directly from decoded pages — one pass, no intermediate Vector{SubArray}."""
-function _to_arrow_bytes(pages::Vector{<:DecodedPage}, max_def::Int, is_utf8::Bool; nullable::Bool=false)
-    total = sum(p.num_values for p in pages)
-    flat = UInt8[]
-    offsets = Int32[0]
-    nulls = falses(total)
-    out = 0
-    for page in pages
-        val = 0
-        for i in 1:page.num_values
-            out += 1
-            if page.def_levels !== nothing && page.def_levels[i] < max_def
-                nulls[out] = true
-            else
-                val += 1
-                append!(flat, page.values[val])
-            end
-            push!(offsets, Int32(length(flat)))
-        end
-    end
-    v = _validity(nulls)
-    T = is_utf8 ? String : Vector{UInt8}
-    ET = (v.nc > 0 || nullable) ? Union{Missing,T} : T
-    Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, total, nothing)
-end
-
-"""Wrap flat numeric column (values, nulls) from assemble_flat_column into Arrow.Primitive."""
-function _to_arrow(values, nulls::BitVector, elem::SchemaElement; nullable::Bool=false)
-    v = _validity(nulls)
-    converted = convert_primitive_values(values, elem.type, elem.converted_type)
-    T = eltype(converted)
-    Arrow.Primitive((v.nc > 0 || nullable) ? Union{Missing,T} : T, UInt8[], v, converted, length(nulls), nothing)
 end
 
 """Invert a Parquet nulls BitVector into an Arrow ValidityBitmap."""
@@ -231,7 +169,7 @@ function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector
         offsets = Int32[0]
         for i in 1:n
             if !leaf_nulls[i]
-                append!(flat, codeunits(leaf_values[i]))
+                append!(flat, leaf_values[i])
             end
             push!(offsets, Int32(length(flat)))
         end
@@ -258,9 +196,6 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
                           def_thresholds, ptype, ctype; nullable::Bool=false) where T
     # Innermost threshold: min def_level for a leaf element to exist
     inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
-
-    # Pre-scan for leaf nulls
-    has_leaf_nulls = inner_threshold < max_def && any(d -> inner_threshold <= d < max_def, all_def)
 
     # Offset arrays for each nesting depth (1-indexed, k=1 is outermost list)
     offsets = [Int32[0] for _ in 1:max_rep]
@@ -376,26 +311,21 @@ end
 
 """Convert primitive values based on Parquet and converted types."""
 function convert_primitive_values(values, ptype, ctype)
-    if ctype == CT_UTF8 && ptype == BYTE_ARRAY
-        [String(copy(v)) for v in values]
-    elseif ctype == CT_DATE && ptype == INT32
+    if ctype == CT_DATE && ptype == INT32
         [Date(1970, 1, 1) + Day(v) for v in values]
     elseif ctype == CT_TIMESTAMP_MILLIS && ptype == INT64
         [DateTime(1970, 1, 1) + Millisecond(v) for v in values]
     elseif ctype == CT_TIMESTAMP_MICROS && ptype == INT64
         [DateTime(1970, 1, 1) + Microsecond(v) for v in values]
-    elseif ptype == BYTE_ARRAY
-        [copy(v) for v in values]
-    elseif (T = _converted_int_type(ptype, ctype)) !== nothing
+    elseif (T = _converted_int_type(ctype)) !== nothing && T !== eltype(values)
         T.(values)
     else
-        T = element_julia_type(ptype, ctype)
-        T === Any ? values : T.(values)
+        values
     end
 end
 
 """Map ConvertedType integer annotations to Julia types. Returns nothing if no conversion needed."""
-function _converted_int_type(ptype, ctype)
+function _converted_int_type(ctype)
     ctype === nothing && return nothing
     ctype == CT_INT_8   && return Int8
     ctype == CT_INT_16  && return Int16
@@ -439,7 +369,7 @@ function element_julia_type(ptype, ctype)
         Date
     elseif ctype in (CT_TIMESTAMP_MILLIS, CT_TIMESTAMP_MICROS) && ptype == INT64
         DateTime
-    elseif (T = _converted_int_type(ptype, ctype)) !== nothing
+    elseif (T = _converted_int_type(ctype)) !== nothing
         T
     elseif ptype == INT96
         Int96
