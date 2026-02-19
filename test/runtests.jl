@@ -304,6 +304,30 @@ write_kwargs = {'row_group_size': 5}""") do tbl
     end
 end
 
+@testset "Field-level metadata from ARROW:schema" begin
+    _with_pyarrow_file("field-level metadata", "test_field_meta.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+schema = pa.schema([
+    pa.field('x', pa.float64(), metadata={'units': 's', 'codec': 'raw'}),
+    pa.field('y', pa.int32(), metadata={'datatype': 'array<1>{real}'}),
+    pa.field('plain', pa.utf8()),
+])
+table = pa.table({'x': [1.0, 2.0], 'y': pa.array([10, 20], type=pa.int32()), 'plain': ['a', 'b']}, schema=schema)""") do tbl
+        @test tbl isa Arrow.Table
+        mx = Arrow.getmetadata(tbl.x)
+        @test mx !== nothing
+        @test mx["units"] == "s"
+        @test mx["codec"] == "raw"
+
+        my = Arrow.getmetadata(tbl.y)
+        @test my !== nothing
+        @test my["datatype"] == "array<1>{real}"
+
+        # Column without field metadata should return nothing
+        @test Arrow.getmetadata(tbl.plain) === nothing
+    end
+end
+
 # =============================================================================
 # Apache parquet-testing suite
 # =============================================================================

@@ -50,7 +50,7 @@ end
 function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=nothing)
     schema_tree = build_schema_tree(pf.metadata.schema)
     leaf_columns = get_leaf_columns(schema_tree)
-    fsl_info = parse_arrow_schema(pf.metadata.key_value_metadata)
+    (; fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
 
     if columns !== nothing
         leaf_columns = filter(leaf_columns) do (path, node)
@@ -76,7 +76,7 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
             chunk_tasks = map(row_groups) do rg
                 Threads.@spawn begin
                     pages = _read_pages_for_rg(pf.data, rg, path, node)
-                    _assemble_to_arrow(pages, node, schema_tree, path, fsl_info, top_name; nullable)
+                    _assemble_to_arrow(pages, node, schema_tree, path, fsl, field_meta, top_name; nullable)
                 end
             end
             chunks = fetch.(chunk_tasks)
@@ -122,10 +122,11 @@ end
 
 """Assemble one row group's decoded pages into an Arrow array chunk."""
 function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, schema_tree::SchemaNode,
-                            column_path::Vector{String}, fsl_info, top_name::String; nullable::Bool=false)
+                            column_path::Vector{String}, fsl_info, field_meta, top_name::String; nullable::Bool=false)
     is_nested = node.max_rep_level > 0
     ptype = node.element.type
     max_def = node.max_def_level
+    meta = get(field_meta, top_name, nothing)
 
     if is_nested
         all_rep, all_def, raw = collect_page_data(pages, max_def)
@@ -138,13 +139,13 @@ function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, sche
             convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
         else
             _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
-                             def_thresholds, ptype, node.element.converted_type; nullable)
+                             def_thresholds, ptype, node.element.converted_type; nullable, meta)
         end
     else
         # All flat columns: bool, bytes, numeric
         values, nulls = assemble_flat_column(pages, max_def)
         converted = convert_primitive_values(values, ptype, node.element.converted_type)
-        _build_leaf_array(converted, nulls, ptype, node.element.converted_type; nullable)
+        _build_leaf_array(converted, nulls, ptype, node.element.converted_type; nullable, meta)
     end
 end
 
@@ -157,7 +158,8 @@ function _validity(nulls::BitVector)
 end
 
 """Build the appropriate Arrow leaf array from flat leaf values and nulls."""
-function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector, ptype, ctype; nullable::Bool=false) where T
+function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector, ptype, ctype;
+                           nullable::Bool=false, meta=nothing) where T
     v = _validity(leaf_nulls)
     has_nulls = v.nc > 0 || nullable
     n = length(leaf_nulls)
@@ -175,7 +177,7 @@ function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector
         end
         BT = is_utf8 ? String : Vector{UInt8}
         ET = has_nulls ? Union{Missing,BT} : BT
-        return Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, n, nothing)
+        return Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, n, meta)
     elseif ptype == BOOLEAN
         bytes = zeros(UInt8, cld(n, 8))
         for i in 1:n
@@ -184,16 +186,16 @@ function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector
             end
         end
         ET = has_nulls ? Union{Missing,Bool} : Bool
-        return Arrow.BoolVector{ET}(bytes, 1, v, Int64(n), nothing)
+        return Arrow.BoolVector{ET}(bytes, 1, v, Int64(n), meta)
     else
         ET = has_nulls ? Union{Missing,T} : T
-        return Arrow.Primitive(ET, UInt8[], v, leaf_values, n, nothing)
+        return Arrow.Primitive(ET, UInt8[], v, leaf_values, n, meta)
     end
 end
 
 """Build Arrow.List directly from rep/def levels — single pass, no intermediate Vector{Vector{T}}."""
 function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, max_rep,
-                          def_thresholds, ptype, ctype; nullable::Bool=false) where T
+                          def_thresholds, ptype, ctype; nullable::Bool=false, meta=nothing) where T
     # Innermost threshold: min def_level for a leaf element to exist
     inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
 
@@ -284,10 +286,10 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
         n = length(offsets[k]) - 1
 
         if k == 1
-            # Top level: apply record nulls
+            # Top level: apply record nulls and field metadata
             v = _validity(record_nulls)
             ET = (v.nc > 0 || nullable) ? Union{Missing,ST} : ST
-            child = Arrow.List{ET, Int32, typeof(child)}(UInt8[], v, offs, child, n, nothing)
+            child = Arrow.List{ET, Int32, typeof(child)}(UInt8[], v, offs, child, n, meta)
         else
             # Intermediate levels: all-valid
             v = Arrow.ValidityBitmap(UInt8[], 1, n, 0)
