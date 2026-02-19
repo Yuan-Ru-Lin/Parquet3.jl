@@ -243,16 +243,16 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
     pos = Ref(1)
 
     function read_varint()
-        result = UInt64(0)
+        val = UInt64(0)
         shift = 0
         while pos[] <= length(data)
             byte = data[pos[]]
             pos[] += 1
-            result |= UInt64(byte & 0x7f) << shift
+            val |= UInt64(byte & 0x7f) << shift
             (byte & 0x80) == 0 && break
             shift += 7
         end
-        result
+        val
     end
 
     function read_zigzag()
