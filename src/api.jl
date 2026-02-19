@@ -19,7 +19,7 @@ end
 ArrowTypes.ArrowKind(::Type{FixedSizeView{N,T}}) where {N,T} = ArrowTypes.FixedSizeListKind{N,T}()
 
 """Fixed-size list column: flat child array with fixed stride N, plus record-level nulls."""
-struct FixedSizeListVector{N, T} <: AbstractVector{Union{Missing, FixedSizeView{N, T}}}
+struct FixedSizeListVector{N, T, ET} <: AbstractVector{ET}
     data::Vector{T}
     nulls::BitVector    # true = record is null
     len::Int
@@ -27,7 +27,7 @@ end
 
 Base.size(v::FixedSizeListVector) = (v.len,)
 Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
-@Base.propagate_inbounds function Base.getindex(v::FixedSizeListVector{N,T}, i::Int) where {N,T}
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeListVector{N,T,ET}, i::Int) where {N,T,ET}
     @boundscheck checkbounds(v, i)
     v.nulls[i] && return missing
     FixedSizeView{N,T}(v.data, (i - 1) * N)
@@ -136,7 +136,7 @@ function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, sche
         if haskey(fsl_info, top_name)
             T = eltype(converted)
             values, nulls = assemble_nested(all_rep, all_def, converted, max_def, node.max_rep_level, T, def_thresholds)
-            convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name])
+            convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name]; nullable)
         else
             _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
                              def_thresholds, ptype, node.element.converted_type; nullable, meta)
@@ -341,7 +341,7 @@ function _converted_int_type(ctype)
 end
 
 """Convert nested values into a FixedSizeListVector (flat child array + record-level nulls)."""
-function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int)
+function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int; nullable::Bool=false)
     T = element_julia_type(elem.type, elem.converted_type)
     nrows = length(nulls)
     data = Vector{T}(undef, list_size * nrows)
@@ -359,7 +359,9 @@ function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, 
             end
         end
     end
-    FixedSizeListVector{list_size, T}(data, nulls, nrows)
+    has_nulls = any(nulls) || nullable
+    ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
+    FixedSizeListVector{list_size, T, ET}(data, nulls, nrows)
 end
 
 
