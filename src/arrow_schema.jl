@@ -3,13 +3,14 @@
 
 import Base64
 
-const _EMPTY_ARROW_SCHEMA = (fsl=Dict{String,Int}(), field_meta=Dict{String,Base.ImmutableDict{String,String}}())
+const _EMPTY_ARROW_SCHEMA = (schema=nothing, fsl=Dict{String,Int}(), field_meta=Dict{String,Base.ImmutableDict{String,String}}())
 
 """
-    parse_arrow_schema(metadata) -> (fsl, field_meta)
+    parse_arrow_schema(metadata) -> (schema, fsl, field_meta)
 
-Extract FixedSizeList field sizes and per-field custom_metadata from the ARROW:schema
-Parquet metadata. Returns a named tuple with:
+Extract the Arrow schema, FixedSizeList field sizes, and per-field custom_metadata from
+the ARROW:schema Parquet metadata. Returns a named tuple with:
+- `schema::Union{Arrow.Meta.Schema,Nothing}` — the parsed Arrow schema, or nothing
 - `fsl::Dict{String,Int}` — field_name → list_size for FixedSizeList fields
 - `field_meta::Dict{String,ImmutableDict{String,String}}` — field_name → custom metadata
 """
@@ -21,22 +22,24 @@ function parse_arrow_schema(metadata::Union{Vector{KeyValue}, Nothing})
 end
 
 function _parse_arrow_schema_bytes(buf::Vector{UInt8})
+    schema = Ref{Union{Arrow.Meta.Schema,Nothing}}(nothing)
     fsl = Dict{String,Int}()
     field_meta = Dict{String,Base.ImmutableDict{String,String}}()
     try
-        _parse_arrow_schema_bytes!(fsl, field_meta, buf)
+        _parse_arrow_schema_bytes!(schema, fsl, field_meta, buf)
     catch e
         @warn "Failed to parse ARROW:schema" exception=(e, catch_backtrace())
     end
-    (fsl=fsl, field_meta=field_meta)
+    (schema=schema[], fsl=fsl, field_meta=field_meta)
 end
 
-function _parse_arrow_schema_bytes!(fsl, field_meta, buf)
+function _parse_arrow_schema_bytes!(schema_ref, fsl, field_meta, buf)
     fb_start = (length(buf) >= 8 && buf[1:4] == UInt8[0xff, 0xff, 0xff, 0xff]) ? 8 : 0
 
     msg = Arrow.FlatBuffers.getrootas(Arrow.Meta.Message, buf, fb_start)
     schema = msg.header
     schema isa Arrow.Meta.Schema || return
+    schema_ref[] = schema
 
     fields = schema.fields
     fields === nothing && return

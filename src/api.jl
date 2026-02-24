@@ -50,7 +50,7 @@ end
 function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=nothing)
     schema_tree = build_schema_tree(pf.metadata.schema)
     leaf_columns = get_leaf_columns(schema_tree)
-    (; fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
+    (; schema, fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
 
     if columns !== nothing
         leaf_columns = filter(leaf_columns) do (path, node)
@@ -106,8 +106,9 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     col_types = Type[eltype(v) for v in col_vectors]
     lookup = Dict{Symbol,AbstractVector}(zip(col_names, col_vectors))
     meta = _parse_kv_metadata(pf.metadata.key_value_metadata)
+    schema_ref = schema !== nothing ? Ref(schema) : Ref{Arrow.Meta.Schema}()
     Arrow.Table(col_names, col_types, col_vectors, lookup,
-        Ref{Arrow.Meta.Schema}(),
+        schema_ref,
         Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(meta))
 end
 
