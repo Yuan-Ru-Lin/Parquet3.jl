@@ -95,32 +95,46 @@ function unpack_bits(data::AbstractVector{UInt8}, count::Int, bit_width::Int)
     bit_width == 0 && return zeros(UInt32, count)
 
     result = Vector{UInt32}(undef, count)
-    bit_position = 0
+    _unpack_bits_into!(result, 1, data, count, bit_width)
+    result
+end
 
-    for i in 1:count
-        value = UInt32(0)
-        bits_remaining = bit_width
+"""
+    unpack_bits!(result, offset, data, count, bit_width)
 
-        while bits_remaining > 0
-            byte_index = (bit_position >> 3) + 1
-            byte_index > length(data) && break
+Unpack `count` bit-packed values directly into `result` starting at `result[offset]`.
+"""
+function unpack_bits!(result::Vector{UInt32}, offset::Int, data::AbstractVector{UInt8}, count::Int, bit_width::Int)
+    bit_width == 0 && (fill!(@view(result[offset:offset+count-1]), UInt32(0)); return)
+    _unpack_bits_into!(result, offset, data, count, bit_width)
+    nothing
+end
 
-            bit_offset = bit_position & 7
-            bits_in_byte = 8 - bit_offset
-            bits_to_read = min(bits_in_byte, bits_remaining)
+"""
+Inner loop shared by unpack_bits and unpack_bits!.
+Uses a UInt64 accumulator to extract values with shift+mask
+instead of byte-at-a-time inner loop.
+"""
+function _unpack_bits_into!(result::Vector{UInt32}, offset::Int, data::AbstractVector{UInt8}, count::Int, bit_width::Int)
+    mask = (UInt64(1) << bit_width) - 1
+    data_len = length(data)
+    # Accumulator: holds up to 64 bits of loaded data
+    accum = UInt64(0)
+    bits_in_accum = 0
+    byte_pos = 1  # next byte to load from data
 
-            mask = (UInt32(1) << bits_to_read) - 1
-            extracted = (UInt32(data[byte_index]) >> bit_offset) & mask
-
-            value |= extracted << (bit_width - bits_remaining)
-            bits_remaining -= bits_to_read
-            bit_position += bits_to_read
+    @inbounds for i in 0:count-1
+        # Ensure accumulator has enough bits
+        while bits_in_accum < bit_width && byte_pos <= data_len
+            accum |= UInt64(data[byte_pos]) << bits_in_accum
+            bits_in_accum += 8
+            byte_pos += 1
         end
 
-        result[i] = value
+        result[offset + i] = UInt32(accum & mask)
+        accum >>= bit_width
+        bits_in_accum -= bit_width
     end
-
-    result
 end
 
 #=============================================================================
@@ -170,12 +184,10 @@ function decode_rle_bitpacked(data::AbstractVector{UInt8}, count::Int, bit_width
             packed_data = @view data[pos : pos + bytes_available - 1]
             pos += bytes_available
 
-            unpacked = unpack_bits(packed_data, num_values, bit_width)
-            for value in unpacked
-                output_index >= count && break
-                output_index += 1
-                result[output_index] = value
-            end
+            values_to_copy = min(num_values, count - output_index)
+            # Ensure result has enough room (it should, but be safe)
+            unpack_bits!(result, output_index + 1, packed_data, values_to_copy, bit_width)
+            output_index += values_to_copy
         else
             # RLE: repeated value
             run_length = header >> 1
@@ -234,38 +246,42 @@ end
 # Delta Binary Packed Encoding
 =============================================================================#
 
-"""
-    decode_delta_binary_packed(data, count) -> Vector{Int64}
+"""Read a varint from `data` starting at position `pos`, return (value, new_pos)."""
+function _read_varint(data::AbstractVector{UInt8}, pos::Int)
+    val = UInt64(0)
+    shift = 0
+    len = length(data)
+    @inbounds while pos <= len
+        byte = data[pos]
+        pos += 1
+        val |= UInt64(byte & 0x7f) << shift
+        (byte & 0x80) == 0 && break
+        shift += 7
+    end
+    (val, pos)
+end
 
-Decode delta binary packed encoding for sorted/nearly-sorted integer columns.
+"""Read a zigzag-encoded varint from `data` starting at `pos`, return (value, new_pos)."""
+function _read_zigzag(data::AbstractVector{UInt8}, pos::Int)
+    n, pos = _read_varint(data, pos)
+    signed_n = reinterpret(Int64, n)
+    ((signed_n >> 1) ⊻ (-(signed_n & 1)), pos)
+end
+
+"""
+    decode_delta_binary_packed(data, count) -> (Vector{Int64}, final_pos)
+
+Decode delta binary packed encoding. Returns the decoded values and the
+byte position after the last consumed byte (for use by delta_length_byte_array).
 """
 function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
-    pos = Ref(1)
-
-    function read_varint()
-        val = UInt64(0)
-        shift = 0
-        while pos[] <= length(data)
-            byte = data[pos[]]
-            pos[] += 1
-            val |= UInt64(byte & 0x7f) << shift
-            (byte & 0x80) == 0 && break
-            shift += 7
-        end
-        val
-    end
-
-    function read_zigzag()
-        n = read_varint()
-        signed_n = reinterpret(Int64, n)
-        (signed_n >> 1) ⊻ (-(signed_n & 1))
-    end
+    pos = 1
 
     # Read header
-    block_size = Int(read_varint())
-    miniblocks_per_block = Int(read_varint())
-    total_value_count = Int(read_varint())
-    first_value = read_zigzag()
+    block_size, pos = _read_varint(data, pos); block_size = Int(block_size)
+    miniblocks_per_block, pos = _read_varint(data, pos); miniblocks_per_block = Int(miniblocks_per_block)
+    total_value_count, pos = _read_varint(data, pos); total_value_count = Int(total_value_count)
+    first_value, pos = _read_zigzag(data, pos)
 
     values_per_miniblock = block_size ÷ miniblocks_per_block
 
@@ -273,13 +289,16 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
     result[1] = first_value
     value_index = 2
 
+    # Reusable buffer for unpacked deltas (avoids allocation per miniblock)
+    delta_buf = Vector{UInt32}(undef, values_per_miniblock)
+
     # Decode blocks
-    while value_index <= length(result) && pos[] <= length(data)
-        min_delta = read_zigzag()
+    while value_index <= length(result) && pos <= length(data)
+        min_delta, pos = _read_zigzag(data, pos)
 
         # Read bit widths for each miniblock
-        bit_widths = data[pos[] : pos[] + miniblocks_per_block - 1]
-        pos[] += miniblocks_per_block
+        bit_widths = @view data[pos : pos + miniblocks_per_block - 1]
+        pos += miniblocks_per_block
 
         # Decode each miniblock
         for miniblock in 1:miniblocks_per_block
@@ -289,22 +308,22 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
 
             if bit_width == 0
                 # All deltas equal min_delta
-                for _ in 1:values_to_read
+                @inbounds for _ in 1:values_to_read
                     value_index > length(result) && break
                     result[value_index] = result[value_index - 1] + min_delta
                     value_index += 1
                 end
             else
                 bytes_needed = cld(values_per_miniblock * bit_width, 8)
-                pos[] + bytes_needed - 1 > length(data) && break
+                pos + bytes_needed - 1 > length(data) && break
 
-                packed_data = @view data[pos[] : pos[] + bytes_needed - 1]
-                pos[] += bytes_needed
+                packed_data = @view data[pos : pos + bytes_needed - 1]
+                pos += bytes_needed
 
-                deltas = unpack_bits(packed_data, values_per_miniblock, bit_width)
-                for i in 1:values_to_read
+                unpack_bits!(delta_buf, 1, packed_data, values_per_miniblock, bit_width)
+                @inbounds for i in 1:values_to_read
                     value_index > length(result) && break
-                    delta = Int64(deltas[i]) + min_delta
+                    delta = Int64(delta_buf[i]) + min_delta
                     result[value_index] = result[value_index - 1] + delta
                     value_index += 1
                 end
@@ -312,7 +331,7 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
         end
     end
 
-    result
+    (result, pos)
 end
 
 #=============================================================================
@@ -320,53 +339,14 @@ end
 =============================================================================#
 
 """
-    decode_delta_length_byte_array(data, count) -> Vector{Vector{UInt8}}
+    decode_delta_length_byte_array(data, count) -> VectorOfVectors
 
 Decode delta length byte array encoding. Lengths are delta-encoded,
 followed by concatenated byte data.
 """
 function decode_delta_length_byte_array(data::AbstractVector{UInt8}, count::Int)
-    # First, decode the lengths
-    lengths = decode_delta_binary_packed(data, count)
-
-    # Find where the length data ends by re-parsing the header
-    pos = 1
-
-    function read_varint()
-        result = UInt64(0)
-        shift = 0
-        while pos <= length(data)
-            byte = data[pos]
-            pos += 1
-            result |= UInt64(byte & 0x7f) << shift
-            (byte & 0x80) == 0 && break
-            shift += 7
-        end
-        result
-    end
-
-    block_size = Int(read_varint())
-    miniblocks_per_block = Int(read_varint())
-    total_count = Int(read_varint())
-    read_varint()  # first value
-
-    values_per_miniblock = block_size ÷ miniblocks_per_block
-    values_remaining = total_count
-
-    # Skip through the delta blocks to find byte data start
-    while values_remaining > 0 && pos <= length(data)
-        read_varint()  # min_delta
-        bit_widths_start = pos
-        pos += miniblocks_per_block
-
-        for mb in 1:miniblocks_per_block
-            bit_width = data[bit_widths_start + mb - 1]
-            bytes_needed = cld(values_per_miniblock * Int(bit_width), 8)
-            pos += bytes_needed
-            values_remaining -= values_per_miniblock
-            values_remaining <= 0 && break
-        end
-    end
+    # Decode lengths; pos is the byte position right after the delta block
+    lengths, pos = decode_delta_binary_packed(data, count)
 
     # Byte data is contiguous from here — build VectorOfVectors as a zero-copy view
     elem_ptr = Vector{Int}(undef, count + 1)

@@ -130,14 +130,18 @@ function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, sche
     meta = get(field_meta, top_name, nothing)
 
     if is_nested
+        # Fast path: FSL columns with no nulls — bypass collect_page_data entirely
+        if haskey(fsl_info, top_name) && _fsl_no_nulls(pages, max_def)
+            return _assemble_fsl_dense(pages, ptype, node.element, fsl_info[top_name]; nullable)
+        end
+
         all_rep, all_def, raw = collect_page_data(pages, max_def)
         converted = convert_primitive_values(raw, ptype, node.element.converted_type)
         def_thresholds = compute_def_thresholds(schema_tree, column_path)
 
         if haskey(fsl_info, top_name)
-            T = eltype(converted)
-            values, nulls = assemble_nested(all_rep, all_def, converted, max_def, node.max_rep_level, T, def_thresholds)
-            convert_fixed_size_list(values, nulls, node.element, fsl_info[top_name]; nullable)
+            assemble_fsl_direct(all_rep, all_def, converted, max_def, fsl_info[top_name],
+                                node.element, def_thresholds; nullable)
         else
             _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
                              def_thresholds, ptype, node.element.converted_type; nullable, meta)
@@ -347,7 +351,7 @@ function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, 
     nrows = length(nulls)
     data = Vector{T}(undef, list_size * nrows)
     val_idx = 0
-    for row in 1:nrows
+    @inbounds for row in 1:nrows
         base = (row - 1) * list_size
         if nulls[row]
             for j in 1:list_size; data[base + j] = zero(T); end
@@ -363,6 +367,115 @@ function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, 
     has_nulls = any(nulls) || nullable
     ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
     FixedSizeListVector{list_size, T, ET}(data, nulls, nrows)
+end
+
+"""
+Direct FSL assembly: scatter values from rep/def levels into a flat buffer
+in a single pass, bypassing intermediate Vector{Vector{T}} creation.
+"""
+function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
+                             max_def::Int, list_size::Int, elem::SchemaElement,
+                             def_thresholds::Vector{Int}; nullable::Bool=false) where V
+    T = element_julia_type(elem.type, elem.converted_type)
+    num_records = count(==(0), all_rep)
+    data = Vector{T}(undef, list_size * num_records)
+    nulls = falses(num_records)
+
+    inner_threshold = length(def_thresholds) >= 1 ? def_thresholds[1] : 1
+
+    record_idx = 0
+    value_idx = 1
+    slot_idx = 0  # position within current record's list
+
+    @inbounds for i in eachindex(all_rep)
+        rep = all_rep[i]
+        def = all_def[i]
+
+        if rep == 0
+            # New record
+            record_idx += 1
+            slot_idx = 0
+            base = (record_idx - 1) * list_size
+
+            if def == 0 && max_def > 0
+                nulls[record_idx] = true
+                # Zero-fill the null record's slots
+                for j in 1:list_size
+                    data[base + j] = zero(T)
+                end
+                continue
+            end
+        end
+
+        base = (record_idx - 1) * list_size
+
+        if def == max_def
+            slot_idx += 1
+            if slot_idx <= list_size
+                data[base + slot_idx] = T(values[value_idx])
+            end
+            value_idx += 1
+        elseif def >= inner_threshold
+            # Null leaf value
+            slot_idx += 1
+            if slot_idx <= list_size
+                data[base + slot_idx] = zero(T)
+            end
+        end
+    end
+
+    has_nulls = any(nulls) || nullable
+    ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
+    FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
+end
+
+"""Check if all pages in an FSL column have no nulls (all defs at max or no def levels)."""
+function _fsl_no_nulls(pages::Vector{<:DecodedPage}, max_def::Int)
+    for page in pages
+        if page.def_levels !== nothing
+            all(==(max_def), page.def_levels) || return false
+        end
+    end
+    true
+end
+
+"""
+Dense FSL assembly: when there are no nulls, page values are already contiguous.
+Copy them directly into the flat FSL buffer — no rep/def level processing needed.
+"""
+function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaElement,
+                             list_size::Int; nullable::Bool=false)
+    T = element_julia_type(ptype, elem.converted_type)
+    # Count records from rep levels
+    num_records = sum(pages) do page
+        page.rep_levels === nothing ? page.num_values : count(==(0), page.rep_levels)
+    end
+
+    data = Vector{T}(undef, list_size * num_records)
+    nulls = falses(num_records)
+
+    # Convert and copy page values in bulk using a function barrier for type stability
+    _fsl_dense_copy!(data, pages, ptype, elem.converted_type)
+
+    ET = nullable ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
+    FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
+end
+
+"""Type-stable inner loop: convert page values and copyto! into the flat buffer."""
+function _fsl_dense_copy!(data::Vector{T}, pages::Vector{<:DecodedPage}, ptype, ctype) where T
+    pos = 1
+    for page in pages
+        converted = convert_primitive_values(page.values, ptype, ctype)
+        n = length(converted)
+        if eltype(converted) === T
+            copyto!(data, pos, converted, 1, n)
+        else
+            @inbounds for i in 1:n
+                data[pos + i - 1] = T(converted[i])
+            end
+        end
+        pos += n
+    end
 end
 
 

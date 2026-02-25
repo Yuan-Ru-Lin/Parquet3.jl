@@ -51,7 +51,7 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
         dict === nothing && error("No dictionary for dictionary encoding")
         decode_dictionary(dict, data, count)
     elseif encoding == DELTA_BINARY_PACKED
-        vals = decode_delta_binary_packed(data, count)
+        vals, _ = decode_delta_binary_packed(data, count)
         ptype == INT32 ? Int32.(vals) : vals
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
         decode_delta_length_byte_array(data, count)
@@ -70,13 +70,15 @@ function read_page(reader::ColumnReader)
 
     header, bytes_consumed = read_page_header(reader.data, reader.offset)
     reader.offset += bytes_consumed
-    page_data = reader.data[reader.offset+1 : reader.offset+header.compressed_page_size]
+    page_range = reader.offset+1 : reader.offset+header.compressed_page_size
     reader.offset += header.compressed_page_size
 
     # Decompress for DICTIONARY_PAGE and DATA_PAGE (v1) — entire page is compressed.
     # DATA_PAGE_V2 handles decompression of data portion separately.
     if header.type != DATA_PAGE_V2 && meta.codec != UNCOMPRESSED
-        page_data = decompress(page_data, meta.codec, Int(header.uncompressed_page_size))
+        page_data = decompress(reader.data[page_range], meta.codec, Int(header.uncompressed_page_size))
+    else
+        page_data = @view reader.data[page_range]
     end
 
     if header.type == DICTIONARY_PAGE
@@ -186,15 +188,23 @@ function assemble_flat_column(pages::Vector{<:DecodedPage}, max_def::Int)
 
     out = 1
     for page in pages
-        val = 1
-        for i in 1:page.num_values
-            if page.def_levels !== nothing && page.def_levels[i] < max_def
-                nulls[out] = true
-            else
-                values[out] = page.values[val]
-                val += 1
+        if page.def_levels === nothing
+            # Non-nullable: bulk copy entire page values
+            n = length(page.values)
+            copyto!(values, out, page.values, 1, n)
+            out += n
+        else
+            # Nullable: element-by-element with null check
+            val = 1
+            @inbounds for i in 1:page.num_values
+                if page.def_levels[i] < max_def
+                    nulls[out] = true
+                else
+                    values[out] = page.values[val]
+                    val += 1
+                end
+                out += 1
             end
-            out += 1
         end
     end
 
@@ -204,24 +214,36 @@ end
 """Collect rep/def levels and raw values from decoded pages."""
 function collect_page_data(pages::Vector{<:DecodedPage}, max_def::Int)
     T = eltype(first(pages).values)
-    all_rep = Int[]
-    all_def = Int[]
-    all_values = T[]
+    total_levels = sum(p.num_values for p in pages)
+    total_values = sum(length(p.values) for p in pages)
+
+    all_rep = Vector{Int}(undef, total_levels)
+    all_def = Vector{Int}(undef, total_levels)
+    all_values = Vector{T}(undef, total_values)
+
+    level_pos = 1
+    value_pos = 1
 
     for page in pages
+        nv = page.num_values
+
         if page.rep_levels !== nothing
-            append!(all_rep, page.rep_levels)
+            copyto!(all_rep, level_pos, page.rep_levels, 1, nv)
         else
-            append!(all_rep, zeros(Int, page.num_values))
+            fill!(@view(all_rep[level_pos:level_pos+nv-1]), 0)
         end
 
         if page.def_levels !== nothing
-            append!(all_def, page.def_levels)
+            copyto!(all_def, level_pos, page.def_levels, 1, nv)
         else
-            append!(all_def, fill(max_def, page.num_values))
+            fill!(@view(all_def[level_pos:level_pos+nv-1]), max_def)
         end
 
-        append!(all_values, page.values)
+        vlen = length(page.values)
+        copyto!(all_values, value_pos, page.values, 1, vlen)
+
+        level_pos += nv
+        value_pos += vlen
     end
 
     (all_rep, all_def, all_values)
@@ -243,57 +265,94 @@ Uses a stack-based approach:
 - def_thresholds[i] = min def_level at which rep_level i has a defined element
 """
 function assemble_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}, def_thresholds::Vector{Int}=Int[]) where T
+    max_rep == 1 && return _assemble_nested_rep1(all_rep, all_def, all_values, max_def, T, def_thresholds)
+    _assemble_nested_general(all_rep, all_def, all_values, max_def, max_rep, T, def_thresholds)
+end
+
+"""Specialized fast path for max_rep == 1 (List<T>) — fully typed, no Any containers."""
+function _assemble_nested_rep1(all_rep, all_def, all_values, max_def, ::Type{T}, def_thresholds::Vector{Int}) where T
+    num_records = count(==(0), all_rep)
+    inner_threshold = length(def_thresholds) >= 1 ? def_thresholds[1] : 1
+
+    has_leaf_nulls = inner_threshold < max_def && any(d -> inner_threshold <= d < max_def, all_def)
+    LeafT = has_leaf_nulls ? Union{Missing, T} : T
+
+    records = Vector{Vector{LeafT}}(undef, num_records)
+    record_nulls = falses(num_records)
+
+    current = LeafT[]
+    record_idx = 0
+    value_idx = 1
+
+    @inbounds for i in eachindex(all_rep)
+        rep = all_rep[i]
+        def = all_def[i]
+
+        if rep == 0
+            # Save previous record
+            if record_idx > 0
+                records[record_idx] = current
+                current = LeafT[]
+            end
+            record_idx += 1
+
+            if def == 0 && max_def > 0
+                record_nulls[record_idx] = true
+                records[record_idx] = LeafT[]
+                continue
+            end
+        end
+
+        if def == max_def
+            push!(current, all_values[value_idx])
+            value_idx += 1
+        elseif def >= inner_threshold
+            push!(current, missing)
+        end
+    end
+
+    # Save last record
+    if record_idx > 0
+        records[record_idx] = current
+    end
+
+    (records, record_nulls)
+end
+
+"""General path for max_rep > 1 — closures inlined to avoid boxing."""
+function _assemble_nested_general(all_rep, all_def, all_values, max_def, max_rep, ::Type{T}, def_thresholds::Vector{Int}) where T
     num_records = count(==(0), all_rep)
 
     records = []
     record_nulls = falses(num_records)
 
-    # Innermost threshold: min def_level for a leaf element to exist
     inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
 
-    # Check data for actual leaf nulls (inner_threshold <= def < max_def)
     has_leaf_nulls = inner_threshold < max_def && any(d -> inner_threshold <= d < max_def, all_def)
     LeafT = has_leaf_nulls ? Union{Missing, T} : T
 
-    new_leaf() = LeafT[]
-
-    # Initialize stack - each level holds current list being built
-    # Innermost level is typed; intermediate levels stay Any[]
     stack = Vector{Any}(undef, max_rep)
     for level in 1:max_rep
-        stack[level] = level == max_rep ? new_leaf() : []
+        stack[level] = level == max_rep ? LeafT[] : []
     end
 
     record_idx = 0
     value_idx = 1
-
-    function finalize_level(level)
-        if level > 1
-            push!(stack[level-1], stack[level])
-        end
-        stack[level] = level == max_rep ? new_leaf() : []
-    end
-
-    function finalize_from(start_level)
-        for level in max_rep:-1:start_level
-            finalize_level(level)
-        end
-    end
-
-    function save_record()
-        if record_idx > 0
-            finalize_from(2)
-            push!(records, stack[1])
-            stack[1] = 1 == max_rep ? new_leaf() : []
-        end
-    end
 
     for i in eachindex(all_rep)
         rep = all_rep[i]
         def = all_def[i]
 
         if rep == 0
-            save_record()
+            # Inline save_record
+            if record_idx > 0
+                for level in max_rep:-1:2
+                    push!(stack[level-1], stack[level])
+                    stack[level] = level == max_rep ? LeafT[] : []
+                end
+                push!(records, stack[1])
+                stack[1] = 1 == max_rep ? LeafT[] : []
+            end
             record_idx += 1
 
             if def == 0 && max_def > 0
@@ -302,22 +361,31 @@ function assemble_nested(all_rep, all_def, all_values, max_def, max_rep, ::Type{
                 continue
             end
         elseif rep < max_rep
-            finalize_from(rep + 1)
+            # Inline finalize_from(rep + 1)
+            for level in max_rep:-1:(rep + 1)
+                if level > 1
+                    push!(stack[level-1], stack[level])
+                end
+                stack[level] = level == max_rep ? LeafT[] : []
+            end
         end
 
-        # Only push to innermost list if def reaches the inner threshold
         if def == max_def
             push!(stack[max_rep], all_values[value_idx])
             value_idx += 1
         elseif def >= inner_threshold
-            # Innermost element exists but leaf value is null
             push!(stack[max_rep], missing)
         end
-        # def < inner_threshold: some intermediate list is null/empty — don't push.
-        # The empty stack at that level will be finalized as [] by the next entry.
     end
 
-    save_record()
+    # Inline save_record for last record
+    if record_idx > 0
+        for level in max_rep:-1:2
+            push!(stack[level-1], stack[level])
+            stack[level] = level == max_rep ? LeafT[] : []
+        end
+        push!(records, stack[1])
+    end
 
     (records, record_nulls)
 end
