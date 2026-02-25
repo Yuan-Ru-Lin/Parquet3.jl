@@ -60,7 +60,6 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     end
 
     row_groups = pf.metadata.row_groups
-    multi_rg = length(row_groups) > 1
 
     # Per-column parallelism: each column reads its own row groups from the shared mmap'd data.
     # NUMA optimization opportunity: with ThreadPinning.jl, per-RG decompression/decoding tasks
@@ -70,7 +69,7 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
             top_name = path[1]
             col_name = join(path, ".")
             name = node.max_rep_level > 0 ? top_name : col_name
-            nullable = multi_rg && node.max_def_level > 0
+            nullable = _column_has_nulls(row_groups, path, node)
 
             # Per-row-group parallelism within each column
             chunk_tasks = map(row_groups) do rg
@@ -110,6 +109,29 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     Arrow.Table(col_names, col_types, col_vectors, lookup,
         schema_ref,
         Ref{Union{Nothing,Base.ImmutableDict{String,String}}}(meta))
+end
+
+"""
+    _column_has_nulls(row_groups, path, node) -> Bool
+
+Check column chunk statistics across all row groups to determine if a column
+actually contains nulls. Falls back to schema-based conservative check
+(`multi_rg && max_def > 0`) when statistics are unavailable.
+"""
+function _column_has_nulls(row_groups::Vector{RowGroup}, path::Vector{String}, node::SchemaNode)
+    node.max_def_level == 0 && return false
+    for rg in row_groups
+        idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == path, rg.columns)
+        idx === nothing && continue
+        stats = rg.columns[idx].meta_data.statistics
+        if stats === nothing || stats.null_count === nothing
+            # Statistics unavailable — fall back to conservative multi-RG check.
+            # For single-RG files, actual null presence drives the type via any(nulls).
+            return length(row_groups) > 1
+        end
+        stats.null_count > 0 && return true
+    end
+    false
 end
 
 """Read and decode all pages from one row group's column chunk."""
