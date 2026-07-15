@@ -21,6 +21,47 @@ This package uses two structs to circumvent the issue:
 - Composition with other Arrow types (e.g., `List<FixedSizeList<T>>`) falls back to variable-length lists at all levels.
 - If you write the table to an Arrow IPC file with `Arrow.write` and read it back with `Arrow.read`, FixedSizeList columns will come back as Arrow.jl's native `NTuple`-based `FixedSizeList`, not as `FixedSizeListVector`. The data is preserved, but the zero-copy view behavior is lost.
 
+## Struct Design
+
+Parquet has no physical struct storage — a group is pure schema nesting over independently
+stored leaf columns, so struct support is an assembly feature. Each member leaf is decoded
+with the existing page machinery, then wrapped in `Arrow.Struct` (a tuple of child columns
+plus a validity bitmap; `NamedTuple` elements are materialized lazily on `getindex`).
+
+`Arrow.Struct` stores fields positionally with no name-based access, so — following the
+`FixedSizeListVector` precedent — the public container is our own `StructColumn` wrapper:
+`col[i]` delegates row access to the wrapped `Arrow.Struct` (or `ChainedVector` of per-RG
+chunks), and `getproperty` maps `col.fieldname` to the full child column, chaining chunks
+per field for multi-RowGroup files. `Arrow.write` serializes it as a native struct column
+(the `NamedTuple` eltype drives `ArrowTypes.StructKind` inference), verified by round-trip.
+
+Null attribution comes from raw definition levels. For
+`optional wf { optional t0; optional values (LIST) { repeated list { optional element }}}`
+(max_def = 4 on the `values` leaf): def 0 = struct null, 1 = list null, 2 = empty list,
+3 = element null, 4 = value. Struct validity is derived from a flat member's def levels
+(`def <` the group's own def level), or from record starts (rep == 0) of a list member when
+the struct has no flat fields. List members reuse `_to_arrow_nested` with a
+`record_null_def` threshold: below it the record is a null list (for top-level list columns
+the threshold is 1, preserving the old `def == 0` behavior).
+
+Element-type stability across row-group chunks (required for `ChainedVector`) is decided
+before reading data: a struct can only be null where *every* member is null, so if any flat
+member's column-chunk statistics report zero nulls, the struct eltype excludes `Missing`.
+
+Nested structs assemble recursively via a per-column plan (`_plan_struct`); one leftmost
+leaf's def levels encode the nullness of every ancestor group, so each nesting level slices
+its own validity from the same `record_defs` vector by comparing against its own def level.
+
+`List<Struct>` inverts the decomposition: every member leaf carries an identical copy of the
+list structure in its rep/def levels (a Dremel invariant), so offsets and list/element
+validity are built once from the first member, remaining members contribute child arrays at
+element granularity, and the result is `Arrow.List` over `Arrow.Struct`, wrapped in
+`ListOfStructsColumn` (named field access returns a ragged per-field list sharing offsets).
+
+Unsupported shapes (`List<Struct{List}>`, maps) fall back to flattened dotted columns; a
+repeated leaf claims the bare top-level column name only when it is the sole leaf under that
+top, so multi-leaf fallbacks can no longer silently collide on one name.
+
 ## Known Limitations
 
 - Read-only. No write support.

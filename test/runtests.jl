@@ -119,6 +119,26 @@ using Tables
         @test values[1][1][1] == [1, 2]   # inner list is [1, 2]
     end
 
+    @testset "Struct null attribution" begin
+        # optional group person { optional field }: max_def = 2, group's own def level = 1
+        # def: 2 = fully present, 1 = struct present but field null, 0 = struct itself null
+        page = Parquet3.DecodedPage(Int32[10, 20], [2, 1, 0, 2], nothing, 4)
+        defs = Parquet3._page_defs([page], 2)
+        @test defs == [2, 1, 0, 2]
+        @test (defs .< 1) == [false, false, true, false]   # struct validity at own def = 1
+
+        # Pages without def levels (all required) are all-present
+        dense = Parquet3.DecodedPage(Int32[1, 2, 3], nothing, nothing, 3)
+        @test Parquet3._page_defs([dense], 2) == [2, 2, 2]
+
+        # From a repeated (list) member: only record starts (rep == 0) count.
+        # Records: [v, v], struct-null, [], list-null  (struct def = 1)
+        rep = [0, 1, 0, 0, 0]
+        def = [4, 4, 0, 2, 1]
+        @test Parquet3._record_defs(rep, def) == [4, 0, 2, 1]
+        @test (Parquet3._record_defs(rep, def) .< 1) == [false, true, false, false]
+    end
+
     @testset "Snappy Decompression" begin
         compressed = UInt8[0x05, 0x10, 0x68, 0x65, 0x6c, 0x6c, 0x6f]
         @test String(Parquet3.decompress_snappy(compressed, 5)) == "hello"
@@ -328,6 +348,239 @@ table = pa.table({'x': [1.0, 2.0], 'y': pa.array([10, 20], type=pa.int32()), 'pl
     end
 end
 
+@testset "Struct Columns" begin
+    _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+person = pa.array([
+    {'name': 'Alice', 'age': 30},
+    {'name': None, 'age': 25},
+    None,
+    {'name': 'Dana', 'age': None},
+], type=pa.struct([pa.field('name', pa.string()), pa.field('age', pa.int64())]))
+table = pa.table({'id': [1, 2, 3, 4], 'person': person})""") do tbl
+        @test tbl isa Arrow.Table
+        @test collect(tbl.id) == [1, 2, 3, 4]
+        @test :person in Tables.columnnames(tbl)
+
+        p = tbl.person
+        @test p isa Parquet3.StructColumn
+        @test length(p) == 4
+        @test propertynames(p) == (:name, :age)
+        @test p.name[1] == "Alice"                    # named child-column access
+        @test isequal(collect(p.age), [30, 25, missing, missing])
+        @test p[1] == (name = "Alice", age = 30)
+        @test p[2].name === missing
+        @test p[2].age == 25
+        @test p[3] === missing            # struct-level null, not a struct of missings
+        @test p[4].name == "Dana"
+        @test p[4].age === missing
+
+        # column_names reports the struct as one column
+        pf = open_parquet(joinpath(@__DIR__, "test_struct.parquet"))
+        @test column_names(pf) == ["id", "person"]
+        close(pf)
+
+        # Column selection by struct name
+        sel = read_parquet(joinpath(@__DIR__, "test_struct.parquet"); columns=["person"])
+        @test collect(Tables.columnnames(sel)) == [:person]
+        @test sel.person[1] == (name = "Alice", age = 30)
+    end
+
+    _with_pyarrow_file("struct without nulls", "test_struct_dense.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+point = pa.array([{'x': i, 'y': float(i) * 0.5} for i in range(6)],
+                 type=pa.struct([pa.field('x', pa.int64()), pa.field('y', pa.float64())]))
+table = pa.table({'point': point})""") do tbl
+        p = tbl.point
+        @test length(p) == 6
+        # No nulls anywhere: eltype should not include Missing
+        @test !(Missing <: eltype(p))
+        @test p[3] == (x = 2, y = 1.0)
+        @test [v.x for v in p] == collect(0:5)
+    end
+
+    _with_pyarrow_file("struct with list field", "test_struct_list.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+wf = pa.array([
+    {'t0': 0.0, 'dt': 1.0, 'values': [1, 2, 3]},
+    {'t0': 0.5, 'dt': 1.0, 'values': []},
+    None,
+    {'t0': 1.5, 'dt': None, 'values': None},
+    {'t0': 2.0, 'dt': 2.0, 'values': [4, None, 5]},
+], type=pa.struct([pa.field('t0', pa.float32()), pa.field('dt', pa.float32()),
+                   pa.field('values', pa.list_(pa.int32()))]))
+table = pa.table({'id': [1, 2, 3, 4, 5], 'wf': wf})""") do tbl
+        wf = tbl.wf
+        @test wf isa Parquet3.StructColumn
+        @test length(wf) == 5
+        @test wf.t0 isa AbstractVector            # full child columns by name
+        @test collect(skipmissing(wf.t0)) == Float32[0.0, 0.5, 1.5, 2.0]
+        @test wf.values isa Arrow.List
+        @test length(wf.values) == 5
+        @test wf[1].t0 == 0.0f0
+        @test collect(skipmissing(wf[1].values)) == Int32[1, 2, 3]
+        @test wf[2].values !== missing        # empty list, not a null list
+        @test isempty(wf[2].values)
+        @test wf[3] === missing               # struct-level null
+        @test wf[4].dt === missing
+        @test wf[4].values === missing        # list-level null (struct present)
+        @test wf[5].values[2] === missing     # element-level null
+        @test collect(skipmissing(wf[5].values)) == Int32[4, 5]
+    end
+
+    # No flat member: struct validity must come from the list member's rep/def levels
+    _with_pyarrow_file("struct with only list fields", "test_struct_only_lists.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+s = pa.array([{'a': [1, 2], 'b': [7]}, None, {'a': [], 'b': None}],
+             type=pa.struct([pa.field('a', pa.list_(pa.int64())), pa.field('b', pa.list_(pa.int64()))]))
+table = pa.table({'s': s})""") do tbl
+        s = tbl.s
+        @test length(s) == 3
+        @test collect(skipmissing(s[1].a)) == [1, 2]
+        @test collect(skipmissing(s[1].b)) == [7]
+        @test s[2] === missing
+        @test s[3].a !== missing && isempty(s[3].a)
+        @test s[3].b === missing
+    end
+
+    _with_pyarrow_file("nested struct (struct-of-struct)", "test_struct_nested.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+event = pa.array([
+    {'vertex': {'x': 1.0, 'y': 2.0, 'z': 3.0}, 'energy': 10},
+    {'vertex': None, 'energy': 20},
+    None,
+    {'vertex': {'x': 4.0, 'y': None, 'z': 6.0}, 'energy': None},
+], type=pa.struct([
+    pa.field('vertex', pa.struct([('x', pa.float64()), ('y', pa.float64()), ('z', pa.float64())])),
+    pa.field('energy', pa.int64()),
+]))
+table = pa.table({'event': event})""") do tbl
+        e = tbl.event
+        @test e isa Parquet3.StructColumn
+        @test length(e) == 4
+        @test e[1].vertex == (x = 1.0, y = 2.0, z = 3.0)   # row access recurses
+        @test e[1].energy == 10
+        @test e[2].vertex === missing                       # inner-struct null
+        @test e[2].energy == 20
+        @test e[3] === missing                              # outer-struct null
+        @test e[4].vertex.y === missing
+        @test e[4].vertex.x == 4.0
+
+        # Named access composes through nesting levels
+        v = e.vertex
+        @test v isa Parquet3.StructColumn
+        @test v[2] === missing && v[3] === missing          # outer null propagates
+        @test collect(skipmissing(v.x)) == [1.0, 4.0]
+        @test isequal(collect(e.energy), [10, 20, missing, missing])
+    end
+
+    _with_pyarrow_file("nested struct containing list", "test_struct_nested_list.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+s = pa.array([
+    {'meta': {'tag': 'a', 'ids': [1, 2]}, 'n': 1},
+    {'meta': {'tag': 'b', 'ids': []}, 'n': 2},
+], type=pa.struct([
+    pa.field('meta', pa.struct([('tag', pa.string()), ('ids', pa.list_(pa.int64()))])),
+    pa.field('n', pa.int32()),
+]))
+table = pa.table({'s': s})""") do tbl
+        s = tbl.s
+        @test s[1].meta.tag == "a"
+        @test collect(skipmissing(s[1].meta.ids)) == [1, 2]
+        @test isempty(s[2].meta.ids)
+        @test s.meta.ids isa Arrow.List                     # named access to depth-2 list
+        @test collect(skipmissing(s.meta.ids[1])) == [1, 2]
+        @test isequal(collect(s.n), Int32[1, 2])
+    end
+
+    _with_pyarrow_file("list of structs", "test_los.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+particles = pa.array([
+    [{'pt': 1.0, 'eta': 0.5, 'charge': 1}, {'pt': 2.0, 'eta': None, 'charge': -1}],
+    [],
+    None,
+    [{'pt': 3.0, 'eta': 1.5, 'charge': 0}, None, {'pt': 4.0, 'eta': -1.0, 'charge': 1}],
+], type=pa.list_(pa.struct([pa.field('pt', pa.float64()), pa.field('eta', pa.float64()),
+                            pa.field('charge', pa.int32())])))
+table = pa.table({'id': [1, 2, 3, 4], 'particles': particles})""") do tbl
+        ps = tbl.particles
+        @test ps isa Parquet3.ListOfStructsColumn
+        @test length(ps) == 4
+        @test propertynames(ps) == (:pt, :eta, :charge)
+
+        @test length(ps[1]) == 2
+        @test ps[1][1] == (pt = 1.0, eta = 0.5, charge = Int32(1))
+        @test ps[1][2].eta === missing            # field-level null
+        @test ps[1][2].pt == 2.0
+        @test ps[2] !== missing && isempty(ps[2]) # empty list
+        @test ps[3] === missing                   # list-level null
+        @test ps[4][2] === missing                # element-level null
+        @test ps[4][3].pt == 4.0
+
+        # Named ragged access: one field across all records, sharing offsets
+        pts = ps.pt
+        @test pts isa Arrow.List
+        @test collect(skipmissing(pts[1])) == [1.0, 2.0]
+        @test pts[3] === missing
+        @test isequal(collect(pts[4]), [3.0, missing, 4.0])
+    end
+
+    _with_pyarrow_file("multi-rowgroup list of structs", "test_los_multi_rg.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+n = 30
+data = [[{'a': i * 10 + k, 'b': f's{i}_{k}'} for k in range(i % 4)] for i in range(n)]
+particles = pa.array(data, type=pa.list_(pa.struct([pa.field('a', pa.int64()),
+                                                    pa.field('b', pa.string())])))
+table = pa.table({'particles': particles})
+write_kwargs = {'row_group_size': 7}""") do tbl
+        ps = tbl.particles
+        @test length(ps) == 30
+        @test isempty(ps[1])                      # i = 0: 0 elements
+        @test length(ps[4]) == 3                  # i = 3: 3 elements
+        @test ps[4][2].a == 31 && ps[4][2].b == "s3_1"
+        @test ps[30][1].a == 290                  # i = 29, crosses chunks
+        @test length(ps.a) == 30                  # chunk-chained field access
+        @test collect(skipmissing(ps.a[4])) == [30, 31, 32]
+        @test sum(length, ps.a) == sum(i % 4 for i in 0:29)
+    end
+
+    # list<struct{list}> is not yet assembled — must fall back to distinct dotted
+    # columns instead of silently colliding on the top-level name
+    _with_pyarrow_file("unsupported list<struct{list}> fallback", "test_los_fallback.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+particles = pa.array(
+    [[{'pt': 1.0, 'trace': [1, 2]}], [{'pt': 2.0, 'trace': [3]}, {'pt': 3.0, 'trace': []}]],
+    type=pa.list_(pa.struct([pa.field('pt', pa.float64()),
+                             pa.field('trace', pa.list_(pa.int32()))])))
+table = pa.table({'particles': particles})""") do tbl
+        names = collect(Tables.columnnames(tbl))
+        @test length(names) == length(unique(names)) == 2   # no collision, both leaves present
+        pt_col = Tables.getcolumn(tbl, only(filter(n -> contains(string(n), "pt"), names)))
+        @test collect(skipmissing(pt_col[2])) == [2.0, 3.0]
+    end
+
+    _with_pyarrow_file("multi-rowgroup struct", "test_struct_multi_rg.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+n = 40
+person = pa.array(
+    [{'x': i, 'y': float(i)} if i % 5 else None for i in range(n)],
+    type=pa.struct([pa.field('x', pa.int64()), pa.field('y', pa.float64())]))
+table = pa.table({'person': person})
+write_kwargs = {'row_group_size': 10}""") do tbl
+        p = tbl.person
+        @test length(p) == 40
+        @test p[1] === missing            # i = 0
+        @test p[6] === missing            # i = 5
+        @test p[2].x == 1
+        @test p[13].y == 12.0             # crosses into second row group
+        @test count(ismissing, p) == 8
+        # Named child access chains across row-group chunks
+        @test length(p.x) == 40
+        @test p.x[2] == 1 && p.x[13] == 12
+        @test isequal(collect(skipmissing(p.y)), [float(i) for i in 0:39 if i % 5 != 0])
+    end
+end
+
 # =============================================================================
 # Apache parquet-testing suite
 # =============================================================================
@@ -478,9 +731,13 @@ if HAS_PARQUET_TESTING
 
         @testset "nulls.snappy" begin
             t = read_parquet(joinpath(PARQUET_TESTING_DIR, "nulls.snappy.parquet"))
-            col = Tables.getcolumn(t, first(Tables.columnnames(t)))
+            # optional group b_struct { optional int32 b_c_int }: all 8 structs are
+            # present (def = 1) with a null field — not struct-level nulls
+            col = t.b_struct
+            @test col isa Parquet3.StructColumn
             @test length(col) == 8
-            @test all(ismissing, col)
+            @test all(x -> x.b_c_int === missing, col)
+            @test all(ismissing, col.b_c_int)
         end
 
         @testset "sort_columns" begin

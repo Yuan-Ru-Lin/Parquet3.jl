@@ -33,6 +33,69 @@ Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
     FixedSizeView{N,T}(v.data, (i - 1) * N)
 end
 
+# ── Nested column containers ─────────────────────────────────────────────────
+
+"""
+Column wrapper adding named field access to nested Arrow containers, which store
+fields positionally. `col[i]` delegates row access to the wrapped array;
+`col.fieldname` yields the field's full child column — zero-copy for a single row
+group, chained across per-row-group chunks otherwise.
+"""
+struct NestedColumn{kind, T, fnames, D<:AbstractVector{T}} <: AbstractVector{T}
+    _data::D    # Arrow.Struct / Arrow.List-over-Struct, or ChainedVector of chunks
+end
+
+"""Struct column: rows are lazy `NamedTuple`s; `col.fieldname` is the child column."""
+const StructColumn{T, fnames, D} = NestedColumn{:struct, T, fnames, D}
+
+"""List-of-structs column: rows are lazy vectors of `NamedTuple`s; `col.fieldname`
+is a ragged per-field list sharing the parent's offsets and validity."""
+const ListOfStructsColumn{T, fnames, D} = NestedColumn{:list_of_structs, T, fnames, D}
+
+StructColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
+    NestedColumn{:struct, T, fnames, typeof(data)}(data)
+ListOfStructsColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
+    NestedColumn{:list_of_structs, T, fnames, typeof(data)}(data)
+
+Base.size(c::NestedColumn) = size(getfield(c, :_data))
+Base.IndexStyle(::Type{<:NestedColumn}) = Base.IndexLinear()
+@Base.propagate_inbounds Base.getindex(c::NestedColumn, i::Int) = getfield(c, :_data)[i]
+Arrow.getmetadata(c::NestedColumn) = Arrow.getmetadata(_first_chunk(getfield(c, :_data)))
+
+Base.propertynames(::NestedColumn{kind, T, fnames}) where {kind, T, fnames} = fnames
+function Base.getproperty(c::NestedColumn{kind, T, fnames}, name::Symbol) where {kind, T, fnames}
+    j = findfirst(==(name), fnames)
+    j === nothing && return getfield(c, name)
+    _child_column(getfield(c, :_data), j)
+end
+
+"""Project field `j` out of a nested container: struct → child column, list-over-struct → ragged list."""
+_child_column(s::Arrow.Struct, j::Int) = _wrap_struct(s.data[j])
+_child_column(l::Arrow.List, j::Int) = _member_list(l, j)
+function _child_column(cv::ChainedVector, j::Int)
+    first(cv.arrays) isa Arrow.Struct ?
+        _wrap_struct(ChainedVector([s.data[j] for s in cv.arrays])) :
+        ChainedVector([_member_list(l, j) for l in cv.arrays])
+end
+
+"""Ragged view of one struct member: an Arrow.List over the member's child array, sharing offsets/validity."""
+function _member_list(l::Arrow.List, j::Int)
+    child = l.data.data[j]
+    _make_list(child, l.validity, l.offsets.offsets, length(l), Missing <: eltype(l))
+end
+
+"""Wrap struct-valued children in StructColumn so named access composes (`tbl.a.b.c`)."""
+function _wrap_struct(v::AbstractVector)
+    v isa ChainedVector && isempty(v.arrays) && return v
+    s = _first_chunk(v)
+    s isa Arrow.Struct || return v
+    StructColumn(v, _struct_fnames(typeof(s)))
+end
+_struct_fnames(::Type{<:Arrow.Struct{T, S, fnames}}) where {T, S, fnames} = fnames
+
+_first_chunk(v::AbstractVector) = v
+_first_chunk(cv::ChainedVector) = first(cv.arrays)
+
 """
     read_parquet(path::String; columns=nothing) -> Arrow.Table
 
@@ -52,10 +115,30 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     leaf_columns = get_leaf_columns(schema_tree)
     (; schema, fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
 
+    struct_nodes = _struct_top_nodes(schema_tree)
+    # Counted before any column filtering so names don't depend on the selection
+    leaf_count = _leaf_counts(leaf_columns)
+
     if columns !== nothing
         leaf_columns = filter(leaf_columns) do (path, node)
+            haskey(struct_nodes, path[1]) && return path[1] in columns
             col_name = join(path, ".")
             col_name in columns || path[1] in columns || path[end] in columns
+        end
+    end
+
+    # One spec per output column, in schema order: a (path, node) leaf pair, or the
+    # group SchemaNode for a struct assembled from all its member leaves.
+    specs = Union{Tuple{Vector{String}, SchemaNode}, SchemaNode}[]
+    emitted_structs = Set{String}()
+    for (path, node) in leaf_columns
+        top = path[1]
+        if haskey(struct_nodes, top)
+            top in emitted_structs && continue
+            push!(emitted_structs, top)
+            push!(specs, struct_nodes[top])
+        else
+            push!(specs, (path, node))
         end
     end
 
@@ -64,24 +147,23 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     # Per-column parallelism: each column reads its own row groups from the shared mmap'd data.
     # NUMA optimization opportunity: with ThreadPinning.jl, per-RG decompression/decoding tasks
     # could be pinned to NUMA-local threads, keeping data close to where it's consumed downstream.
-    tasks = map(leaf_columns) do (path, node)
+    tasks = map(specs) do spec
         Threads.@spawn begin
+            if spec isa SchemaNode
+                return is_struct_group(spec) ?
+                    _read_struct_column(pf.data, row_groups, spec, field_meta, schema_tree) :
+                    _read_los_column(pf.data, row_groups, spec, field_meta)
+            end
+            path, node = spec
             top_name = path[1]
-            col_name = join(path, ".")
-            name = node.max_rep_level > 0 ? top_name : col_name
+            name = _leaf_column_name(path, node, leaf_count)
             nullable = _column_has_nulls(row_groups, path, node)
 
-            # Per-row-group parallelism within each column
-            chunk_tasks = map(row_groups) do rg
-                Threads.@spawn begin
-                    pages = _read_pages_for_rg(pf.data, rg, path, node)
-                    _assemble_to_arrow(pages, node, schema_tree, path, fsl, field_meta, top_name; nullable)
-                end
+            column = _read_column_chunks(row_groups) do rg
+                pages = _read_pages_for_rg(pf.data, rg, path, node)
+                _assemble_to_arrow(pages, node, schema_tree, path, fsl, field_meta, top_name; nullable)
             end
-            chunks = fetch.(chunk_tasks)
-
-            isempty(chunks) && return nothing
-            column = length(chunks) == 1 ? only(chunks) : ChainedVector(chunks)
+            column === nothing && return nothing
             (Symbol(name), column)
         end
     end
@@ -93,7 +175,8 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         result = try
             fetch(task)
         catch e
-            col_name = join(first(leaf_columns[i]), ".")
+            spec = specs[i]
+            col_name = spec isa SchemaNode ? spec.element.name : join(spec[1], ".")
             @warn "Failed to read column $col_name" exception=(e, catch_backtrace())
             nothing
         end
@@ -143,6 +226,240 @@ function _read_pages_for_rg(data::Vector{UInt8}, rg::RowGroup, column_path::Vect
     read_all_pages(reader)
 end
 
+# ── Struct (group) column assembly ───────────────────────────────────────────
+#
+# Parquet stores no struct data: a group is pure schema nesting over independently
+# stored member leaves. Assembly = read each leaf as usual, then wrap the child
+# arrays in Arrow.Struct (columnar: tuple of children + validity bitmap).
+# Struct-level nulls are recovered from raw definition levels: a row's struct is
+# null iff def < the group's own def level (leaf assembly alone can't distinguish
+# "struct is null" from "struct present, field null").
+
+"""
+Build a recursive assembly plan for a struct group. Each member entry carries its
+kind (:flat, :list, or :struct), leaf node and full schema path, per-column nullable
+flag, list thresholds, and — for :struct — a nested plan.
+"""
+function _plan_struct(gnode::SchemaNode, base_path::Vector{String},
+                      row_groups::Vector{RowGroup}, schema_tree::SchemaNode)
+    members = map(gnode.children) do c
+        kind = struct_member_kind(c)
+        if kind == :struct
+            (name = Symbol(c.element.name), kind = kind, leaf = c, path = String[],
+             nullable = false, thresholds = Int[], null_def = 0,
+             plan = _plan_struct(c, [base_path; c.element.name], row_groups, schema_tree))
+        else
+            leaf, names = _single_leaf_chain(c)
+            path = [base_path; names]
+            (name = Symbol(c.element.name), kind = kind, leaf = leaf, path = path,
+             nullable = _column_has_nulls(row_groups, path, leaf),
+             thresholds = compute_def_thresholds(schema_tree, path),
+             # Min def level for a list member to be present (below it: null).
+             # A REQUIRED or REPEATED member field can never itself be null.
+             null_def = c.element.repetition_type == OPTIONAL ? c.own_def_level : 0,
+             plan = nothing)
+        end
+    end
+
+    (fnames = Tuple(m.name for m in members), members = members,
+     own_def = gnode.own_def_level,
+     nullable = _group_nullable(gnode.own_def_level, _flat_descendant_nullables(members), row_groups))
+end
+
+function _flat_descendant_nullables(members)
+    out = Bool[]
+    for m in members
+        m.kind == :flat && push!(out, m.nullable)
+        m.kind == :struct && append!(out, _flat_descendant_nullables(m.plan.members))
+    end
+    out
+end
+
+"""Read a struct group column: one Arrow.Struct chunk per row group."""
+function _read_struct_column(data::Vector{UInt8}, row_groups::Vector{RowGroup},
+                             gnode::SchemaNode, field_meta, schema_tree::SchemaNode)
+    gname = gnode.element.name
+    plan = _plan_struct(gnode, [gname], row_groups, schema_tree)
+    meta = get(field_meta, gname, nothing)
+    column = _read_column_chunks(rg -> first(_assemble_struct_chunk(data, rg, plan, meta)), row_groups)
+    column === nothing && return nothing
+    (Symbol(gname), StructColumn(column, plan.fnames))
+end
+
+"""
+Assemble one row group's member leaves into an Arrow.Struct chunk, decoding members
+in parallel and recursing into nested struct members. Returns `(struct_chunk,
+record_defs)` where `record_defs` holds the leftmost leaf's def level at each
+record — one leaf's def levels encode the nullness of every ancestor group, so each
+nesting level extracts its own validity from the same vector by comparing against
+its own def level. `record_defs` is only materialized when this level needs it
+(`plan.own_def > 0`) or the caller asked for it (`want_defs`).
+"""
+function _assemble_struct_chunk(data::Vector{UInt8}, rg::RowGroup, plan, meta; want_defs::Bool=false)
+    need_defs = want_defs || plan.own_def > 0
+    results = fetch.([Threads.@spawn _assemble_member(data, rg, m, need_defs && j == 1)
+                      for (j, m) in enumerate(plan.members)])
+
+    children = Tuple(first(r) for r in results)
+    record_defs = results[1][2]
+    n = length(first(children))
+    snulls = falses(n)
+    if plan.own_def > 0
+        @inbounds for i in 1:n
+            snulls[i] = record_defs[i] < plan.own_def
+        end
+    end
+    (_make_struct(children, plan.fnames, snulls, plan.nullable, meta), record_defs)
+end
+
+"""Assemble one struct member's child column; optionally also return its record-level def levels."""
+function _assemble_member(data::Vector{UInt8}, rg::RowGroup, m, want_defs::Bool)
+    m.kind == :struct && return _assemble_struct_chunk(data, rg, m.plan, nothing; want_defs)
+    pages = _read_pages_for_rg(data, rg, m.path, m.leaf)
+    elem = m.leaf.element
+    if m.kind == :flat
+        values, nulls = assemble_flat_column(pages, m.leaf.max_def_level)
+        converted = convert_primitive_values(values, elem.type, elem.converted_type)
+        child = _build_leaf_array(converted, nulls, elem.type, elem.converted_type; nullable=m.nullable)
+        (child, want_defs ? _page_defs(pages, m.leaf.max_def_level) : nothing)
+    else  # :list — child column is a regular Arrow.List
+        all_rep, all_def, raw = collect_page_data(pages, m.leaf.max_def_level)
+        converted = convert_primitive_values(raw, elem.type, elem.converted_type)
+        child = _to_arrow_nested(all_rep, all_def, converted, m.leaf.max_def_level,
+                                 m.leaf.max_rep_level, m.thresholds, elem.type, elem.converted_type;
+                                 nullable=m.nullable, record_null_def=m.null_def)
+        (child, want_defs ? _record_defs(all_rep, all_def) : nothing)
+    end
+end
+
+"""Concatenate def levels across pages (pages without def levels are all-present)."""
+function _page_defs(pages::Vector{<:DecodedPage}, max_def::Int)
+    total = sum(p.num_values for p in pages; init=0)
+    out = Vector{Int}(undef, total)
+    pos = 1
+    for p in pages
+        if p.def_levels === nothing
+            fill!(@view(out[pos:pos+p.num_values-1]), max_def)
+        else
+            copyto!(out, pos, p.def_levels, 1, p.num_values)
+        end
+        pos += p.num_values
+    end
+    out
+end
+
+"""
+Read a List<Struct> column: one Arrow.List-over-Arrow.Struct chunk per row group.
+
+Every member leaf carries an identical copy of the list structure in its rep/def
+levels (Dremel guarantees this), so offsets and list/element validity are derived
+once from the first member; the remaining members only contribute child arrays.
+Def-level layers for `optional g (LIST) { repeated list { optional elem { optional f }}}`:
+def < 1 list null, < 2 empty list, < 3 element null, < 4 field null, 4 value.
+"""
+function _read_los_column(data::Vector{UInt8}, row_groups::Vector{RowGroup},
+                          gnode::SchemaNode, field_meta)
+    parts = list_of_structs_parts(gnode)
+    gname = gnode.element.name
+    members = map(parts.elem.children) do c
+        path = [parts.prefix; c.element.name]
+        (leaf = c, path = path, nullable = _column_has_nulls(row_groups, path, c))
+    end
+    member_nullable = [m.nullable for m in members]
+    elem_optional = parts.elem !== parts.rep && parts.elem.element.repetition_type == OPTIONAL
+
+    # A null list (or null element) nulls every member leaf at that position, so
+    # they are only possible when every member column contains nulls (cf. structs).
+    plan = (members = members,
+            entry_def = parts.rep.own_def_level,              # slot exists at/above this
+            elem_null_def = elem_optional ? parts.elem.own_def_level : 0,
+            list_null_def = gnode.own_def_level,
+            list_nullable = _group_nullable(gnode.own_def_level, member_nullable, row_groups),
+            elem_nullable = elem_optional &&
+                _group_nullable(parts.elem.own_def_level, member_nullable, row_groups),
+            fnames = Tuple(Symbol(c.element.name) for c in parts.elem.children),
+            meta = get(field_meta, gname, nothing))
+
+    column = _read_column_chunks(rg -> _assemble_los_chunk(data, rg, plan), row_groups)
+    column === nothing && return nothing
+    (Symbol(gname), ListOfStructsColumn(column, plan.fnames))
+end
+
+"""Assemble one row group's member leaves into an Arrow.List{Arrow.Struct} chunk."""
+function _assemble_los_chunk(data::Vector{UInt8}, rg::RowGroup, plan)
+    # Decode all member column chunks in parallel
+    fetched = fetch.([Threads.@spawn begin
+                          pages = _read_pages_for_rg(data, rg, m.path, m.leaf)
+                          collect_page_data(pages, m.leaf.max_def_level)
+                      end for m in plan.members])
+
+    # Offsets and list/element validity from the first member's levels
+    rep1, def1, _ = fetched[1]
+    n = count(==(0), rep1)
+    nslots = count(>=(plan.entry_def), def1)
+    offsets = Vector{Int32}(undef, n + 1)
+    list_nulls = falses(n)
+    elem_nulls = falses(nslots)
+    rec = 0
+    slot = 0
+    @inbounds for i in eachindex(rep1)
+        d = def1[i]
+        if rep1[i] == 0
+            rec += 1
+            offsets[rec] = slot
+            d < plan.list_null_def && (list_nulls[rec] = true)
+        end
+        if d >= plan.entry_def
+            slot += 1
+            plan.elem_null_def > 0 && d < plan.elem_null_def && (elem_nulls[slot] = true)
+        end
+    end
+    offsets[n + 1] = slot
+
+    # Member child arrays at element (slot) granularity
+    children = map(plan.members, fetched) do m, (_, defj, valsj)
+        converted = convert_primitive_values(valsj, m.leaf.element.type, m.leaf.element.converted_type)
+        mvals, mnulls = _scatter_member(defj, converted, plan.entry_def, m.leaf.max_def_level, nslots)
+        _build_leaf_array(mvals, mnulls, m.leaf.element.type, m.leaf.element.converted_type;
+                          nullable=m.nullable)
+    end
+
+    elem_struct = _make_struct(Tuple(children), plan.fnames, elem_nulls, plan.elem_nullable, nothing)
+    lv = _validity(list_nulls)
+    _make_list(elem_struct, lv, offsets, n, lv.nc > 0 || plan.list_nullable, plan.meta)
+end
+
+"""Function barrier: scatter one member's values into element-slot granularity (type-stable inner loop)."""
+function _scatter_member(defs, values::AbstractVector{T}, entry_def::Int, max_def::Int, nslots::Int) where T
+    mvals = Vector{T}(undef, nslots)
+    mnulls = falses(nslots)
+    s = 0
+    v = 0
+    @inbounds for d in defs
+        d >= entry_def || continue
+        s += 1
+        if d == max_def
+            v += 1
+            mvals[s] = values[v]
+        else
+            mnulls[s] = true
+        end
+    end
+    (mvals, mnulls)
+end
+
+"""Def levels at record starts (rep == 0) of a repeated member's level streams."""
+function _record_defs(all_rep, all_def)
+    out = Vector{Int}(undef, count(==(0), all_rep))
+    rec = 0
+    @inbounds for i in eachindex(all_rep)
+        all_rep[i] == 0 || continue
+        rec += 1
+        out[rec] = all_def[i]
+    end
+    out
+end
+
 """Assemble one row group's decoded pages into an Arrow array chunk."""
 function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, schema_tree::SchemaNode,
                             column_path::Vector{String}, fsl_info, field_meta, top_name::String; nullable::Bool=false)
@@ -184,6 +501,38 @@ function _validity(nulls::BitVector)
     Arrow.ValidityBitmap(bytes, 1, length(nulls), nc)
 end
 
+"""Assemble one chunk per row group in parallel; chain multiple chunks. Returns nothing if no row groups."""
+function _read_column_chunks(assemble::Function, row_groups::Vector{RowGroup})
+    chunks = fetch.([Threads.@spawn assemble(rg) for rg in row_groups])
+    isempty(chunks) && return nothing
+    length(chunks) == 1 ? only(chunks) : ChainedVector(chunks)
+end
+
+"""
+Whether a group level (struct, list, or list element) can be null, decided from
+member column statistics: a null at the group level nulls every flat leaf below it,
+so any zero-null member column rules it out. With no flat-descendant statistics the
+call is conservative for multi-row-group files (single-RG eltypes follow the data).
+"""
+_group_nullable(own_def::Int, flat_nullables::Vector{Bool}, row_groups::Vector{RowGroup}) =
+    own_def > 0 && (isempty(flat_nullables) ? length(row_groups) > 1 : all(flat_nullables))
+
+"""Build an Arrow.Struct from child columns and group-null bits, widening eltype when nullable."""
+function _make_struct(children::Tuple, fnames, nulls::BitVector, nullable::Bool, meta)
+    NT = NamedTuple{fnames, Tuple{map(eltype, children)...}}
+    v = _validity(nulls)
+    ET = (v.nc > 0 || nullable) ? Union{Missing, NT} : NT
+    Arrow.Struct{ET, typeof(children), fnames}(v, children, length(nulls), meta)
+end
+
+"""Build an Arrow.List over `child` from 0-based offsets, widening eltype when `withmissing`."""
+function _make_list(child::AbstractVector, v::Arrow.ValidityBitmap, offsets::Vector{Int32},
+                    n::Integer, withmissing::Bool, meta=nothing)
+    ST = SubArray{eltype(child), 1, typeof(child), Tuple{UnitRange{Int64}}, true}
+    ET = withmissing ? Union{Missing, ST} : ST
+    Arrow.List{ET, Int32, typeof(child)}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), child, Int(n), meta)
+end
+
 """Build the appropriate Arrow leaf array from flat leaf values and nulls."""
 function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector, ptype, ctype;
                            nullable::Bool=false, meta=nothing) where T
@@ -222,7 +571,8 @@ end
 
 """Build Arrow.List directly from rep/def levels — single pass, no intermediate Vector{Vector{T}}."""
 function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, max_rep,
-                          def_thresholds, ptype, ctype; nullable::Bool=false, meta=nothing) where T
+                          def_thresholds, ptype, ctype; nullable::Bool=false, meta=nothing,
+                          record_null_def::Int = max_def > 0 ? 1 : 0) where T
     # Innermost threshold: min def_level for a leaf element to exist
     inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
 
@@ -256,8 +606,10 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
             end
             record_idx += 1
 
-            # Null record: def=0 means the entire record is null
-            if def == 0 && max_def > 0
+            # Null record: def below the record-null threshold. For top-level list
+            # columns that is def == 0; for a list member inside a struct, any def
+            # below the list group's own def level (struct null or list null).
+            if def < record_null_def
                 record_nulls[record_idx] = true
                 # Still need to push offset entries for this null record at the end
                 # (handled by the finalization on next rep=0 or after loop)
@@ -308,19 +660,14 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
     child = _build_leaf_array(leaf_values, leaf_nulls, ptype, ctype; nullable)
 
     for k in max_rep:-1:1
-        ST = SubArray{eltype(child), 1, typeof(child), Tuple{UnitRange{Int64}}, true}
-        offs = Arrow.Offsets(UInt8[], offsets[k])
         n = length(offsets[k]) - 1
-
         if k == 1
             # Top level: apply record nulls and field metadata
             v = _validity(record_nulls)
-            ET = (v.nc > 0 || nullable) ? Union{Missing,ST} : ST
-            child = Arrow.List{ET, Int32, typeof(child)}(UInt8[], v, offs, child, n, meta)
+            child = _make_list(child, v, offsets[k], n, v.nc > 0 || nullable, meta)
         else
             # Intermediate levels: all-valid
-            v = Arrow.ValidityBitmap(UInt8[], 1, n, 0)
-            child = Arrow.List{ST, Int32, typeof(child)}(UInt8[], v, offs, child, n, nothing)
+            child = _make_list(child, Arrow.ValidityBitmap(UInt8[], 1, n, 0), offsets[k], n, false)
         end
     end
 

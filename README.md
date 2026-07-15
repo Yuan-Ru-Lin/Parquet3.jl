@@ -98,6 +98,8 @@ Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Bin
 
 - `List<T>` — returned as `Arrow.List` (Tables.jl-compatible, iterable as nested arrays)
 - `List<List<T>>` and deeper — arbitrary nesting depth supported via nested `Arrow.List`
+- `Struct` — returned as `StructColumn` (columnar wrapper over `Arrow.Struct`): `col[i]` gives a lazily-built `NamedTuple` row, `col.fieldname` gives the full child column zero-copy (chained across row groups). Members may be primitives, strings, lists (e.g. `waveform: {t0: float, dt: float, values: list<int32>}`), or nested structs — named access composes (`tbl.event.vertex.x`).
+- `List<Struct>` — returned as `ListOfStructsColumn`: `col[i]` gives a lazy vector of `NamedTuple`s, `col.fieldname` gives that field as a ragged list column sharing the parent's offsets (e.g. `particles.pt`). Deeper combinations (`List<Struct{List}>`, maps) are not yet assembled and fall back to distinct flattened columns.
 - `FixedSizeList<T>` — returned as `FixedSizeListVector{N,T}` (flat `Vector{T}` with fixed stride, zero-copy `FixedSizeView{N,T}` element access); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.)
 
 ### Logical Types
