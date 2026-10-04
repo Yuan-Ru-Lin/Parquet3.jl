@@ -2203,3 +2203,50 @@ end
         end
     end
 end
+
+@testset "Recursive reader: member selection (R6)" begin
+    P = Parquet3
+    plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+    mktempdir() do dir
+        path = joinpath(dir, "shapes.parquet")
+        if _run_pyarrow(HARNESS_NEW_SHAPES * "pq.write_table(table, '$(path)', row_group_size=4)\nprint('SUCCESS')") == "SUCCESS"
+            # Each selection, against pyarrow's own pruned read of the same leaves
+            selections = [["id"], ["lsl"], ["lsl.adc"], ["lsl.x", "id"], ["lss.vertex.tag"], ["lss.vertex", "lss.id"], ["sls.run"],
+                          ["sls.hits"], ["sls.hits.adc"], ["lls.vertex.x"], ["lls.id", "lsl.x"], ["m"], ["m.key"], ["m.value"],
+                          ["mm.value.value"], ["mm.key", "mm.value.key"], ["sm.tags.value", "sm.n"], ["sm.tags"]]
+            verdicts = harness_compare_selections(P._read_parquet_recursive, path, selections, dir)
+            @testset "columns = $sel" for (sel, verdict) in zip(selections, verdicts)
+                @test verdict == "equal"
+            end
+
+            # A selection is the full column with the other members left out
+            full = P._read_parquet_recursive(path)
+            sel = P._read_parquet_recursive(path; columns = ["lss.vertex.tag", "sls.run", "m.value"])
+            @test isequal(plain(sel.lss.vertex.tag), plain(full.lss.vertex.tag)) && propertynames(sel.lss.vertex) == (:tag,)
+            @test isequal(plain(sel.sls.run), plain(full.sls.run)) && isequal(plain(sel.m.value), plain(full.m.value))
+            @test ismissing(sel.sls[4]) && ismissing(sel.m[4])      # validity comes from the remaining leaf
+            @test isempty(loose_nodes(sel))
+        else
+            @warn "Skipping selection fixtures: uv/pyarrow not available"
+        end
+
+        # Unselected leaves are not decoded: `s.b` uses an encoding the reader cannot decode,
+        # so reading `s` fails, while its other member and the other columns read fine.
+        path = joinpath(dir, "undecodable.parquet")
+        if _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq
+st = pa.struct([('a', pa.int32()), ('b', pa.string())])
+table = pa.table({'id': [1, 2, 3], 's': pa.array([{'a': 1, 'b': 'x'}, None, {'a': 3, 'b': 'z'}], type=st),
+                  'l': pa.array([[{'a': 1, 'b': 'p'}], [], None], type=pa.list_(st))})
+pq.write_table(table, '$(path)', use_dictionary=False,
+               column_encoding={'id': 'PLAIN', 's.a': 'PLAIN', 's.b': 'DELTA_BYTE_ARRAY', 'l.list.element.a': 'PLAIN', 'l.list.element.b': 'DELTA_BYTE_ARRAY'})
+print('SUCCESS')""") == "SUCCESS"
+            err = try P._read_parquet_recursive(path); nothing catch e; e end
+            @test err isa P.ColumnReadError && err.column == "s" && occursin("DELTA_BYTE_ARRAY", sprint(showerror, err))
+            @test_throws P.ColumnReadError P._read_parquet_recursive(path; columns = ["s.b"])
+            t = P._read_parquet_recursive(path; columns = ["id", "s.a", "l.a"])
+            @test collect(t.id) == [1, 2, 3] && isequal(collect(t.s.a), [1, missing, 3]) && ismissing(t.s[2])
+            @test isequal(plain(t.l), Any[Any[(a = 1,)], Any[], missing])
+        end
+    end
+end

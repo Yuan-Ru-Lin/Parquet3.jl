@@ -273,3 +273,43 @@ table = pa.table({
     'id':  pa.array(range(n), type=i64),
 })
 """
+
+# pyarrow's file-level reader takes Parquet leaf paths and returns the nested column pruned
+# to them, which is the selection semantics of `columns=` here. (`pq.read_table` differs: it
+# returns a selected struct member as a top-level column and cannot select inside lists.)
+# Arguments: the original file, then rewrite=leaf.path,leaf.path,... per selection.
+const HARNESS_COMPARE_SELECTIONS = """
+import pyarrow.parquet as pq
+def norm(v):
+    if isinstance(v, tuple): return {'key': norm(v[0]), 'value': norm(v[1])}
+    if isinstance(v, list): return [norm(x) for x in v]
+    if isinstance(v, dict): return {k: norm(x) for k, x in v.items()}
+    return v
+pf = pq.ParquetFile(ARGS[0])
+def compare(spec):
+    ours, leaves = spec.split('=')
+    a, b = pf.read(columns=leaves.split(',')), pq.read_table(ours)
+    if a.column_names != b.column_names: return 'column names differ: %s vs %s' % (a.column_names, b.column_names)
+    bad = [n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.column(n).to_pylist())]
+    return 'equal' if not bad else 'DIFFER in ' + ', '.join(bad)
+print(';'.join(compare(spec) for spec in ARGS[1:]))
+"""
+
+"""
+For each selection (a vector of user keys), read `path` with `read`, write the result to
+`dir`, and have pyarrow compare it with its own pruned read of the same leaves. Returns
+one verdict per selection, or `nothing` without pyarrow.
+"""
+function harness_compare_selections(read, path::String, selections, dir::String)
+    pf = open_parquet(path)
+    plan = Parquet3.plan_read_tree(Parquet3.build_schema_tree(pf.metadata.schema))
+    close(pf)
+    specs = map(enumerate(selections)) do (i, keys)
+        out = joinpath(dir, "selection_$i.parquet")
+        write_parquet(out, read(path; columns = keys))
+        leaves = [join(leaf.path, ".") for node in Parquet3.prune_read_plan(plan, keys) for leaf in Parquet3.read_leaves(node)]
+        "'$(out)=$(join(leaves, ","))'"
+    end
+    result = _run_pyarrow("ARGS = ['$(path)', $(join(specs, ", "))]\n" * HARNESS_COMPARE_SELECTIONS)
+    result === nothing ? nothing : split(result, ';')
+end

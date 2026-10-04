@@ -379,13 +379,37 @@ entry point.
       files read in full with no loose nodes.
       Moved to R7: rewriting the tests that pin the flattened fallback. They test
       `read_parquet`, which keeps the old paths until the switch.
-- [ ] R6 — member selection end to end: `columns=` with dotted paths against pyarrow's
-      `read_table(columns=…)` for the same keys; a check that unselected leaves are not
-      decoded; benchmark of `waveform_windowed.t0` alone against the full column.
+- [x] R6 (DONE) — member selection end to end. 18 selections on the new-shapes fixture
+      (members inside lists, structs, lists of lists, maps, several row groups): pyarrow's
+      pruned read of the same leaves equals our result in every case. A struct or
+      list<struct> with an undecodable member reads when that member is not selected.
+      Benchmark (local): `waveform_windowed.t0` alone 4.4 ms / 2 MiB against 142 ms / 701 MiB
+      for the whole struct.
+      Finding: "as in pyarrow" holds for `pq.ParquetFile(...).read(columns=<leaf paths>)`,
+      which returns the pruned nested column. `pq.read_table(columns=["s.a"])` behaves
+      differently: it returns a top-level column `a`, and cannot select inside lists.
 - [ ] R7 — switch the default; delete the old paths, the classification helpers and the
       statistics-based nullability; docs; final benchmark. Re-run the parquet-testing files
       with known read failures (task C list) against the new reader and report which still
       fail and which went away; they are deliberately not fixed before the rewrite.
+
+- R8 (PROPOSED 2026-10-04, awaiting the user; not started) — maps the Arrow way, both
+      directions. Read: a MAP node wraps as `Arrow.Map`, so `col[i]` is a `Dict{K,V}` (at top
+      level, in structs, in lists, map of maps); a key-only map stays a list of keys. Write:
+      an element type `<: AbstractDict` is written as a Parquet MAP (group annotated MAP,
+      repeated `key_value`, required key, optional value); a vector of `(key, value)`
+      NamedTuples stays a list of structs. Tests against pyarrow in both directions, plus
+      `Arrow.write` of a map column.
+      Points against, to weigh before starting:
+      - `Arrow.Map` builds a `Dict` on every index access (allocation per row).
+      - A `Dict` drops duplicate keys and entry order, both of which Parquet allows.
+      - Columnar access to all keys or all values (`col.key`, `col.value`) is lost unless the
+        child stays reachable. Proposal if R8 goes ahead: keep it, by wrapping the `Arrow.Map`
+        in the existing wrapper so `col[i]` is a `Dict` while `col.key` / `col.value` still
+        return the ragged key and value lists.
+      - One more Arrow.jl internal positional constructor behind the tight compat bound.
+      - `columns=["m.key"]` (R6) returns a map without values; under R8 that would have to
+        stay a list of keys, as a key-only map does.
 
 ### Constraints carried from the brief
 - Structure and values of everything that assembles today are unchanged.
