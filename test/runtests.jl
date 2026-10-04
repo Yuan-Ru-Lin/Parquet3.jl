@@ -1002,6 +1002,14 @@ table = pa.table({
                     @test back.fsl isa Parquet3.FixedSizeListVector{3, Int32}
                     @test back.fslf isa Parquet3.FixedSizeListVector{2, Float64}
 
+                    # ARROW:schema is written only when a FixedSizeList column needs it
+                    has_schema(path) = (pf = open_parquet(path); kv = pf.metadata.key_value_metadata; close(pf);
+                                        kv !== nothing && any(e -> e.key == "ARROW:schema", kv))
+                    @test has_schema(out)
+                    write_parquet(out, (hits = t.hits, wf = t.wf))
+                    @test !has_schema(out)
+                    write_parquet(out, t)
+
                     # pyarrow sees the same values and types as in its own file
                     result = _run_pyarrow("""
 import pyarrow.parquet as pq

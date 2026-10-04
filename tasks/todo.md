@@ -39,6 +39,10 @@ Nested writing is driven by element type, so reader outputs round-trip:
       the table schema, take the first IPC message) rather than hand-building FlatBuffers;
       confirm our reader and pyarrow both restore fixed_size_list.
 
+- [ ] Follow-up (if it bothers users): first-write latency for tables with a FixedSizeList
+      column (5–20 s, Arrow.jl compilation in `_arrow_schema_kv`). Needs a schema path that
+      avoids Arrow.jl's generic writer.
+
 Open: compression — in v0.2.0 or v0.3?
 
 Deferred (edge case, decided 2026-10-03): infer struct member types from rows when the

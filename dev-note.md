@@ -104,9 +104,11 @@ special cases.
 A `FixedSizeListVector` is written as a plain LIST, as pyarrow does; the fixed size lives
 in the `ARROW:schema` key-value entry. `_arrow_schema_kv` gets that entry from Arrow.jl
 instead of building FlatBuffers by hand: it serializes a zero-row copy of the table and
-keeps the first IPC message, which is the schema. The entry is written for every file.
-Cost: Arrow.jl compiles its schema code for each new set of column types, which adds
-first-call latency to `write_parquet`.
+keeps the first IPC message, which is the schema. The entry is written only when the table
+has a FixedSizeList column: Arrow.jl compiles its schema code for each new set of column
+types, which adds 5–20 s to a first `write_parquet` call (measured 2026-10-03), and no
+other type we write needs it. Tables with a FixedSizeList column still pay that once per
+session and table shape.
 
 Narrow and unsigned integers are stored in INT32/INT64 with a converted-type annotation;
 `encode_plain` converts with `% Int32` / `% Int64`, the inverse of the reader's `% T`.
