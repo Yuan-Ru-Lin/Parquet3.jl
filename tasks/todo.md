@@ -210,7 +210,109 @@ handling, and logical types on members. Bugs below are in priority order; one at
       `parse_page_header`. Their four level-array unit tests now drive the live `_to_arrow_nested`.
 - [x] `snulls` loop is just `record_defs .< own_def`
 
-## Part 4 (future, if needed) — full closure: list<struct{list}>, list<struct{struct}>, maps
+## Part 4 — one recursive reader (PLAN, awaiting approval; no reader code written yet)
+
+Requested 2026-10-04 via the planning session. Goal: replace the three shape-specific read
+paths (leaf/list `_assemble_to_arrow`, struct `_read_struct_column`, list<struct>
+`_read_los_column`) and the flattened fallback with one recursion that is the inverse of the
+writer's `_plan_node` / `_shred!`: schema tree → plan tree → recursive assembly.
+
+### Design
+Node kinds and what each contributes to the Arrow array:
+- **leaf** — values and element validity (`def == max_def`). One slot per level entry with
+  `def >=` the def level of the nearest enclosing list item (every entry, outside lists).
+- **list** — offsets from repetition levels and validity from definition levels
+  (`def >= own_def`); wraps its one child. Covers the standard 3-level LIST, the legacy
+  2-level form, a bare repeated field, and MAP (a list of `key_value` structs).
+- **struct** — validity only (`def >= own_def`); wraps its children.
+- **fixed-size list** — a list node that `ARROW:schema` declares fixed-size with a primitive
+  element, at top level or as a struct member (as today). Keeps today's dense fast path.
+
+One leaf's levels serve every ancestor: all leaves under a node carry identical structure
+above that node (the Dremel invariant), so each list/struct takes its offsets and validity
+from its leftmost leaf, in the single pass that leaf already makes. Every other leaf only
+scatters its values into slots. This generalises today's `_to_arrow_nested` (one pass, all
+list levels of one leaf chain) and the struct path's `record_defs` slicing, from "record
+level only" to any depth.
+
+Public result per shape:
+| Shape | Result | Change |
+|---|---|---|
+| primitive, string | `Arrow.Primitive` / `Arrow.BoolVector` / string list | none |
+| `list<…>` of primitives or lists | `Arrow.List` | none |
+| struct | `StructColumn` | none |
+| `list<struct>` | `ListOfStructsColumn` | members may now be lists/structs |
+| `list<struct{list}>`, `list<struct{struct}>`, `list<list<struct>>` | `ListOfStructsColumn`; `col.f` is that field through every list level, sharing offsets | new (was flattened) |
+| struct with a `list<struct>` member | `StructColumn`; that member is a `ListOfStructsColumn`, so `tbl.s.hits.x` composes | new (was flattened) |
+| MAP | `ListOfStructsColumn` with fields `key`, `value` (Arrow's own layout for maps); not a `Dict` | new (was flattened) |
+The two wrapper names stay (no API break). Internally they are already one type
+(`NestedColumn`); the rule becomes "named field access wherever the element, through any
+number of list levels, is a struct".
+
+Fallback: once every list/struct shape assembles, the flattened dotted columns are removed.
+What stays unsupported is leaf-level (encodings, the Known Limitations list) plus
+FixedSizeList inside a list (still read as variable-length). A schema the planner cannot
+classify throws `ColumnReadError` (consistent with task C). `column_names` and `columns=`
+become plain top-level field names.
+
+Own file: yes, `src/reader.jl` for the plan tree and assembly; `api.jl` keeps the public
+API and the wrappers. Not a general split of `api.jl`.
+
+### Staging — each step ends with a report and waits for approval
+Old paths stay the default until R6; the new reader runs beside them behind an internal
+entry point.
+- [ ] R0 — regression harness and baseline, no reader change. Corpus: every pyarrow fixture
+      in the suite, the parquet-testing files that read, `part-0.parquet`, and a
+      writer-produced shape matrix. Comparison: column names, `typeof`, `eltype`, values.
+      Baseline benchmark (min of 7, 8 threads, 2026-10-04, commit 8614d23):
+      all columns 182.6 ms / 1317 MiB; `waveform_windowed` 181.2 ms / 712 MiB;
+      `waveform_presummed` 146.3 ms / 539 MiB; `tracelist` 5.0 ms / 12 MiB.
+- [ ] R1 — plan tree from the schema (kinds, levels, nullability flags). Pure function with
+      unit tests, including legacy 2-level lists, MAP and bare repeated fields. No assembly.
+- [ ] R2 — assembly for leaves and structs without lists. Harness: identical to the old
+      paths for flat columns, structs, struct-of-struct, zero-row files.
+- [ ] R3 — lists: `list<prim>`, `list<list>`, struct with list members, FixedSizeList (top
+      level and member, dense path). Harness identical; benchmark on `part-0.parquet`. A
+      regression on the waveform columns blocks the step.
+- [ ] R4 — `list<struct>` with flat members: identical to the old path, wrapper and field
+      projection included.
+- [ ] R5 — the new shapes and MAP; wrapper generalisation. Tests: write → read equals input
+      across a shape matrix, and pyarrow-written files against pyarrow's values. Tests that
+      pin the flattened fallback are rewritten.
+- [ ] R6 — switch the default, delete the old paths and the classification helpers, docs,
+      final benchmark.
+
+### Constraints carried from the brief
+- Nothing that assembles today changes: same column types, element types, values.
+- Per-row-group parallelism, `ChainedVector` composition with stable element types, existing
+  zero-copy, FixedSizeList restoration, logical conversions at every depth, legacy lists,
+  zero-row files.
+- Nullability stays derived from `null_count` in this task (levels-based is the v0.3 item).
+
+### Risks
+1. **Element types must not move.** Nullability is three hand-written rules today (leaf,
+   struct, list<struct>), each tuned to how pyarrow counts nulls. One general rule has to
+   reproduce all three exactly, across row groups. This is the likeliest source of harness
+   failures and the part I am least sure collapses cleanly; if it does not, the fallback is
+   to keep the three rules as cases of the general function.
+2. **Performance.** The dense FixedSizeList path and per-member parallelism must survive.
+   The recursion has to stay at node level, with typed loops per leaf.
+3. **Level arithmetic at depth.** Mitigated by the harness, by the writer as an independent
+   implementation of the same arithmetic, and by pyarrow.
+4. **New public surface.** Field access through several list levels and MAP-as-list are new
+   behaviour users will rely on.
+5. **Breaking change.** Shapes that read today as several flattened dotted columns will read
+   as one nested column, and `columns=` by dotted leaf name stops working for them. This is
+   the one deliberate exception to "nothing changes".
+
+### Size and what I would cut
+This is the largest single task so far: it replaces roughly 600 lines of `src/api.jl` and
+`src/filereader.jl` (most of the reader's assembly) with an estimated 350–450. It is
+well-contained, since the writer and the harness pin the behaviour, but it is not small,
+and risk 1 could stretch it. To keep v0.2.0 shippable throughout, I would do it on its own
+branch off `writer-w1`.
+Cut: FixedSizeList inside lists; selecting struct members through `columns=`; any `Dict`
+type for maps; nullability from levels (already v0.3).
 
 ## Review (Part 2)
 - `waveform_windowed` / `waveform_presummed` now read as `Arrow.Struct` with fields
