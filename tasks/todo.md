@@ -72,7 +72,7 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
 ## Codecs (v0.2.0, decided 2026-10-04 via the planning session)
 - [x] Replace CodecZlib/CodecZstd/CodecLz4/Snappy/TranscodingStreams with ChunkCodecs.jl
       (DONE, awaiting review): `src/compression.jl` 117 → 64 lines; declared page size bounds
-      the output; leak check from 6ab762e still flat for every codec.
+      the output; leak check from 801e74f still flat for every codec.
 - [x] Brotli read and write (`compression = :brotli`), checked both ways against pyarrow.
 
 ## Release blockers from the structure review (2026-10-04, via the planning session)
@@ -345,7 +345,7 @@ entry point.
       its types are loose in 26 files (the preview of what tightens). Corpus: every
       pyarrow fixture in the suite, the parquet-testing files that read, `part-0.parquet`,
       and a writer-produced shape matrix.
-      Baseline benchmark (min of 7, 8 threads, 2026-10-04, commit 8614d23):
+      Baseline benchmark (min of 7, 8 threads, 2026-10-04, commit 4a06bc4):
       all columns 182.6 ms / 1317 MiB; `waveform_windowed` 181.2 ms / 712 MiB;
       `waveform_presummed` 146.3 ms / 539 MiB; `tracelist` 5.0 ms / 12 MiB.
 - [x] R1 (DONE, awaiting review) — `src/reader.jl`: `plan_read_tree`, `prune_read_plan` (unmatched key

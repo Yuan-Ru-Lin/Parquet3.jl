@@ -23,6 +23,10 @@ This package uses two structs to circumvent the issue:
 
 ## Reader Design
 
+The repetition/definition-level encoding of nested data, and the invariant used below, come
+from the Dremel paper: S. Melnik et al., "Dremel: Interactive Analysis of Web-Scale
+Datasets", PVLDB 3(1), 2010 — <https://research.google.com/pubs/archive/36632.pdf>.
+
 The reader (`src/reader.jl`) is the inverse of the writer's `_plan_node` / `_shred!`:
 schema tree → plan tree → prune to the selection → recursive assembly. It replaced three
 shape-specific paths (leaf/list, struct, list<struct>) and a flattened fallback.
