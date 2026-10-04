@@ -2,6 +2,7 @@ using Test
 using Parquet3
 using Arrow
 using Tables
+using Dates
 
 @testset "Parquet3.jl" begin
 
@@ -1171,6 +1172,49 @@ print(t.column('id').to_pylist() == list(range(1, $(n) + 1)), t.column('hits').t
             write_parquet(f, (a = Int32[], l = Vector{Float64}[]); compression = "zstd")
             @test length(read_parquet(f).a) == 0
             @test_throws Exception write_parquet(f, tbl; compression = :brotli)
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "Date and DateTime round-trip" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        tbl = (
+            d  = [Date(2024, 2, 29), missing, Date(1969, 12, 31)],
+            ts = [DateTime(2024, 2, 29, 13, 14, 15, 123), DateTime(1969, 12, 31, 23, 59, 59, 999), missing],
+            ld = [[Date(2020, 1, 1), missing], Date[], [Date(1970, 1, 1)]],
+            lt = [[DateTime(2020, 1, 1, 12)], missing, DateTime[]],
+            s  = Union{Missing, @NamedTuple{when::DateTime, day::Union{Missing, Date}}}[
+                     (when = DateTime(2000, 1, 1, 0, 0, 0, 1), day = Date(2000, 1, 1)), missing,
+                     (when = DateTime(1970, 1, 1), day = missing)],
+        )
+        f = wfile("test_dates_w.parquet")
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            for k in keys(tbl)
+                @test isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k]))
+            end
+            @test nonmissingtype(eltype(t.d)) == Date && nonmissingtype(eltype(t.ts)) == DateTime
+
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(' | '.join(str(t.schema.field(n).type) for n in t.column_names))
+print(t.column('d').to_pylist())
+print([None if v is None else v.isoformat() for v in t.column('ts').to_pylist()])
+print(t.column('ld').to_pylist(), t.column('s').to_pylist()[1])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                # Converted type TIMESTAMP_MILLIS means UTC-adjusted, so pyarrow shows tz=UTC
+                @test lines[1] == "date32[day] | timestamp[ms, tz=UTC] | list<element: date32[day]> | " *
+                                  "list<element: timestamp[ms, tz=UTC]> | struct<when: timestamp[ms, tz=UTC], day: date32[day]>"
+                @test lines[2] == "[datetime.date(2024, 2, 29), None, datetime.date(1969, 12, 31)]"
+                @test lines[3] == "['2024-02-29T13:14:15.123000+00:00', '1969-12-31T23:59:59.999000+00:00', None]"
+                @test lines[4] == "[[datetime.date(2020, 1, 1), None], [], [datetime.date(1970, 1, 1)]] None"
+            else
+                @warn "Skipping pyarrow cross-check of dates: uv/pyarrow not available"
+            end
         finally
             rm(f, force=true)
         end

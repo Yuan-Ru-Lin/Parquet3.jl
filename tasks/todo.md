@@ -27,8 +27,9 @@ Nested writing is driven by element type, so reader outputs round-trip:
       pyarrow confirms equal values and, except FSL, equal types)
 - [x] Int8/Int16 and UInt8/16/32/64 writing (DONE, awaiting review): INT32/INT64 plus
       converted type; pyarrow restores the exact types.
-- [ ] Still rejected by the writer though the reader returns them: Date/DateTime
-      (deferred to v0.3).
+- [x] Date/DateTime writing (DONE, awaiting review; pulled into v0.2.0 on 2026-10-03 at the
+      planning session's request): INT32 + DATE, INT64 + TIMESTAMP_MILLIS; converted type
+      only, `logicalType` still deferred to v0.3.
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
 
 - [x] N1.5 (DONE, awaiting review: `_arrow_schema_kv`; our reader and pyarrow both restore
@@ -57,7 +58,7 @@ Nested writing is driven by element type, so reader outputs round-trip:
 Deferred (edge case, decided 2026-10-03): infer struct member types from rows when the
 `NamedTuple` eltype is not concrete (`[(a = missing,), (a = 2,)]`); currently a clear error.
 
-## Deferred to v0.3 — multi-RG, Date/DateTime, min/max stats
+## Deferred to v0.3 — multi-RG, min/max stats, `logicalType` writing
 
 ## Arrow.write of nested columns (do with writer work)
 - [ ] `Arrow.write` does not see `NestedColumn` (StructColumn / ListOfStructsColumn) as an

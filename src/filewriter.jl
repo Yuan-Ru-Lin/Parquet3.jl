@@ -19,13 +19,17 @@ function writer_parquet_type(::Type{T}) where T
     T === UInt16  && return (INT32, CT_UINT_16)
     T === UInt32  && return (INT32, CT_UINT_32)
     T === UInt64  && return (INT64, CT_UINT_64)
+    # Days / milliseconds since the Unix epoch
+    T === Date     && return (INT32, CT_DATE)
+    T === DateTime && return (INT64, CT_TIMESTAMP_MILLIS)
     T === Float32 && return (FLOAT, nothing)
     T === Float64 && return (DOUBLE, nothing)
     T === Bool    && return (BOOLEAN, nothing)
     T <: AbstractString && return (BYTE_ARRAY, CT_UTF8)
     T === Vector{UInt8} && return (BYTE_ARRAY, nothing)
     error("write_parquet: unsupported column eltype $T " *
-          "(supported: signed and unsigned integers up to 64 bits, Float32, Float64, Bool, String, Vector{UInt8}, " *
+          "(supported: signed and unsigned integers up to 64 bits, Float32, Float64, Bool, String, " *
+          "Date, DateTime, Vector{UInt8}, " *
           "vectors or NamedTuples of those, and Missing unions)")
 end
 
@@ -132,7 +136,8 @@ end
     write_parquet(path::String, tbl; compression=:snappy) -> path
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
-Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Vector{UInt8}; vectors (written as
+Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Date, DateTime,
+Vector{UInt8}; vectors (written as
 LIST) and NamedTuples (written as a struct group) of supported types, nested to any
 depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
 with PLAIN encoding in a single row group.

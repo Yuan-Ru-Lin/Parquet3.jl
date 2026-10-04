@@ -115,9 +115,11 @@ session and table shape.
 
 Narrow and unsigned integers are stored in INT32/INT64 with a converted-type annotation;
 `encode_plain` converts with `% Int32` / `% Int64`, the inverse of the reader's `% T`.
+`Date` is written as INT32 days and `DateTime` as INT64 milliseconds since the Unix epoch,
+with converted types DATE and TIMESTAMP_MILLIS (no `logicalType`; that is deferred to v0.3).
 
 Current writer scope: flat, list, and struct columns nested to any depth (Int8–Int64, UInt8–UInt64,
-Float32/Float64, Bool, String, bytes + Missing unions), PLAIN, one row group. Each v1 data page
+Float32/Float64, Bool, String, Date, DateTime, bytes + Missing unions), PLAIN, one row group. Each v1 data page
 body (levels + values) is compressed as a whole by `compress`, the inverse of `decompress`
 in `src/compression.jl`; Snappy is the default, as in pyarrow, whose codec names we follow
 (`:lz4` means LZ4_RAW; the deprecated Hadoop-framed LZ4 is not written). Next steps are
@@ -125,6 +127,7 @@ in `tasks/todo.md`.
 
 ## Known Limitations
 
+- A written `DateTime` column is shown by pyarrow as `timestamp[ms, tz=UTC]`, not as a naive timestamp: the converted type TIMESTAMP_MILLIS means UTC-adjusted, and we do not write a `logicalType` that could say otherwise. The instants are unchanged. This holds with or without the `ARROW:schema` entry (checked 2026-10-03 with a FixedSizeList column present).
 - `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
 - Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
 - `logicalType` annotations are not parsed, only `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both).

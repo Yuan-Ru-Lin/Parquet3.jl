@@ -407,6 +407,10 @@ encode_plain(values::Vector{T}) where {T <: Union{Int8, Int16, UInt8, UInt16, UI
     encode_plain(values .% Int32)
 encode_plain(values::Vector{UInt64}) = encode_plain(values .% Int64)
 
+"""PLAIN-encode dates as INT32 days and datetimes as INT64 milliseconds since the Unix epoch."""
+encode_plain(values::Vector{Date}) = encode_plain(Int32[Dates.value(v - Date(1970, 1, 1)) for v in values])
+encode_plain(values::Vector{DateTime}) = encode_plain(Int64[Dates.value(v - DateTime(1970, 1, 1)) for v in values])
+
 """PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
 function encode_plain(values::Vector{Bool})
     bytes = zeros(UInt8, cld(length(values), 8))
