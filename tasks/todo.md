@@ -92,6 +92,20 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
       BYTE_STREAM_SPLIT beyond float/double. Not investigated: deprecated LZ4 codec (three
       files; left alone by decision). Limit: >2 GB of strings in one chunk.
 
+## Repository hygiene and CI (2026-10-04, via the planning session; the history rewrite confirmed by the user directly)
+- [x] `papers/36632.pdf` removed from the unpushed history of main, writer-w1 and
+      recursive-reader (git filter-branch on that one path; trees otherwise identical;
+      origin/main untouched). `papers/` is gitignored; the local copy stays on disk; the
+      Dremel paper is linked from dev-note.md. Backup bundle of the old refs:
+      `~/Parquet3.jl-backup-before-pdf-removal-2026-10-04.bundle` (delete once satisfied).
+      Hashes cited in this file were updated; hashes quoted in older commit messages are stale.
+- [x] CI: `.github/workflows/CI.yml` (Julia 1.10 and latest, ubuntu, 4 threads, submodules,
+      uv) and `CompatHelper.yml`. Python environment moved into the repo (`test/pyhelper`,
+      pyarrow 23.0.0 pinned and locked). `PARQUET3_TEST_STRICT=1` turns a missing uv/pyarrow
+      or submodule into a failure. Acceptance: a fresh `git clone --recurse-submodules`,
+      strict, 4 threads, passes on Julia 1.10.11 and 1.13.0 with nothing skipped (macOS;
+      the workflows themselves have not run, since nothing is pushed).
+
 ## Writer encodings (v0.2.0, decided 2026-10-04 via the planning session)
 Goal: write every value encoding the reader decodes. One step at a time, each reported for approval.
 - [x] E1 — BYTE_STREAM_SPLIT for Float32/Float64, the `encoding` keyword (one name for the
