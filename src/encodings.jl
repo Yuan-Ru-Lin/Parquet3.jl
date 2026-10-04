@@ -4,32 +4,21 @@
 # Plain Encoding
 =============================================================================#
 
+# Fixed-width physical types, whose PLAIN encoding is their little-endian bytes
+const PLAIN_FIXED_TYPES = Dict(INT32 => Int32, INT64 => Int64, INT96 => Int96, FLOAT => Float32, DOUBLE => Float64)
+
 """
     decode_plain(type, data, count, type_length) -> Vector
 
-Decode plain-encoded values. Uses if-else instead of Val dispatch
-since ParquetType is a runtime value.
+Decode plain-encoded values. `ptype` is a runtime value, so this branches instead of
+dispatching; fixed-width types are a reinterpreted view of the page bytes.
 """
 function decode_plain(ptype::ParquetType, data::AbstractVector{UInt8}, count::Int, type_length::Int=0)
-    if ptype == BOOLEAN
-        return decode_plain_boolean(data, count)
-    elseif ptype == INT32
-        return decode_plain_int32(data, count)
-    elseif ptype == INT64
-        return decode_plain_int64(data, count)
-    elseif ptype == INT96
-        return decode_plain_int96(data, count)
-    elseif ptype == FLOAT
-        return decode_plain_float32(data, count)
-    elseif ptype == DOUBLE
-        return decode_plain_float64(data, count)
-    elseif ptype == BYTE_ARRAY
-        return decode_plain_byte_array(data, count)
-    elseif ptype == FIXED_LEN_BYTE_ARRAY
-        return decode_plain_fixed_byte_array(data, count, type_length)
-    else
-        error("Unknown Parquet type: $ptype")
-    end
+    ptype == BOOLEAN && return decode_plain_boolean(data, count)
+    ptype == BYTE_ARRAY && return decode_plain_byte_array(data, count)
+    ptype == FIXED_LEN_BYTE_ARRAY && return decode_plain_fixed_byte_array(data, count, type_length)
+    T = get(() -> error("Unknown Parquet type: $ptype"), PLAIN_FIXED_TYPES, ptype)
+    reinterpret(T, @view data[1:sizeof(T) * count])
 end
 
 function decode_plain_boolean(data::AbstractVector{UInt8}, count::Int)
@@ -50,21 +39,6 @@ function decode_rle_boolean(data::AbstractVector{UInt8}, count::Int)
     len = Int(ltoh(reinterpret(UInt32, data[1:4])[1]))
     BitVector(decode_rle_bitpacked(@view(data[5:4+len]), count, 1) .!= 0)
 end
-
-decode_plain_int32(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Int32, @view data[1:4count])
-
-decode_plain_int64(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Int64, @view data[1:8count])
-
-decode_plain_int96(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Int96, @view data[1:12count])
-
-decode_plain_float32(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Float32, @view data[1:4count])
-
-decode_plain_float64(data::AbstractVector{UInt8}, count::Int) =
-    reinterpret(Float64, @view data[1:8count])
 
 function decode_plain_byte_array(data::AbstractVector{UInt8}, count::Int)
     # Pass 1: compute element boundaries
@@ -92,6 +66,9 @@ end
 
 decode_plain_fixed_byte_array(data::AbstractVector{UInt8}, count::Int, type_length::Int) =
     nestedview(reshape(@view(data[1:type_length*count]), type_length, count))
+
+"""Bits needed to store a repetition or definition level up to `max_level`."""
+level_bit_width(max_level::Integer) = ndigits(max_level, base = 2)
 
 #=============================================================================
 # Bit Unpacking
@@ -173,16 +150,8 @@ function decode_rle_bitpacked(data::AbstractVector{UInt8}, count::Int, bit_width
     data_length = length(data)
 
     while output_index < count && pos <= data_length
-        # Read varint header
-        header = UInt32(0)
-        shift = 0
-        while pos <= data_length
-            byte = data[pos]
-            pos += 1
-            header |= UInt32(byte & 0x7f) << shift
-            (byte & 0x80) == 0 && break
-            shift += 7
-        end
+        header, pos = _read_varint(data, pos)
+        header = Int(header)
 
         is_bitpacked = (header & 1) == 1
 
@@ -448,41 +417,20 @@ end
 =============================================================================#
 
 """
-    decode_byte_stream_split_float32(data, count) -> Vector{Float32}
+    decode_byte_stream_split(T, data, count) -> AbstractVector{T}
 
-Decode byte stream split encoding for Float32. Bytes are interleaved:
-all first bytes, then all second bytes, etc.
+Decode byte stream split encoding: byte 1 of every value, then byte 2 of every value, and
+so on. Read as a `count`×K matrix whose columns are those streams, the values' bytes are
+its rows. Inverse of `encode_byte_stream_split`.
 """
-function decode_byte_stream_split_float32(data::AbstractVector{UInt8}, count::Int)
-    reconstructed = Vector{UInt8}(undef, count * 4)
-    for i in 1:count
-        for j in 1:4
-            reconstructed[(i-1)*4 + j] = data[(j-1)*count + i]
-        end
-    end
-    reinterpret(Float32, reconstructed)
-end
-
-"""
-    decode_byte_stream_split_float64(data, count) -> Vector{Float64}
-
-Decode byte stream split encoding for Float64.
-"""
-function decode_byte_stream_split_float64(data::AbstractVector{UInt8}, count::Int)
-    reconstructed = Vector{UInt8}(undef, count * 8)
-    for i in 1:count
-        for j in 1:8
-            reconstructed[(i-1)*8 + j] = data[(j-1)*count + i]
-        end
-    end
-    reinterpret(Float64, reconstructed)
-end
+decode_byte_stream_split(::Type{T}, data::AbstractVector{UInt8}, count::Int) where {T <: Union{Float32, Float64}} =
+    reinterpret(T, vec(permutedims(reshape(@view(data[1:sizeof(T) * count]), count, sizeof(T)))))
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Encoders (write side) — mirrors of the decoders above
 # ═══════════════════════════════════════════════════════════════════════════
 
-"""PLAIN-encode fixed-width values (inverse of decode_plain_int32/int64/float32/float64)."""
+"""PLAIN-encode fixed-width values (inverse of decode_plain for these types)."""
 encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
     collect(reinterpret(UInt8, values))
 
@@ -503,21 +451,22 @@ encode_plain(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32, UInt64, 
     encode_plain(physical_ints(values))
 
 """
-BYTE_STREAM_SPLIT-encode floats (inverse of decode_byte_stream_split_float32/float64):
+BYTE_STREAM_SPLIT-encode floats (inverse of decode_byte_stream_split):
 byte 1 of every value, then byte 2 of every value, and so on. With the values' bytes as
 the columns of a K×n matrix, that is its rows laid end to end.
 """
 encode_byte_stream_split(values::Vector{T}) where {T <: Union{Float32, Float64}} =
     vec(permutedims(reshape(reinterpret(UInt8, values), sizeof(T), :)))
 
+"""
+The bytes of a bit vector, LSB-first: bit `i` is bit `(i-1) & 7` of byte `(i-1) >> 3`. This
+is how a `BitVector` stores its chunks, and how Parquet (PLAIN booleans) and Arrow (boolean
+arrays) pack booleans.
+"""
+packed_bits(bits::BitVector) = reinterpret(UInt8, bits.chunks)[1:cld(length(bits), 8)]
+
 """PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
-function encode_plain(values::Vector{Bool})
-    bytes = zeros(UInt8, cld(length(values), 8))
-    for (i, v) in enumerate(values)
-        v && (bytes[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7))
-    end
-    bytes
-end
+encode_plain(values::Vector{Bool}) = packed_bits(BitVector(values))
 
 """PLAIN-encode strings/byte arrays as 4-byte LE length + payload (inverse of decode_plain_byte_array)."""
 function encode_plain(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})

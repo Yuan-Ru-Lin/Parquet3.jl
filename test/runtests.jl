@@ -8,10 +8,10 @@ using Dates
 
     @testset "Plain Encoding" begin
         data = collect(reinterpret(UInt8, Int32[1, 2, 3, 4, 5]))
-        @test collect(Parquet3.decode_plain_int32(data, 5)) == Int32[1, 2, 3, 4, 5]
+        @test collect(Parquet3.decode_plain(Parquet3.INT32, data, 5)) == Int32[1, 2, 3, 4, 5]
 
         data = collect(reinterpret(UInt8, Float64[1.5, 2.5, 3.5]))
-        @test collect(Parquet3.decode_plain_float64(data, 3)) == Float64[1.5, 2.5, 3.5]
+        @test collect(Parquet3.decode_plain(Parquet3.DOUBLE, data, 3)) == Float64[1.5, 2.5, 3.5]
     end
 
     @testset "RLE Decoding" begin
@@ -1332,8 +1332,7 @@ print(t.column('us_utc').cast('int64').to_pylist(), t.column('ns').cast('int64')
         # encoder is the inverse of the decoder
         for T in (Float32, Float64), vals in (T[1.5, -2.25, NaN, Inf, 0.0, floatmin(T)], T[], T[3.0])
             enc = Parquet3.encode_byte_stream_split(vals)
-            dec = T == Float32 ? Parquet3.decode_byte_stream_split_float32(enc, length(vals)) :
-                                 Parquet3.decode_byte_stream_split_float64(enc, length(vals))
+            dec = Parquet3.decode_byte_stream_split(T, enc, length(vals))
             @test length(enc) == sizeof(T) * length(vals) && isequal(collect(dec), vals)
         end
 
@@ -1743,7 +1742,7 @@ const HAS_PARQUET_TESTING = isdir(PARQUET_TESTING_DIR)
 # file => columns that cannot be read yet (see Known Limitations in dev-note.md).
 # read_parquet throws for these; every other column, and every other file, must read.
 const PARQUET_TESTING_KNOWN_GAPS = Dict(
-    "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split",
+    "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split", "int64_byte_stream_split",
                                                   "flba5_byte_stream_split", "decimal_byte_stream_split"],
     "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
                                    "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],

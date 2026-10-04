@@ -353,7 +353,7 @@ function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
     body = IOBuffer()
     for (levels, max_level) in ((leaf.rep, leaf.max_rep), (leaf.def, leaf.max_def))
         max_level == 0 && continue
-        rle = encode_rle_bitpacked(levels, ndigits(max_level, base = 2))
+        rle = encode_rle_bitpacked(levels, level_bit_width(max_level))
         write(body, htol(UInt32(length(rle))))
         write(body, rle)
     end

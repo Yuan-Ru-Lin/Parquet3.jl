@@ -326,12 +326,8 @@ function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector
         ET = has_nulls ? Union{Missing,BT} : BT
         return Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, n, meta)
     elseif ptype == BOOLEAN
-        bytes = zeros(UInt8, cld(n, 8))
-        for i in 1:n
-            if !leaf_nulls[i] && leaf_values[i]
-                bytes[((i-1) >> 3) + 1] |= UInt8(1) << ((i-1) & 7)
-            end
-        end
+        # Null slots hold no value (their bytes may be anything), so they are masked out
+        bytes = packed_bits(BitVector(leaf_values) .& .!leaf_nulls)
         ET = has_nulls ? Union{Missing,Bool} : Bool
         return Arrow.BoolVector{ET}(bytes, 1, v, Int64(n), meta)
     else

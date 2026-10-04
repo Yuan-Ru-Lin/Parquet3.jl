@@ -46,7 +46,7 @@ end
 function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, encoding::Encoding)
     max_level == 0 && return (zeros(Int, count), 0)
 
-    bit_width = max(1, ceil(Int, log2(max_level + 1)))
+    bit_width = level_bit_width(max_level)
 
     if encoding == RLE
         len = ltoh(reinterpret(UInt32, @view data[1:4])[1])
@@ -72,8 +72,9 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
         decode_delta_length_byte_array(data, count)
     elseif encoding == BYTE_STREAM_SPLIT
-        ptype == FLOAT ? decode_byte_stream_split_float32(data, count) :
-                         decode_byte_stream_split_float64(data, count)
+        ptype == FLOAT ? decode_byte_stream_split(Float32, data, count) :
+        ptype == DOUBLE ? decode_byte_stream_split(Float64, data, count) :
+        error("BYTE_STREAM_SPLIT is decoded for FLOAT and DOUBLE only, not $ptype")
     elseif encoding == RLE && ptype == BOOLEAN
         decode_rle_boolean(data, count)
     else
@@ -154,13 +155,11 @@ function read_page(reader::ColumnReader)
         # column has such levels: some writers store repetition levels for a column that is
         # not repeated. Always skip them, so the data section starts in the right place.
         if max_rep > 0 && dh.repetition_levels_byte_length > 0
-            bw = max(1, ceil(Int, log2(max_rep + 1)))
-            rep_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.repetition_levels_byte_length-1]), nv, bw))
+            rep_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.repetition_levels_byte_length-1]), nv, level_bit_width(max_rep)))
         end
         pos += dh.repetition_levels_byte_length
         if max_def > 0 && dh.definition_levels_byte_length > 0
-            bw = max(1, ceil(Int, log2(max_def + 1)))
-            def_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.definition_levels_byte_length-1]), nv, bw))
+            def_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.definition_levels_byte_length-1]), nv, level_bit_width(max_def)))
         end
         pos += dh.definition_levels_byte_length
 
