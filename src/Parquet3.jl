@@ -3,6 +3,7 @@ module Parquet3
 using Mmap
 using Dates
 using Arrow
+using ArrowTypes: ArrowTypes
 using SentinelArrays: ChainedVector
 using ArraysOfArrays: nestedview, VectorOfVectors
 using BitIntegers: @define_integers

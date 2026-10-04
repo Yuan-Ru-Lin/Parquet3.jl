@@ -6,6 +6,7 @@ authors = ["Yuan-Ru Lin <yuanruleonlin@gmail.com>"]
 [deps]
 ArraysOfArrays = "65a8f2f4-9b39-5baf-92e2-a9cc46fdf018"
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
+ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 Base64 = "2a0f44e3-6c83-55bd-87e4-b1978d98bd5f"
 BitIntegers = "c3b6d118-76ef-56ca-8cc7-ebb389d030a1"
 ChunkCodecLibBrotli = "653b0ff7-85b5-4442-93c1-dcc330d3ec7d"
@@ -22,7 +23,8 @@ Thrift = "8d9c9c80-f77e-5080-9541-c6f69d204e22"
 [compat]
 ArraysOfArrays = "0.6.6"
 Arrow = "2.8.1"
-Base64 = "1.11.0"
+ArrowTypes = "2.3.0"
+Base64 = "<0.0.1, 1"
 BitIntegers = "0.3.7"
 ChunkCodecLibBrotli = "1.0.0"
 ChunkCodecLibLz4 = "1.0.0"
@@ -32,11 +34,10 @@ ChunkCodecLibZstd = "1.0.0"
 SentinelArrays = "1.4.9"
 Tables = "1.13.0"
 Thrift = "0.8.5"
-julia = "1.6"
+julia = "1.10"
 
 [extras]
-Tables = "bd369af6-aec1-5ad0-b16a-f7cc5008161c"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test", "Tables"]
+test = ["Test"]
