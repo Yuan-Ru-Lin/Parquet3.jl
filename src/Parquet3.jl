@@ -6,9 +6,12 @@ using Arrow
 using SentinelArrays: ChainedVector
 using ArraysOfArrays: nestedview, VectorOfVectors
 using BitIntegers: @define_integers
+using Tables
 using Thrift: TCompactProtocol, TMemoryTransport, TType,
     readStructBegin, readStructEnd, readFieldBegin, readFieldEnd,
-    readListBegin, readListEnd, skip
+    readListBegin, readListEnd, skip,
+    writeStructBegin, writeStructEnd, writeFieldBegin, writeFieldEnd,
+    writeFieldStop, writeListBegin, writeListEnd
 
 @define_integers 96
 
@@ -19,10 +22,12 @@ include("compression.jl")
 include("filereader.jl")
 include("pagereader.jl")
 include("arrow_schema.jl")
+include("filewriter.jl")
 include("api.jl")
 
 export
     read_parquet,
+    write_parquet,
     open_parquet,
     num_rows,
     num_row_groups,

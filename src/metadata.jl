@@ -131,6 +131,102 @@ const PAGE_HEADER_FIELDS = [
     (8, :data_page_header_v2,     p -> read_thrift(p, DataPageHeaderV2, DATA_PAGE_HEADER_V2_FIELDS)),
 ]
 
+# ── Thrift writing (mirror of the table-driven reader) ───────────────────
+
+"""Generic Thrift struct writer driven by a field table.
+Each entry is `(field_id, ttype, getter, writer)`; fields whose getter returns
+`nothing` are omitted (Thrift optional-field semantics)."""
+function write_thrift(p, obj, fields)
+    writeStructBegin(p, "")
+    for (fid, ttype, getter, writer) in fields
+        val = getter(obj)
+        val === nothing && continue
+        writeFieldBegin(p, "", ttype, fid)
+        writer(p, val)
+        writeFieldEnd(p)
+    end
+    writeFieldStop(p)
+    writeStructEnd(p)
+end
+
+"""Write a Thrift list of `items`, calling `writer` for each element."""
+function write_list(p, etype::Int32, items, writer)
+    writeListBegin(p, etype, length(items))
+    for item in items
+        writer(p, item)
+    end
+    writeListEnd(p)
+end
+
+"""Serialize `obj` to compact-protocol bytes using its write field table."""
+function serialize_thrift(obj, fields)
+    t = TMemoryTransport()
+    write_thrift(TCompactProtocol(t), obj, fields)
+    take!(t.buff)
+end
+
+_w_enum(p, v) = write(p, Int32(v))
+
+# Write tables cover only the fields the writer emits (readers of our files
+# treat missing optional fields per Thrift semantics).
+
+const SCHEMA_ELEMENT_W = [
+    (1, TType.I32,    o -> o.type,            _w_enum),
+    (3, TType.I32,    o -> o.repetition_type, _w_enum),
+    (4, TType.STRING, o -> o.name,            (p, v) -> write(p, v)),
+    (5, TType.I32,    o -> o.num_children,    (p, v) -> write(p, Int32(v))),
+    (6, TType.I32,    o -> o.converted_type,  _w_enum),
+]
+
+const STATISTICS_W = [
+    (3, TType.I64, o -> o.null_count, (p, v) -> write(p, Int64(v))),
+]
+
+const COLUMN_METADATA_W = [
+    (1,  TType.I32,    o -> o.type,                    _w_enum),
+    (2,  TType.LIST,   o -> o.encodings,               (p, v) -> write_list(p, TType.I32, v, _w_enum)),
+    (3,  TType.LIST,   o -> o.path_in_schema,          (p, v) -> write_list(p, TType.STRING, v, (q, s) -> write(q, s))),
+    (4,  TType.I32,    o -> o.codec,                   _w_enum),
+    (5,  TType.I64,    o -> o.num_values,              (p, v) -> write(p, Int64(v))),
+    (6,  TType.I64,    o -> o.total_uncompressed_size, (p, v) -> write(p, Int64(v))),
+    (7,  TType.I64,    o -> o.total_compressed_size,   (p, v) -> write(p, Int64(v))),
+    (9,  TType.I64,    o -> o.data_page_offset,        (p, v) -> write(p, Int64(v))),
+    (12, TType.STRUCT, o -> o.statistics,              (p, v) -> write_thrift(p, v, STATISTICS_W)),
+]
+
+const COLUMN_CHUNK_W = [
+    (2, TType.I64,    o -> o.file_offset, (p, v) -> write(p, Int64(v))),
+    (3, TType.STRUCT, o -> o.meta_data,   (p, v) -> write_thrift(p, v, COLUMN_METADATA_W)),
+]
+
+const ROW_GROUP_W = [
+    (1, TType.LIST, o -> o.columns,         (p, v) -> write_list(p, TType.STRUCT, v, (q, c) -> write_thrift(q, c, COLUMN_CHUNK_W))),
+    (2, TType.I64,  o -> o.total_byte_size, (p, v) -> write(p, Int64(v))),
+    (3, TType.I64,  o -> o.num_rows,        (p, v) -> write(p, Int64(v))),
+]
+
+const FILE_METADATA_W = [
+    (1, TType.I32,    o -> o.version,    (p, v) -> write(p, Int32(v))),
+    (2, TType.LIST,   o -> o.schema,     (p, v) -> write_list(p, TType.STRUCT, v, (q, s) -> write_thrift(q, s, SCHEMA_ELEMENT_W))),
+    (3, TType.I64,    o -> o.num_rows,   (p, v) -> write(p, Int64(v))),
+    (4, TType.LIST,   o -> o.row_groups, (p, v) -> write_list(p, TType.STRUCT, v, (q, r) -> write_thrift(q, r, ROW_GROUP_W))),
+    (6, TType.STRING, o -> o.created_by, (p, v) -> write(p, v)),
+]
+
+const DATA_PAGE_HEADER_W = [
+    (1, TType.I32, o -> o.num_values,                (p, v) -> write(p, Int32(v))),
+    (2, TType.I32, o -> o.encoding,                  _w_enum),
+    (3, TType.I32, o -> o.definition_level_encoding, _w_enum),
+    (4, TType.I32, o -> o.repetition_level_encoding, _w_enum),
+]
+
+const PAGE_HEADER_W = [
+    (1, TType.I32,    o -> o.type,                   _w_enum),
+    (2, TType.I32,    o -> o.uncompressed_page_size, (p, v) -> write(p, Int32(v))),
+    (3, TType.I32,    o -> o.compressed_page_size,   (p, v) -> write(p, Int32(v))),
+    (5, TType.STRUCT, o -> o.data_page_header,       (p, v) -> write_thrift(p, v, DATA_PAGE_HEADER_W)),
+]
+
 # ── Public API (matches old signatures) ──────────────────────────────────
 
 parse_file_metadata(data::Vector{UInt8}) =

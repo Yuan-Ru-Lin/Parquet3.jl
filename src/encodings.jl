@@ -393,3 +393,65 @@ function decode_byte_stream_split_float64(data::AbstractVector{UInt8}, count::In
     end
     reinterpret(Float64, reconstructed)
 end
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Encoders (write side) — mirrors of the decoders above
+# ═══════════════════════════════════════════════════════════════════════════
+
+"""PLAIN-encode fixed-width values (inverse of decode_plain_int32/int64/float32/float64)."""
+encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
+    collect(reinterpret(UInt8, values))
+
+"""PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
+function encode_plain(values::Vector{Bool})
+    bytes = zeros(UInt8, cld(length(values), 8))
+    for (i, v) in enumerate(values)
+        v && (bytes[((i - 1) >> 3) + 1] |= UInt8(1) << ((i - 1) & 7))
+    end
+    bytes
+end
+
+"""PLAIN-encode strings/byte arrays as 4-byte LE length + payload (inverse of decode_plain_byte_array)."""
+function encode_plain(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})
+    out = IOBuffer()
+    for v in values
+        bytes = v isa AbstractString ? codeunits(v) : v
+        write(out, htol(UInt32(length(bytes))))
+        write(out, bytes)
+    end
+    take!(out)
+end
+
+"""LEB128 varint (inverse of _read_varint)."""
+function _write_varint(io::IO, v::Unsigned)
+    while true
+        b = UInt8(v & 0x7f)
+        v >>= 7
+        v == 0 && return write(io, b)
+        write(io, b | 0x80)
+    end
+end
+
+"""
+RLE/bit-packed hybrid encoding of levels (inverse of decode_rle_bitpacked).
+Uses RLE runs only — header `run_length << 1` (even) followed by the run value
+in `cld(bit_width, 8)` bytes — which is always a valid form of the hybrid.
+"""
+function encode_rle_bitpacked(levels::AbstractVector{<:Integer}, bit_width::Int)
+    out = IOBuffer()
+    value_bytes = cld(bit_width, 8)
+    i = 1
+    while i <= length(levels)
+        v = levels[i]
+        j = i
+        while j < length(levels) && levels[j + 1] == v
+            j += 1
+        end
+        _write_varint(out, UInt64(j - i + 1) << 1)
+        for b in 0:value_bytes-1
+            write(out, UInt8((v >> (8b)) & 0xff))
+        end
+        i = j + 1
+    end
+    take!(out)
+end

@@ -74,9 +74,23 @@ slot in the child array that is never read.
 A column chunk with no pages (zero-row file or row group) is given one empty page of the
 leaf's physical type (`_empty_pages`), so every column kind assembles to a typed empty column.
 
+## Writer Design
+
+Writing mirrors the table-driven Thrift reading: `write_thrift` in `src/metadata.jl`
+inverts `read_thrift` using Thrift.jl's exported compact-protocol writers, driven by
+write field tables that emit only the fields we produce. Encoders in `src/encodings.jl`
+are inverses of the decoders beside them (`encode_plain`, `encode_rle_bitpacked` —
+RLE-runs-only, always a valid form of the hybrid encoding). `src/filewriter.jl`
+assembles pages (length-prefixed RLE def levels + PLAIN values), column chunks, and
+the footer. All columns are written OPTIONAL with null-count statistics so the
+reader's statistics-based eltype derivation works on our own files.
+
+Current writer scope: flat columns (Int32/Int64/Float32/Float64/Bool/String/bytes +
+Missing unions), PLAIN, uncompressed, one row group. Planned: compression and
+multi-RG (W2), lists (W3), structs/list<struct> (W4).
+
 ## Known Limitations
 
-- Read-only. No write support.
 - Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
 - `logicalType` annotations are not parsed, only `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both).
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.

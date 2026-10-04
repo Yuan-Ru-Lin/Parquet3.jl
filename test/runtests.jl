@@ -713,6 +713,109 @@ write_kwargs = {'row_group_size': 10}""") do tbl
     end
 end
 
+@testset "Writer (W1)" begin
+    wfile(name) = joinpath(@__DIR__, name)
+
+    @testset "flat round-trip, all supported types" begin
+        tbl = (
+            i32  = Int32[1, -2, 3, typemax(Int32)],
+            i64  = [10, -20, 30, typemin(Int64)],
+            f32  = Float32[1.5, -2.5, Inf32, 0.0],
+            f64  = [0.1, -0.2, NaN, 4.0e100],
+            flag = [true, false, true, false],
+            str  = ["alice", "", "déjà vu", "z"],
+            byt  = [UInt8[1, 2], UInt8[], UInt8[0xff], UInt8[0x00]],
+            oi   = [1, missing, 3, missing],
+            os   = [missing, "x", missing, "z"],
+            ob   = [true, missing, missing, false],
+        )
+        f = wfile("test_w1_roundtrip.parquet")
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            @test collect(Tables.columnnames(t)) == collect(keys(tbl))
+            for k in keys(tbl)
+                @test isequal(collect(Tables.getcolumn(t, k)), collect(tbl[k]))
+            end
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "edge cases" begin
+        f = wfile("test_w1_edge.parquet")
+        try
+            # 0 rows
+            write_parquet(f, (a = Int32[], b = String[]))
+            t = read_parquet(f)
+            @test length(t.a) == 0 && length(t.b) == 0
+
+            # all-missing typed column
+            write_parquet(f, (x = Union{Missing, Int64}[missing, missing, missing],))
+            t = read_parquet(f)
+            @test all(ismissing, t.x) && length(t.x) == 3
+
+            # errors
+            @test_throws Exception write_parquet(f, (bad = Union{Missing, Missing}[missing],))
+            @test_throws Exception write_parquet(f, (bad = [1im, 2im],))
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "footer is re-parseable metadata" begin
+        f = wfile("test_w1_meta.parquet")
+        try
+            write_parquet(f, (a = [1, 2, missing], b = ["x", "y", "z"]))
+            pf = open_parquet(f)
+            @test num_rows(pf) == 3
+            @test num_row_groups(pf) == 1
+            @test column_names(pf) == ["a", "b"]
+            # null_count statistics present (drives reader's eltype decisions)
+            st = pf.metadata.row_groups[1].columns[1].meta_data.statistics
+            @test st !== nothing && st.null_count == 1
+            close(pf)
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "pyarrow reads our files" begin
+        f = wfile("test_w1_pyarrow.parquet")
+        try
+            write_parquet(f, (a = Int32[1, 2, 3], b = ["x", "y", "z"], c = [1.5, missing, 3.5]))
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(t.column('a').to_pylist())
+print(t.column('b').to_pylist())
+print(t.column('c').to_pylist())""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "[1, 2, 3]"
+                @test lines[2] == "['x', 'y', 'z']"
+                @test lines[3] == "[1.5, None, 3.5]"
+            else
+                @warn "Skipping pyarrow cross-check of written file: uv/pyarrow not available"
+            end
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "RLE encoder round-trip (unit)" begin
+        for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
+            enc = Parquet3.encode_rle_bitpacked(levels, 1)
+            if !isempty(levels)
+                dec = Parquet3.decode_rle_bitpacked(enc, length(levels), 1)
+                @test Int.(dec) == levels
+            else
+                @test isempty(enc)
+            end
+        end
+    end
+end
+
 # =============================================================================
 # Apache parquet-testing suite
 # =============================================================================
