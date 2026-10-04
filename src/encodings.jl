@@ -402,6 +402,11 @@ end
 encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
     collect(reinterpret(UInt8, values))
 
+"""PLAIN-encode narrow/unsigned integers in their physical type, INT32 or INT64 (bit-preserving)."""
+encode_plain(values::Vector{T}) where {T <: Union{Int8, Int16, UInt8, UInt16, UInt32}} =
+    encode_plain(values .% Int32)
+encode_plain(values::Vector{UInt64}) = encode_plain(values .% Int64)
+
 """PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
 function encode_plain(values::Vector{Bool})
     bytes = zeros(UInt8, cld(length(values), 8))

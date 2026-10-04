@@ -1020,6 +1020,48 @@ print(b.schema.field('fsl').type, '|', b.schema.field('fslf').type)""")
         end
     end
 
+    @testset "Narrow and unsigned integers round-trip" begin
+        tbl = (
+            i8  = Int8[-128, 0, 127],
+            i16 = [typemin(Int16), missing, typemax(Int16)],
+            u8  = UInt8[0, 128, 255],
+            u16 = [missing, 0x0001, typemax(UInt16)],
+            u32 = UInt32[0, 2^31, typemax(UInt32)],
+            u64 = [typemax(UInt64), UInt64(2)^63, missing],
+            l   = [Int8[-1, 1], Int8[], Int8[127]],
+            s   = [(a = Int16(-7), b = 0xff), (a = Int16(7), b = 0x00), (a = Int16(0), b = 0x80)],
+        )
+        f = wfile("test_small_ints_w.parquet")
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            for k in (:i8, :i16, :u8, :u16, :u32, :u64, :s)
+                col = Tables.getcolumn(t, k)
+                @test isequal(collect(col), collect(tbl[k]))
+                @test nonmissingtype(eltype(col)) == nonmissingtype(eltype(tbl[k]))
+            end
+            # the empty list makes the element type nullable on read (null_count counts it)
+            @test collect.(t.l) == tbl.l && nonmissingtype(eltype(first(t.l))) == Int8
+
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(' '.join(str(t.schema.field(n).type) for n in ['i8', 'i16', 'u8', 'u16', 'u32', 'u64']))
+print(t.column('i8').to_pylist(), t.column('u32').to_pylist(), t.column('u64').to_pylist())
+print(t.schema.field('l').type, t.schema.field('s').type)""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "int8 int16 uint8 uint16 uint32 uint64"
+                @test lines[2] == "[-128, 0, 127] [0, 2147483648, 4294967295] [18446744073709551615, 9223372036854775808, None]"
+                @test lines[3] == "list<element: int8> struct<a: int16, b: uint8>"
+            else
+                @warn "Skipping pyarrow cross-check of narrow ints: uv/pyarrow not available"
+            end
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

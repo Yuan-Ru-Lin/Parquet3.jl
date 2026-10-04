@@ -108,8 +108,11 @@ keeps the first IPC message, which is the schema. The entry is written for every
 Cost: Arrow.jl compiles its schema code for each new set of column types, which adds
 first-call latency to `write_parquet`.
 
-Current writer scope: flat, list, and struct columns nested to any depth (Int32/Int64/Float32/Float64/
-Bool/String/bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are
+Narrow and unsigned integers are stored in INT32/INT64 with a converted-type annotation;
+`encode_plain` converts with `% Int32` / `% Int64`, the inverse of the reader's `% T`.
+
+Current writer scope: flat, list, and struct columns nested to any depth (Int8–Int64, UInt8–UInt64,
+Float32/Float64, Bool, String, bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are
 in `tasks/todo.md`.
 
 ## Known Limitations

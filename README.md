@@ -86,7 +86,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int32/Int64/Float32/Float64/Bool/String/`Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression and multiple row groups are not yet written. `FixedSizeListVector` columns keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression and multiple row groups are not yet written. `FixedSizeListVector` columns keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
 
 ### Encodings
 
