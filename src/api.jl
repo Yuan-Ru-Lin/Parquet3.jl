@@ -120,11 +120,14 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
     leaf_count = _leaf_counts(leaf_columns)
 
     if columns !== nothing
-        leaf_columns = filter(leaf_columns) do (path, node)
-            haskey(struct_nodes, path[1]) && return path[1] in columns
-            col_name = join(path, ".")
-            col_name in columns || path[1] in columns || path[end] in columns
-        end
+        # A struct is selected as a whole by its top-level name; other leaves by
+        # dotted path, top-level name, or leaf name.
+        selects(name, path) = haskey(struct_nodes, path[1]) ? name == path[1] :
+            name in (join(path, "."), path[1], path[end])
+        unmatched = filter(c -> !any(((path, _),) -> selects(c, path), leaf_columns), columns)
+        isempty(unmatched) ||
+            @warn "read_parquet: requested columns not found (struct members are selected via their struct, e.g. \"s\" then `tbl.s.a`)" unmatched
+        leaf_columns = filter(((path, _),) -> any(c -> selects(c, path), columns), leaf_columns)
     end
 
     # One spec per output column, in schema order: a (path, node) leaf pair, or the
@@ -223,7 +226,22 @@ function _read_pages_for_rg(data::Vector{UInt8}, rg::RowGroup, column_path::Vect
     idx === nothing && error("Column chunk not found: $(join(column_path, "."))")
     type_length = Int(something(node.element.type_length, 0))
     reader = ColumnReader(data, rg.columns[idx].meta_data, node, type_length)
-    read_all_pages(reader)
+    pages = read_all_pages(reader)
+    isempty(pages) ? _empty_pages(node) : pages
+end
+
+# Zero-row file with no row groups at all
+_read_pages_for_rg(::Vector{UInt8}, ::Nothing, ::Vector{String}, node::SchemaNode) = _empty_pages(node)
+
+"""
+One empty page of the leaf's physical type, standing in for a column chunk without
+pages (zero-row row group or file) so the usual assembly yields typed empty columns.
+"""
+function _empty_pages(node::SchemaNode)
+    type_length = Int(something(node.element.type_length, 0))
+    values = decode_plain(node.element.type, UInt8[], 0, type_length)
+    [DecodedPage(values, node.max_def_level > 0 ? Int[] : nothing,
+                 node.max_rep_level > 0 ? Int[] : nothing, 0)]
 end
 
 # ── Struct (group) column assembly ───────────────────────────────────────────
@@ -295,7 +313,7 @@ nesting level extracts its own validity from the same vector by comparing agains
 its own def level. `record_defs` is only materialized when this level needs it
 (`plan.own_def > 0`) or the caller asked for it (`want_defs`).
 """
-function _assemble_struct_chunk(data::Vector{UInt8}, rg::RowGroup, plan, meta; want_defs::Bool=false)
+function _assemble_struct_chunk(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, plan, meta; want_defs::Bool=false)
     need_defs = want_defs || plan.own_def > 0
     results = fetch.([Threads.@spawn _assemble_member(data, rg, m, need_defs && j == 1)
                       for (j, m) in enumerate(plan.members)])
@@ -313,7 +331,7 @@ function _assemble_struct_chunk(data::Vector{UInt8}, rg::RowGroup, plan, meta; w
 end
 
 """Assemble one struct member's child column; optionally also return its record-level def levels."""
-function _assemble_member(data::Vector{UInt8}, rg::RowGroup, m, want_defs::Bool)
+function _assemble_member(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, m, want_defs::Bool)
     m.kind == :struct && return _assemble_struct_chunk(data, rg, m.plan, nothing; want_defs)
     pages = _read_pages_for_rg(data, rg, m.path, m.leaf)
     elem = m.leaf.element
@@ -386,7 +404,7 @@ function _read_los_column(data::Vector{UInt8}, row_groups::Vector{RowGroup},
 end
 
 """Assemble one row group's member leaves into an Arrow.List{Arrow.Struct} chunk."""
-function _assemble_los_chunk(data::Vector{UInt8}, rg::RowGroup, plan)
+function _assemble_los_chunk(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, plan)
     # Decode all member column chunks in parallel
     fetched = fetch.([Threads.@spawn begin
                           pages = _read_pages_for_rg(data, rg, m.path, m.leaf)
@@ -501,10 +519,13 @@ function _validity(nulls::BitVector)
     Arrow.ValidityBitmap(bytes, 1, length(nulls), nc)
 end
 
-"""Assemble one chunk per row group in parallel; chain multiple chunks. Returns nothing if no row groups."""
+"""
+Assemble one chunk per row group in parallel; chain multiple chunks. With no row
+groups, assemble a single empty chunk (`rg === nothing`).
+"""
 function _read_column_chunks(assemble::Function, row_groups::Vector{RowGroup})
+    isempty(row_groups) && return assemble(nothing)
     chunks = fetch.([Threads.@spawn assemble(rg) for rg in row_groups])
-    isempty(chunks) && return nothing
     length(chunks) == 1 ? only(chunks) : ChainedVector(chunks)
 end
 

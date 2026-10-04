@@ -404,6 +404,40 @@ table = pa.table({
     end
 end
 
+@testset "Zero-row file" begin
+    _with_pyarrow_file("zero rows", "test_zero_rows.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+schema = pa.schema([
+    ('id', pa.int64()), ('name', pa.string()), ('flag', pa.bool_()), ('d', pa.date32()),
+    ('u', pa.uint16()), ('l', pa.list_(pa.int32())), ('ll', pa.list_(pa.list_(pa.float64()))),
+    ('s', pa.struct([('a', pa.int64()), ('v', pa.list_(pa.int64())), ('n', pa.struct([('x', pa.float32())]))])),
+    ('los', pa.list_(pa.struct([('pt', pa.float32()), ('q', pa.int8())]))),
+])
+table = schema.empty_table()""") do tbl
+        names = [:id, :name, :flag, :d, :u, :l, :ll, :s, :los]
+        @test collect(propertynames(tbl)) == names
+        @test all(n -> length(getproperty(tbl, n)) == 0, names)
+        @test nonmissingtype(eltype(tbl.id)) == Int64
+        @test nonmissingtype(eltype(tbl.name)) == String
+        @test nonmissingtype(eltype(tbl.flag)) == Bool
+        @test nonmissingtype(eltype(tbl.u)) == UInt16
+        @test tbl.s isa Parquet3.StructColumn && isempty(tbl.s.a) && isempty(tbl.s.n.x)
+        @test tbl.los isa Parquet3.ListOfStructsColumn && isempty(tbl.los.pt)
+    end
+end
+
+@testset "Unmatched column selection warns" begin
+    _with_pyarrow_file("column selection", "test_select.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+table = pa.table({'id': [1, 2], 's': pa.array([{'a': 1}, {'a': 2}], type=pa.struct([('a', pa.int64())]))})""") do _
+        path = joinpath(@__DIR__, "test_select.parquet")
+        @test collect(propertynames(read_parquet(path; columns=["s"]))) == [:s]
+        @test_logs min_level=Base.CoreLogging.Warn read_parquet(path; columns=["id", "s"])
+        tbl = @test_logs (:warn, r"not found") min_level=Base.CoreLogging.Warn read_parquet(path; columns=["id", "s.a", "typo"])
+        @test collect(propertynames(tbl)) == [:id]
+    end
+end
+
 @testset "Struct Columns" begin
     _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
