@@ -203,6 +203,24 @@ The writer emits `logicalType` for `DateTime` (naive millis) and `Arrow.Timestam
 pyarrow does, it adds the converted type only where it means the same thing: UTC millis
 or micros. pyarrow then reports the same converted and logical types as for its own files.
 
+## Testing and CI
+
+`julia --project=. -e 'using Pkg; Pkg.test()'` runs everything. pyarrow is the reference:
+the tests have pyarrow write fixtures and read our files, through `uv` in the Python
+environment committed under `test/pyhelper` (pyarrow pinned in `pyproject.toml` and
+`uv.lock`). The Apache parquet-testing files come from the `test/parquet-testing`
+submodule (`git clone --recurse-submodules`).
+
+Without `uv`, or without the submodule, the tests that need them are skipped with a
+warning. With `PARQUET3_TEST_STRICT=1` a missing dependency is a failure instead; CI sets
+it, so a green run means the pyarrow cross-checks and the parquet-testing suite ran.
+
+`.github/workflows/CI.yml` runs the suite on Julia 1.10 (the declared minimum) and the
+latest release, on Linux, with four threads. `CompatHelper.yml` opens a pull request when
+a dependency moves outside the `[compat]` bounds, which matters for the tight Arrow bound.
+Files that exist only on the author's machine (`testdata/part-0.parquet`) are used by the
+corpus test when present and are not needed for a green run.
+
 ## Known Limitations
 
 - A column that cannot be read is an error: `read_parquet` throws `ColumnReadError`, naming the column and keeping the original exception as `cause`; nothing is skipped silently. The other columns, and the other members of the same struct or list, can be read with `columns=`. Columns in the Apache parquet-testing files that currently throw (9 of the 64 files; pinned by the test "every file reads fully or is a known gap"):

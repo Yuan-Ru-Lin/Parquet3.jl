@@ -1,5 +1,7 @@
 # Parquet3.jl
 
+[![CI](https://github.com/Yuan-Ru-Lin/Parquet3.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/Yuan-Ru-Lin/Parquet3.jl/actions/workflows/CI.yml)
+
 An alternative Parquet implementation in Julia, focused on nested data — a suitable representation for data typical of physics experiments, like waveform data and observables of multiple physics objects in an event. Reading returns `Arrow.Table` (Tables.jl-compatible) with memory-mapped IO and per-RowGroup parallelism; writing of flat, list, and struct columns (nested to any depth) is supported.
 
 ## Demo

@@ -91,12 +91,37 @@ using Dates
 
 end
 
+# pyarrow is the reference the tests compare against. It runs through `uv` in the Python
+# environment committed under test/pyhelper (pyarrow pinned, uv.lock).
+const PYHELPER_DIR = joinpath(@__DIR__, "pyhelper")
+
+# With PARQUET3_TEST_STRICT set (CI sets it), a missing test dependency is a failure, not
+# a skip: `uv`/pyarrow for the cross-checks, and the parquet-testing submodule. Without
+# it, as on a machine that has neither, those tests are skipped with a warning.
+const TEST_STRICT = lowercase(get(ENV, "PARQUET3_TEST_STRICT", "")) in ("1", "true", "yes")
+
+"""
+Run a Python script in the test environment and return what it prints. Returns `nothing`
+when `uv` is not installed, unless `PARQUET3_TEST_STRICT` is set, in which case that is an
+error. A script that fails is always an error.
+"""
 function _run_pyarrow(script::String)
-    pyhelper = joinpath(@__DIR__, "..", "..", "pyhelper")
-    isdir(pyhelper) || return nothing
     uv = Sys.which("uv")
-    uv === nothing && return nothing
-    strip(read(Cmd(`$uv run python -c $script`; dir=pyhelper), String))
+    if uv === nothing
+        TEST_STRICT && error("PARQUET3_TEST_STRICT is set but `uv` was not found: the pyarrow cross-checks cannot run")
+        return nothing
+    end
+    strip(read(Cmd(`$uv run --frozen python -c $script`; dir=PYHELPER_DIR), String))
+end
+
+@testset "Test dependencies" begin
+    version = _run_pyarrow("import pyarrow; print(pyarrow.__version__)")
+    if version === nothing
+        @warn "uv not found: every pyarrow cross-check in this run is skipped (set PARQUET3_TEST_STRICT=1 to make that a failure)"
+    else
+        @test version == "23.0.0"       # the version pinned in test/pyhelper and measured against
+    end
+    @info "Test run" strict = TEST_STRICT pyarrow = version threads = Threads.nthreads() julia = VERSION
 end
 
 """Generate a parquet file via pyarrow, run tests, then clean up."""
@@ -1934,6 +1959,10 @@ if HAS_PARQUET_TESTING
         end
     end
 
+elseif TEST_STRICT
+    @testset "parquet-testing submodule" begin
+        @test HAS_PARQUET_TESTING     # PARQUET3_TEST_STRICT is set: clone with --recurse-submodules
+    end
 else
     @warn "Skipping parquet-testing suite: submodule not found at $PARQUET_TESTING_DIR"
 end
