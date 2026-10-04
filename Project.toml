@@ -22,7 +22,7 @@ Thrift = "8d9c9c80-f77e-5080-9541-c6f69d204e22"
 
 [compat]
 ArraysOfArrays = "0.6.6"
-Arrow = "2.8.1"
+Arrow = "~2.8.1"
 ArrowTypes = "2.3.0"
 Base64 = "<0.0.1, 1"
 BitIntegers = "0.3.7"
