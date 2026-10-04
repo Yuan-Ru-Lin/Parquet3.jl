@@ -1616,7 +1616,6 @@ const HAS_PARQUET_TESTING = isdir(PARQUET_TESTING_DIR)
 const PARQUET_TESTING_KNOWN_GAPS = Dict(
     "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split",
                                                   "flba5_byte_stream_split", "decimal_byte_stream_split"],
-    "datapage_v2.snappy.parquet" => ["d"],
     "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
                                    "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],
     "delta_encoding_optional_column.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name",
@@ -1628,7 +1627,6 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
     "hadoop_lz4_compressed_larger.parquet" => ["a"],
     "large_string_map.brotli.parquet" => ["arr"],
     "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
-    "rle_boolean_encoding.parquet" => ["datatype_boolean"],
 )
 
 if HAS_PARQUET_TESTING
@@ -1845,6 +1843,26 @@ if HAS_PARQUET_TESTING
             # One null value: the v2 page's data section is zero bytes, though flagged as compressed
             t = read_parquet(joinpath(PARQUET_TESTING_DIR, "datapage_v2_empty_datapage.snappy.parquet"))
             @test length(t.value) == 1 && ismissing(t.value[1]) && nonmissingtype(eltype(t.value)) == Float32   # pyarrow: [None], float
+        end
+
+        @testset "rle_boolean_encoding" begin
+            # A v2 page that stores repetition levels for a column that is not repeated (they must be
+            # skipped to find the data section), holding RLE-encoded booleans
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "rle_boolean_encoding.parquet"))
+            col = t.datatype_boolean
+            @test length(col) == 68 && count(ismissing, col) == 6
+            @test isequal(collect(col[1:12]), [true, false, missing, true, true, false, false, true, true, true, false, false])
+            result = _run_pyarrow("import pyarrow.parquet as pq; print(pq.read_table('$(joinpath(PARQUET_TESTING_DIR, "rle_boolean_encoding.parquet"))').column(0).to_pylist())")
+            result === nothing || @test result == "[" * join((v === missing ? "None" : v ? "True" : "False" for v in col), ", ") * "]"
+        end
+
+        @testset "datapage_v2.snappy" begin
+            # Its boolean column is RLE-encoded, as every boolean in a v2 page from Arrow-based writers
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "datapage_v2.snappy.parquet"))
+            @test collect(propertynames(t)) == [:a, :b, :c, :d, :e]
+            @test collect(t.d) == [true, true, true, false, true] && collect(t.b) == [1, 2, 3, 4, 5]
+            @test isequal(collect(t.a), ["abc", "abc", "abc", missing, "abc"]) && collect(t.c) == [2.0, 3.0, 4.0, 5.0, 2.0]
+            @test isequal([ismissing(l) ? missing : collect(l) for l in t.e], [[1, 2, 3], missing, missing, [1, 2, 3], [1, 2]])
         end
 
         @testset "overflow_i16_page_cnt" begin

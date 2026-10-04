@@ -40,6 +40,17 @@ function decode_plain_boolean(data::AbstractVector{UInt8}, count::Int)
     bv
 end
 
+"""
+RLE-encoded boolean values: the RLE/bit-packed hybrid at bit width 1, preceded by its
+4-byte length. Unlike levels and dictionary indices, boolean values carry the length
+prefix in both v1 and v2 data pages.
+"""
+function decode_rle_boolean(data::AbstractVector{UInt8}, count::Int)
+    count == 0 && return falses(0)
+    len = Int(ltoh(reinterpret(UInt32, data[1:4])[1]))
+    BitVector(decode_rle_bitpacked(@view(data[5:4+len]), count, 1) .!= 0)
+end
+
 decode_plain_int32(data::AbstractVector{UInt8}, count::Int) =
     reinterpret(Int32, @view data[1:4count])
 

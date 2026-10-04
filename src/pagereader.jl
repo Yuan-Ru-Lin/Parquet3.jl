@@ -74,6 +74,8 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
     elseif encoding == BYTE_STREAM_SPLIT
         ptype == FLOAT ? decode_byte_stream_split_float32(data, count) :
                          decode_byte_stream_split_float64(data, count)
+    elseif encoding == RLE && ptype == BOOLEAN
+        decode_rle_boolean(data, count)
     else
         error("Unsupported encoding: $encoding")
     end
@@ -148,16 +150,19 @@ function read_page(reader::ColumnReader)
         rep_levels = nothing
         def_levels = nothing
 
+        # The level sections occupy the byte lengths the header states, whether or not this
+        # column has such levels: some writers store repetition levels for a column that is
+        # not repeated. Always skip them, so the data section starts in the right place.
         if max_rep > 0 && dh.repetition_levels_byte_length > 0
             bw = max(1, ceil(Int, log2(max_rep + 1)))
             rep_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.repetition_levels_byte_length-1]), nv, bw))
-            pos += dh.repetition_levels_byte_length
         end
+        pos += dh.repetition_levels_byte_length
         if max_def > 0 && dh.definition_levels_byte_length > 0
             bw = max(1, ceil(Int, log2(max_def + 1)))
             def_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.definition_levels_byte_length-1]), nv, bw))
-            pos += dh.definition_levels_byte_length
         end
+        pos += dh.definition_levels_byte_length
 
         data_part = @view page_data[pos:end]
         # An empty data section (every value null) is stored as zero bytes, which is not a

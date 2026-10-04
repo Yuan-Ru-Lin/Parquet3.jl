@@ -94,8 +94,6 @@ variants = {'': {}, '_rg5': {'row_group_size': 5}, '_rg5_nostats': {'row_group_s
 for name, table in tables.items():
     for suffix, kwargs in variants.items():
         if name == 'zero_rows' and suffix: continue
-        # v2 data pages RLE-encode booleans, which the reader does not decode yet (Known Limitations)
-        if suffix == '_v2_dict' and 'flag' in table.column_names: table = table.drop(['flag'])
         pq.write_table(table, '%s/py_%s%s.parquet' % (out, name, suffix), **kwargs)
 print('SUCCESS')
 """
