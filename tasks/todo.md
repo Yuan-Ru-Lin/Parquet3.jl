@@ -84,13 +84,19 @@ Goal: write every value encoding the reader decodes. One step at a time, each re
       it dropped pyarrow INT32 columns with wrap-around deltas and INT64 columns with deltas
       wider than 32 bits, and failed on zero values and on zigzag values beyond ±2^62.
 - [x] E3 — DELTA_LENGTH_BYTE_ARRAY for strings and bytes; reuses E2 for lengths (DONE, awaiting review)
-- E4 — Dictionary (RLE_DICTIONARY): ON HOLD, v0.2.0 or v0.3 undecided (2026-10-04). `:dictionary`
-      is not an accepted `encoding` name, and the bit-packed run encoder is not written.
-      Would need: dictionary page, index page, `dictionary_page_offset`, bit-packed runs in
-      `encode_rle_bitpacked`; no size-based fallback (record as limitation)
+- E4 — Dictionary encoding on write: deferred to v0.3 (decided 2026-10-04); see the v0.3 list.
 Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, multiple pages.
 
-## Deferred to v0.3 — multi-RG, min/max stats, other logical types (LIST-only annotation, TIME, INT96)
+## Deferred to v0.3
+- Multiple row groups on write; min/max statistics
+- Other logical types (LIST-only annotation, TIME, INT96)
+- E4 — Dictionary encoding on write (RLE_DICTIONARY). `:dictionary` is not an accepted
+  `encoding` name today, and the bit-packed run encoder is not written. Needs: dictionary
+  page, index page, `dictionary_page_offset`, bit-packed runs in `encode_rle_bitpacked`;
+  no size-based fallback to PLAIN (record as a limitation).
+- Candidate: derive element nullability from the definition levels actually decoded
+  instead of the `null_count` statistic, so element types do not depend on which writer
+  produced the file.
 
 ## Arrow.write of nested columns (do with writer work)
 - [ ] `Arrow.write` does not see `NestedColumn` (StructColumn / ListOfStructsColumn) as an
