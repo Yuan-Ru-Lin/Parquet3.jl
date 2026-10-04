@@ -365,7 +365,10 @@ entry point.
       Deviation from the plan text: structure is computed per node from the leftmost leaf's
       levels (one pass per list or struct), not in one pass for all ancestors. Simpler, and
       the benchmark did not ask for more.
-- [ ] R4 — `list<struct>` with flat members: harness, wrapper and field projection included.
+- [x] R4 (DONE) — `list<struct>` with flat members: `_wrap_nested` and a `_member_list` that
+      projects a field through any number of list levels (src/api.jl). 79 corpus files, 441
+      columns, every column the current reader assembles: no new differences, no loose
+      nodes, and `col.field` equal to the current reader's for every named field.
 - [ ] R5 — the new shapes and MAP; wrapper generalisation. Tests: write → read equals input
       across a shape matrix, and pyarrow-written files against pyarrow's values. Tests that
       pin the flattened fallback are rewritten.

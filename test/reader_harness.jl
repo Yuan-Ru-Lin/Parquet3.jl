@@ -214,3 +214,16 @@ function harness_r3_columns(path::String)
         any(c -> struct_in_list(c, in_list || node.kind == :list), node.children)
     [node.name for node in plan if !struct_in_list(node)]
 end
+
+"""
+Top-level columns of `path` that the old reader assembles (it flattens the rest): the R3
+set plus LIST groups whose element is a struct of plain leaves.
+"""
+function harness_r4_columns(path::String)
+    pf = open_parquet(path)
+    plan = Parquet3.plan_read_tree(Parquet3.build_schema_tree(pf.metadata.schema))
+    close(pf)
+    flat_struct_list(node) = node.kind == :list && node.schema.element.converted_type == Parquet3.CT_LIST &&
+        only(node.children).kind == :struct && all(c -> c.kind == :leaf, only(node.children).children)
+    union(harness_r3_columns(path), [node.name for node in plan if flat_struct_list(node)])
+end

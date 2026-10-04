@@ -2010,29 +2010,39 @@ end
 end
 
 
-@testset "Recursive reader: leaves, structs, lists (R2, R3)" begin
+@testset "Recursive reader against the current reader (R2–R4)" begin
     # Where the two readers are known to differ, and why. Each is checked against pyarrow below.
     old_reader_bugs = Dict(
         # A required list (bare repeated field) that is empty: the old reader returns `missing`
         "parquet-testing:repeated_primitive_no_list.parquet" => ["Int32_list: values differ"],
     )
     mktempdir() do dir
-        # At this step the new reader assembles every column in which no struct sits inside a list
-        corpus = [(label, path, harness_r3_columns(path)) for (label, path) in harness_corpus(dir)]
+        # Every column the current reader assembles (it flattens the rest; those are tested in R5)
+        corpus = [(label, path, harness_r4_columns(path)) for (label, path) in harness_corpus(dir)]
         corpus = filter(c -> !isempty(c[3]), corpus)
         @test length(corpus) > 60
         results = map(corpus) do (label, path, cols)
             old = read_parquet(path; columns = cols)
             new = Parquet3._read_parquet_recursive(path; columns = cols)
-            (label = label, columns = length(cols), differences = reader_differences(old, new),
+            # Named field access must agree too, for struct and list-of-struct columns alike
+            fields = [(c, f) for c in Tables.columnnames(new) if Tables.getcolumn(new, c) isa Parquet3.NestedColumn
+                             for f in propertynames(Tables.getcolumn(new, c))]
+            field_diffs = ["$c.$f" for (c, f) in fields
+                           if !(harness_same(getproperty(Tables.getcolumn(old, c), f), getproperty(Tables.getcolumn(new, c), f)) &&
+                                harness_shape(eltype(getproperty(Tables.getcolumn(old, c), f))) ==
+                                harness_shape(eltype(getproperty(Tables.getcolumn(new, c), f))))]
+            (label = label, columns = length(cols), fields = length(fields), field_diffs = field_diffs,
+             differences = reader_differences(old, new),
              loose_old = loose_nodes(old), loose_new = loose_nodes(new))
         end
         @testset "$(r.label)" for r in results
             @test r.differences == get(old_reader_bugs, r.label, String[])   # names, containers, values, element types up to Missing
             @test isempty(r.loose_new)        # Missing only where a missing occurs
+            @test isempty(r.field_diffs)      # col.field equals the current reader's
         end
         tightened = [(r.label, setdiff(r.loose_old, r.loose_new)) for r in results if !isempty(setdiff(r.loose_old, r.loose_new))]
-        @info "Recursive reader (R3): $(length(corpus)) files, $(sum(r.columns for r in results)) columns; " *
+        @info "Recursive reader (R4): $(length(corpus)) files, $(sum(r.columns for r in results)) columns, " *
+              "$(sum(r.fields for r in results)) named fields; " *
               "element types tighten in $(length(tightened)):\n" *
               join(("  $label: $(join(nodes, ", "))" for (label, nodes) in tightened), "\n")
     end

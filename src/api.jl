@@ -70,26 +70,39 @@ function Base.getproperty(c::NestedColumn{kind, T, fnames}, name::Symbol) where 
 end
 
 """Project field `j` out of a nested container: struct → child column, list-over-struct → ragged list."""
-_child_column(s::Arrow.Struct, j::Int) = _wrap_struct(s.data[j])
-_child_column(l::Arrow.List, j::Int) = _member_list(l, j)
+_child_column(s::Arrow.Struct, j::Int) = _wrap_nested(s.data[j])
+_child_column(l::Arrow.List, j::Int) = _wrap_nested(_member_list(l, j))
 function _child_column(cv::ChainedVector, j::Int)
     first(cv.arrays) isa Arrow.Struct ?
-        _wrap_struct(ChainedVector([s.data[j] for s in cv.arrays])) :
-        ChainedVector([_member_list(l, j) for l in cv.arrays])
+        _wrap_nested(ChainedVector([s.data[j] for s in cv.arrays])) :
+        _wrap_nested(ChainedVector([_member_list(l, j) for l in cv.arrays]))
 end
 
-"""Ragged view of one struct member: an Arrow.List over the member's child array, sharing offsets/validity."""
+"""
+Ragged view of one struct member: the member's child array under the same list levels,
+sharing each level's offsets and validity. The struct may sit under several list levels.
+"""
 function _member_list(l::Arrow.List, j::Int)
-    child = l.data.data[j]
+    child = l.data isa Arrow.Struct ? l.data.data[j] : _member_list(l.data, j)
     _make_list(child, l.validity, l.offsets.offsets, length(l), Missing <: eltype(l))
 end
 
-"""Wrap struct-valued children in StructColumn so named access composes (`tbl.a.b.c`)."""
-function _wrap_struct(v::AbstractVector)
+"""The struct array reached from `v` through any number of list levels, or `nothing`."""
+_inner_struct(s::Arrow.Struct) = s
+_inner_struct(l::Arrow.List) = _inner_struct(l.data)
+_inner_struct(::Any) = nothing
+
+"""
+Wrap an array whose elements are structs, directly (`StructColumn`) or through list levels
+(`ListOfStructsColumn`), so named access composes (`tbl.a.b.c`). Other arrays are returned as is.
+"""
+function _wrap_nested(v::AbstractVector)
     v isa ChainedVector && isempty(v.arrays) && return v
-    s = _first_chunk(v)
-    s isa Arrow.Struct || return v
-    StructColumn(v, _struct_fnames(typeof(s)))
+    chunk = _first_chunk(v)
+    s = _inner_struct(chunk)
+    s === nothing && return v
+    fnames = _struct_fnames(typeof(s))
+    chunk isa Arrow.Struct ? StructColumn(v, fnames) : ListOfStructsColumn(v, fnames)
 end
 _struct_fnames(::Type{<:Arrow.Struct{T, S, fnames}}) where {T, S, fnames} = fnames
 

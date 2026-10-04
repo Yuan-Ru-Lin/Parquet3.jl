@@ -142,7 +142,8 @@ end
 # itself is null, or an ancestor is. A struct member is therefore missing wherever its
 # struct is, which is what `col.member` shows for those rows.
 #
-# Lists of structs get their wrapper and field access in a later step (R4).
+# A column whose elements are structs, directly or through list levels, is returned in a
+# wrapper with named field access (`_wrap_nested` in api.jl).
 
 """Buffers of one plan node for one row group (stage 1)."""
 struct RawNode
@@ -326,8 +327,7 @@ function _read_column(ctx::ReadContext, row_groups::Vector{RowGroup}, node::Read
     rgs = isempty(row_groups) ? [nothing] : row_groups
     chunks = RawNode[first(fetch(task)) for task in [Threads.@spawn _read_buffers(ctx, rg, node, 0, 0, false) for rg in rgs]]
     arrays = _wrap_buffers(node, chunks, get(field_meta, node.name, nothing))
-    column = length(arrays) == 1 ? only(arrays) : ChainedVector(arrays)
-    node.kind == :struct ? StructColumn(column, Tuple(Symbol(child.name) for child in node.children)) : column
+    _wrap_nested(length(arrays) == 1 ? only(arrays) : ChainedVector(arrays))
 end
 
 """
