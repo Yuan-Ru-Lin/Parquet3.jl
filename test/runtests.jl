@@ -803,6 +803,57 @@ print(t.column('c').to_pylist())""")
         end
     end
 
+    @testset "List<primitive> round-trip (N1)" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
+        tbl = (
+            li  = [Int32[1, 2], Int32[], Int32[3]],
+            lf  = [[1.5, NaN], [2.5], Float64[]],
+            ls  = [["a", ""], String[], ["déjà vu"]],
+            lb  = [[true, false], [true], Bool[]],
+            # nulls at list and element level
+            oli = [[1, missing, 3], missing, Union{Missing, Int64}[]],
+            ols = [missing, ["x", missing], [missing]],
+            id  = [1, 2, 3],
+        )
+        f = wfile("test_n1_lists.parquet")
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            @test collect(Tables.columnnames(t)) == collect(keys(tbl))
+            for k in keys(tbl)
+                @test isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k]))
+            end
+
+            # zero rows, all-null, and all-empty list columns
+            write_parquet(f, (a = Vector{Int32}[],))
+            @test length(read_parquet(f).a) == 0
+            write_parquet(f, (b = Union{Missing, Vector{Int64}}[missing, missing], c = [Float32[], Float32[]]))
+            t = read_parquet(f)
+            @test all(ismissing, t.b) && length(t.b) == 2
+            @test all(isempty, t.c) && length(t.c) == 2
+
+            @test_throws Exception write_parquet(f, (nested = [[[1]], [[2, 3]]],))
+
+            write_parquet(f, (l = [Int32[1, 2], missing, Int32[], [missing, Int32(5)]], s = [["x"], ["y", "z"], String[], missing]))
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(t.schema.field('l').type)
+print(t.column('l').to_pylist())
+print(t.column('s').to_pylist())""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "list<element: int32>"
+                @test lines[2] == "[[1, 2], None, [], [None, 5]]"
+                @test lines[3] == "[['x'], ['y', 'z'], [], None]"
+            else
+                @warn "Skipping pyarrow cross-check of written lists: uv/pyarrow not available"
+            end
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

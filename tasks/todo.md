@@ -13,8 +13,9 @@
 Nested writing is driven by element type, so reader outputs round-trip:
 `AbstractVector` elements → LIST, `NamedTuple` elements → group (struct).
 
-- [ ] N1 — `List<primitive>`: 3-level LIST schema, rep/def level generation, nulls at
-      list and element level; round-trip + pyarrow cross-read
+- [x] N1 — `List<primitive>`: 3-level LIST schema, rep/def level generation, nulls at
+      list and element level; round-trip + pyarrow cross-read (DONE, awaiting review;
+      on branch `writer-w1`, rebased onto main)
 - [ ] N2 — struct of flat fields: one group, several leaves, def levels only
 - [ ] N3 — composition: struct{list}, struct-of-struct, list<struct>, list<list>
       (recursive shredder over the schema tree; N1/N2 become its base cases)

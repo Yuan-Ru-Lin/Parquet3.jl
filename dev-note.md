@@ -85,9 +85,16 @@ assembles pages (length-prefixed RLE def levels + PLAIN values), column chunks, 
 the footer. All columns are written OPTIONAL with null-count statistics so the
 reader's statistics-based eltype derivation works on our own files.
 
-Current writer scope: flat columns (Int32/Int64/Float32/Float64/Bool/String/bytes +
-Missing unions), PLAIN, uncompressed, one row group. Planned: compression and
-multi-RG (W2), lists (W3), structs/list<struct> (W4).
+Each column is shredded (`_shred`) into schema elements, a leaf path, rep/def levels, and
+non-null values; `_data_page` then writes any shredded leaf. Flat columns have no
+repetition levels and def 0/1. `List<primitive>` uses the standard 3-level layout with
+def 0 = null list, 1 = empty list, 2 = null element, 3 = value. `Vector{UInt8}` elements
+are byte strings, not lists. `null_count` counts every level entry without a value
+(including empty lists), matching pyarrow.
+
+Current writer scope: flat and `List<primitive>` columns (Int32/Int64/Float32/Float64/
+Bool/String/bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are
+in `tasks/todo.md`.
 
 ## Known Limitations
 
