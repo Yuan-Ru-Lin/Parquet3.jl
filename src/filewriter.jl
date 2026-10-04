@@ -119,14 +119,15 @@ Plan the schema subtree for a value of type `FT` named `name`, driven by element
 `NamedTuple` → group (struct), `AbstractVector` → standard 3-level LIST, anything else →
 primitive leaf. Every node is OPTIONAL. `path`, `max_rep`, `max_def` describe the parent.
 `key` is the parent's user-facing path: the schema path without a list's structural
-`list`/`element` segments, which is what the `encoding` keyword is keyed by.
+`list`/`element` segments, which is what the `encoding` keyword is keyed by. `rep_def`
+is the definition level of the nearest enclosing list's repeated node (0 outside lists).
 
 Returns a node with its `kind`, depth-first `elements` (schema), and all `leaves` below
 it. A leaf is one column chunk: path, max levels, and the rep/def levels and non-null
 values that `_shred!` appends to.
 """
 function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int, max_def::Int,
-                    key::Vector{String} = String[]; structural::Bool = false) where FT
+                    key::Vector{String} = String[]; structural::Bool = false, rep_def::Int = 0) where FT
     T = Base.nonmissingtype(FT)
     path = [path; name]
     structural || (key = [key; name])
@@ -135,14 +136,15 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
         isconcretetype(T) && fieldcount(T) > 0 ||
             error("write_parquet: struct $(join(path, '.')) needs a concrete, non-empty NamedTuple type, got $T " *
                   "(rows of differing field types need a typed vector, e.g. @NamedTuple{a::Union{Missing, Int64}}[...])")
-        children = [_plan_node(String(f), ft, path, max_rep, max_def, key) for (f, ft) in zip(fieldnames(T), fieldtypes(T))]
+        children = [_plan_node(String(f), ft, path, max_rep, max_def, key; rep_def) for (f, ft) in zip(fieldnames(T), fieldtypes(T))]
         group = SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(length(children)))
         (kind = :struct, rep_level = max_rep, children = children,
          elements = [group; reduce(vcat, [c.elements for c in children])],
          leaves = reduce(vcat, [c.leaves for c in children]))
     elseif _is_list_type(T)
         # optional group name (LIST) { repeated group list { optional <element> } }
-        child = _plan_node("element", eltype(T), [path; "list"], max_rep + 1, max_def + 1, key; structural = true)
+        child = _plan_node("element", eltype(T), [path; "list"], max_rep + 1, max_def + 1, key;
+                           structural = true, rep_def = max_def + 1)
         (kind = :list, rep_level = max_rep + 1, children = [child],
          elements = [SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(1), converted_type = CT_LIST);
                      SchemaElement(repetition_type = REPEATED, name = "list", num_children = Int32(1));
@@ -150,7 +152,7 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
          leaves = child.leaves)
     else
         ptype, ctype = writer_parquet_type(T)
-        leaf = (path = path, key = join(key, "."), ptype = ptype, max_rep = max_rep, max_def = max_def,
+        leaf = (path = path, key = join(key, "."), ptype = ptype, max_rep = max_rep, max_def = max_def, rep_def = rep_def,
                 rep = Int[], def = Int[], values = T[])
         (kind = :leaf, rep_level = max_rep, children = (),
          elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype,
@@ -158,6 +160,17 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
          leaves = [leaf])
     end
 end
+
+"""
+The `null_count` statistic as pyarrow writes it, which readers (ours included) use to
+decide whether a column can hold nulls. Measured on pyarrow 23, not specified anywhere:
+a leaf that is itself a list's element counts every level entry without a value, null
+and empty lists included. A leaf below a struct inside a list counts only the list's
+existing slots (`def >= rep_def`), so null and empty lists are left out. Outside lists
+the two agree.
+"""
+_null_count(leaf) = leaf.max_def == leaf.rep_def + 1 ? count(<(leaf.max_def), leaf.def) :
+                    count(d -> leaf.rep_def <= d < leaf.max_def, leaf.def)
 
 """
 Shred value `v` into the leaves under `node` (Dremel). `rep` is the repetition level of
@@ -283,8 +296,7 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
                     total_uncompressed_size = Int64(uncompressed_size),
                     total_compressed_size = Int64(length(page)),
                     data_page_offset = Int64(offset),
-                    # Every level entry without a value, as pyarrow counts it
-                    statistics = Statistics(null_count = Int64(length(leaf.def) - length(leaf.values))))
+                    statistics = Statistics(null_count = Int64(_null_count(leaf))))
                 push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
             end
         end

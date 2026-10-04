@@ -97,8 +97,15 @@ depth, except the first item, which inherits the enclosing one. A null or empty 
 recorded in every leaf below the node where the path stopped. `_data_page` writes any
 leaf. `NamedTuple` types must be concrete, since member types are read from the type. For example `List<primitive>` has
 def 0 = null list, 1 = empty list, 2 = null element, 3 = value. `Vector{UInt8}` elements
-are byte strings, not lists. `null_count` counts every level entry without a value
-(including empty lists), matching pyarrow.
+are byte strings, not lists. `null_count` follows pyarrow leaf by leaf (`_null_count`), because readers, ours included,
+derive nullability from it. pyarrow's rule is not written down anywhere; measured on
+pyarrow 23 across 18 leaf positions it is: a leaf that is itself a list's element counts
+every level entry without a value, null and empty lists included; a leaf below a struct
+inside a list counts only the list's existing slots, so null and empty lists are left out;
+outside lists the two agree. The reader does not depend on which convention a file uses
+for correctness: a writer that counts more only makes element types looser
+(`Union{Missing, …}`), never wrong. The test compares our statistics with pyarrow's for
+every shape, so a change in pyarrow's behaviour would show up there.
 
 Because dispatch is on element type, the reader's containers (`Arrow.List`, `StructColumn`,
 `ListOfStructsColumn`, `FixedSizeListVector`, `ChainedVector` chunks) are written without

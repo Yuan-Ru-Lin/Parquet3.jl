@@ -1561,6 +1561,70 @@ print(t.column('tags').to_pylist()[:3], t.column('wf').to_pylist()[0], t.column(
         end
     end
 
+    @testset "null_count matches pyarrow for every leaf position" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        M = Missing
+        # Each nested shape, with a null and an empty at every level that can have one
+        tbl = (
+            flat = [1, missing, 3, missing],
+            l    = Union{M, Vector{Union{M, Int}}}[[1, missing], missing, [], [2]],
+            s    = Union{M, @NamedTuple{a::Union{M, Int}, b::Union{M, String}}}[
+                       (a = 1, b = "x"), missing, (a = missing, b = "y"), (a = 2, b = missing)],
+            los  = Union{M, Vector{Union{M, @NamedTuple{a::Union{M, Int}, b::Union{M, Int}}}}}[
+                       [(a = 1, b = 1), missing, (a = missing, b = 2)], missing, [], [(a = 3, b = missing)]],
+            sl   = Union{M, @NamedTuple{v::Union{M, Vector{Union{M, Int}}}, n::Union{M, Int}}}[
+                       (v = [1, missing], n = 1), missing, (v = missing, n = 2), (v = [], n = missing)],
+            ll   = Union{M, Vector{Union{M, Vector{Union{M, Int}}}}}[[[1, missing], missing, []], missing, [], [[2]]],
+            ss   = Union{M, @NamedTuple{inner::Union{M, @NamedTuple{x::Union{M, Int}}}}}[
+                       (inner = (x = 1,),), missing, (inner = missing,), (inner = (x = missing,),)],
+            sls  = Union{M, @NamedTuple{hits::Union{M, Vector{Union{M, @NamedTuple{x::Union{M, Int}}}}}}}[
+                       (hits = [(x = 1,), missing, (x = missing,)],), missing, (hits = missing,), (hits = [],)],
+            lsl  = Union{M, Vector{Union{M, @NamedTuple{v::Union{M, Vector{Union{M, Int}}}}}}}[
+                       [(v = [1, missing],), missing, (v = missing,), (v = [],)], missing, [], [(v = [2],)]],
+            lls  = Union{M, Vector{Union{M, Vector{Union{M, @NamedTuple{x::Union{M, Int}}}}}}}[
+                       [[(x = 1,), missing, (x = missing,)], missing, []], missing, [], [[(x = 2,)]]],
+            # no nulls at all, and lists without nulls but with an empty one
+            los_clean = [[(a = 1, b = 2)], [(a = 3, b = 4), (a = 5, b = 6)], [(a = 7, b = 8)], [(a = 9, b = 0)]],
+            los_empty = [[(a = 1, b = 2)], @NamedTuple{a::Int, b::Int}[], [(a = 7, b = 8)], [(a = 9, b = 0)]],
+            l_empty   = [[1], Int[], [2, 3], [4]],
+        )
+        ours, theirs = wfile("test_nc_ours.parquet"), wfile("test_nc_pyarrow.parquet")
+        try
+            write_parquet(ours, tbl)
+            # pyarrow rewrites the same data; its statistics are the reference
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(ours)')
+pq.write_table(t, '$(theirs)')
+a, b = pq.ParquetFile('$(ours)').metadata.row_group(0), pq.ParquetFile('$(theirs)').metadata.row_group(0)
+print(pq.read_table('$(theirs)').equals(t), a.num_columns)
+print([a.column(i).path_in_schema for i in range(a.num_columns)
+       if (a.column(i).num_values, a.column(i).statistics.null_count) != (b.column(i).num_values, b.column(i).statistics.null_count)])
+print([a.column(i).statistics.null_count for i in range(a.num_columns)])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "True 18"
+                @test lines[2] == "[]"       # no leaf differs from pyarrow
+                # pinned so a change in either side shows up: los/sls/lls members count slots only
+                @test lines[3] == "[2, 3, 2, 2, 2, 2, 4, 2, 5, 3, 2, 6, 2, 0, 0, 0, 0, 1]"
+
+                # Same data, same types, whichever writer produced the file
+                a, b = read_parquet(ours), read_parquet(theirs)
+                @test collect(Tables.columnnames(a)) == collect(Tables.columnnames(b))
+                for k in Tables.columnnames(a)
+                    @test eltype(Tables.getcolumn(a, k)) == eltype(Tables.getcolumn(b, k))
+                    @test isequal(plain(Tables.getcolumn(a, k)), plain(Tables.getcolumn(b, k)))
+                end
+                @test !(Missing <: eltype(a.los_clean)) && !(Missing <: eltype(a.los_empty))
+                @test eltype(first(a.los_empty)) == @NamedTuple{a::Int64, b::Int64}
+            else
+                @warn "Skipping null_count comparison: uv/pyarrow not available"
+            end
+        finally
+            rm(ours, force=true); rm(theirs, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

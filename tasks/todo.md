@@ -36,10 +36,11 @@ Nested writing is driven by element type, so reader outputs round-trip:
 - [x] Reader fix found by the timestamp tests: `list<struct>` across row groups with a null
       list in only some of them gave mismatched chunk types (`col.field` threw). List
       nullability no longer trusts member `null_count` (pyarrow excludes null lists there).
-- [ ] Not done, found 2026-10-03: our `null_count` for a leaf under list→struct counts null
-      and empty lists; pyarrow's does not (it does for a leaf directly under a list). Values
-      are unaffected; our own list<struct> files read back with looser `Union{Missing,…}`
-      element types than pyarrow's.
+- [x] `null_count` matches pyarrow for every leaf position (DONE, awaiting review; found
+      2026-10-03, fixed 2026-10-04). Rule measured on 18 leaves: a list's own element leaf
+      counts all entries without a value; a leaf under a struct inside a list counts only
+      existing slots. Files from our writer and from pyarrow now read back with identical
+      element types. No reader change.
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
 
 - [x] N1.5 (DONE, awaiting review: `_arrow_schema_kv`; our reader and pyarrow both restore
