@@ -31,6 +31,36 @@ function read_list(p, reader)
     items
 end
 
+# ── LogicalType (union): only the TIMESTAMP member is parsed ──────────────
+
+"""Read a Thrift union, returning `reader(p, field_id)` for its one set member (`nothing` to skip it)."""
+function read_union(reader, p)
+    result = nothing
+    readStructBegin(p)
+    while true
+        _, ttype, fid = readFieldBegin(p)
+        ttype == TType.STOP && break
+        value = reader(p, fid)
+        value === nothing ? skip(p, julia_type(ttype)) : (result = value)
+        readFieldEnd(p)
+    end
+    readStructEnd(p)
+    result
+end
+
+const TIME_UNITS = (:MILLIS, :MICROS, :NANOS)    # TimeUnit union field ids 1, 2, 3
+
+# Each TimeUnit member is an empty struct; skip it and keep the field id
+read_time_unit(p) = read_union((q, fid) -> fid in 1:3 ? (skip(q, julia_type(TType.STRUCT)); TIME_UNITS[fid]) : nothing, p)
+
+const TIMESTAMP_TYPE_FIELDS = [
+    (1, :is_adjusted_to_utc, p -> read(p, Bool)),
+    (2, :unit,               read_time_unit),
+]
+
+read_logical_type(p) =
+    read_union((q, fid) -> fid == 8 ? read_thrift(q, TimestampType, TIMESTAMP_TYPE_FIELDS) : nothing, p)
+
 # ── Field tables ──────────────────────────────────────────────────────────
 
 const SCHEMA_ELEMENT_FIELDS = [
@@ -43,6 +73,7 @@ const SCHEMA_ELEMENT_FIELDS = [
     (7, :scale,           p -> read(p, Int32)),
     (8, :precision,       p -> read(p, Int32)),
     (9, :field_id,        p -> read(p, Int32)),
+    (10, :logical_type,   read_logical_type),
 ]
 
 const STATISTICS_FIELDS = [
@@ -170,12 +201,33 @@ _w_enum(p, v) = write(p, Int32(v))
 # Write tables cover only the fields the writer emits (readers of our files
 # treat missing optional fields per Thrift semantics).
 
+"""Write a Thrift union with its single member `fid` (a struct written by `writer`)."""
+function write_union(writer, p, fid::Integer)
+    writeStructBegin(p, "")
+    writeFieldBegin(p, "", TType.STRUCT, fid)
+    writer(p)
+    writeFieldEnd(p)
+    writeFieldStop(p)
+    writeStructEnd(p)
+end
+
+_write_empty_struct(p) = (writeStructBegin(p, ""); writeFieldStop(p); writeStructEnd(p))
+
+const TIMESTAMP_TYPE_W = [
+    # In the compact protocol a bool field's value lives in its field header, hence writeBool
+    (1, TType.BOOL,   o -> o.is_adjusted_to_utc, writeBool),
+    (2, TType.STRUCT, o -> o.unit, (p, v) -> write_union(_write_empty_struct, p, findfirst(==(v), TIME_UNITS))),
+]
+
+write_logical_type(p, ts::TimestampType) = write_union(q -> write_thrift(q, ts, TIMESTAMP_TYPE_W), p, 8)
+
 const SCHEMA_ELEMENT_W = [
     (1, TType.I32,    o -> o.type,            _w_enum),
     (3, TType.I32,    o -> o.repetition_type, _w_enum),
     (4, TType.STRING, o -> o.name,            (p, v) -> write(p, v)),
     (5, TType.I32,    o -> o.num_children,    (p, v) -> write(p, Int32(v))),
     (6, TType.I32,    o -> o.converted_type,  _w_enum),
+    (10, TType.STRUCT, o -> o.logical_type,   write_logical_type),
 ]
 
 const STATISTICS_W = [

@@ -334,8 +334,8 @@ function _assemble_member(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, m, 
     elem = m.leaf.element
     if m.kind == :flat
         values, nulls = assemble_flat_column(pages, m.leaf.max_def_level)
-        converted = convert_primitive_values(values, elem.type, elem.converted_type)
-        child = _build_leaf_array(converted, nulls, elem.type, elem.converted_type; nullable=m.nullable)
+        converted = convert_primitive_values(values, elem.type, leaf_annotation(elem))
+        child = _build_leaf_array(converted, nulls, elem.type, leaf_annotation(elem); nullable=m.nullable)
         (child, want_defs ? _page_defs(pages, m.leaf.max_def_level) : nothing)
     elseif m.fsl_size > 0  # :list declared FixedSizeList — child is a FixedSizeListVector
         max_def = m.leaf.max_def_level
@@ -345,15 +345,15 @@ function _assemble_member(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, m, 
             return (child, want_defs ? fill(max_def, length(child)) : nothing)
         end
         all_rep, all_def, raw = collect_page_data(pages, max_def)
-        converted = convert_primitive_values(raw, elem.type, elem.converted_type)
+        converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
         child = assemble_fsl_direct(all_rep, all_def, converted, max_def, m.fsl_size, elem, m.thresholds;
                                     nullable=m.nullable, record_null_def=m.null_def)
         (child, want_defs ? _record_defs(all_rep, all_def) : nothing)
     else  # :list — child column is a regular Arrow.List
         all_rep, all_def, raw = collect_page_data(pages, m.leaf.max_def_level)
-        converted = convert_primitive_values(raw, elem.type, elem.converted_type)
+        converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
         child = _to_arrow_nested(all_rep, all_def, converted, m.leaf.max_def_level,
-                                 m.leaf.max_rep_level, m.thresholds, elem.type, elem.converted_type;
+                                 m.leaf.max_rep_level, m.thresholds, elem.type, leaf_annotation(elem);
                                  nullable=m.nullable, record_null_def=m.null_def)
         (child, want_defs ? _record_defs(all_rep, all_def) : nothing)
     end
@@ -395,13 +395,15 @@ function _read_los_column(data::Vector{UInt8}, row_groups::Vector{RowGroup},
     member_nullable = [m.nullable for m in members]
     elem_optional = parts.elem !== parts.rep && parts.elem.element.repetition_type == OPTIONAL
 
-    # A null list (or null element) nulls every member leaf at that position, so
-    # they are only possible when every member column contains nulls (cf. structs).
+    # A null element nulls every member leaf at that slot, so it is only possible when
+    # every member column contains nulls (cf. structs). A null *list* has no slot, and
+    # pyarrow leaves it out of the members' null_count, so statistics say nothing about
+    # it: be conservative for multi-row-group files (single-RG eltypes follow the data).
     plan = (members = members,
             entry_def = parts.rep.own_def_level,              # slot exists at/above this
             elem_null_def = elem_optional ? parts.elem.own_def_level : 0,
             list_null_def = gnode.own_def_level,
-            list_nullable = _group_nullable(gnode.own_def_level, member_nullable, row_groups),
+            list_nullable = _group_nullable(gnode.own_def_level, Bool[], row_groups),
             elem_nullable = elem_optional &&
                 _group_nullable(parts.elem.own_def_level, member_nullable, row_groups),
             fnames = Tuple(Symbol(c.element.name) for c in parts.elem.children),
@@ -445,9 +447,9 @@ function _assemble_los_chunk(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, 
 
     # Member child arrays at element (slot) granularity
     children = map(plan.members, fetched) do m, (_, defj, valsj)
-        converted = convert_primitive_values(valsj, m.leaf.element.type, m.leaf.element.converted_type)
+        converted = convert_primitive_values(valsj, m.leaf.element.type, leaf_annotation(m.leaf.element))
         mvals, mnulls = _scatter_member(defj, converted, plan.entry_def, m.leaf.max_def_level, nslots)
-        _build_leaf_array(mvals, mnulls, m.leaf.element.type, m.leaf.element.converted_type;
+        _build_leaf_array(mvals, mnulls, m.leaf.element.type, leaf_annotation(m.leaf.element);
                           nullable=m.nullable)
     end
 
@@ -502,7 +504,7 @@ function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, sche
         end
 
         all_rep, all_def, raw = collect_page_data(pages, max_def)
-        converted = convert_primitive_values(raw, ptype, node.element.converted_type)
+        converted = convert_primitive_values(raw, ptype, leaf_annotation(node.element))
         def_thresholds = compute_def_thresholds(schema_tree, column_path)
 
         if haskey(fsl_info, top_name)
@@ -510,13 +512,13 @@ function _assemble_to_arrow(pages::Vector{<:DecodedPage}, node::SchemaNode, sche
                                 node.element, def_thresholds; nullable)
         else
             _to_arrow_nested(all_rep, all_def, converted, max_def, node.max_rep_level,
-                             def_thresholds, ptype, node.element.converted_type; nullable, meta)
+                             def_thresholds, ptype, leaf_annotation(node.element); nullable, meta)
         end
     else
         # All flat columns: bool, bytes, numeric
         values, nulls = assemble_flat_column(pages, max_def)
-        converted = convert_primitive_values(values, ptype, node.element.converted_type)
-        _build_leaf_array(converted, nulls, ptype, node.element.converted_type; nullable, meta)
+        converted = convert_primitive_values(values, ptype, leaf_annotation(node.element))
+        _build_leaf_array(converted, nulls, ptype, leaf_annotation(node.element); nullable, meta)
     end
 end
 
@@ -679,14 +681,37 @@ function _parse_kv_metadata(kv::Union{Vector{KeyValue}, Nothing})
     d
 end
 
-"""Convert primitive values based on Parquet and converted types."""
+"""
+What a leaf's values mean beyond its physical type: its ConvertedType, or a
+`TimestampType` for timestamps. `logicalType` wins; without it, TIMESTAMP_MILLIS /
+TIMESTAMP_MICROS mean UTC-adjusted (per the spec, and as pyarrow reads them).
+"""
+function leaf_annotation(elem::SchemaElement)
+    elem.logical_type !== nothing && return elem.logical_type
+    elem.converted_type == CT_TIMESTAMP_MILLIS && return TimestampType(true, :MILLIS)
+    elem.converted_type == CT_TIMESTAMP_MICROS && return TimestampType(true, :MICROS)
+    elem.converted_type
+end
+
+const ARROW_TIME_UNITS = (MILLIS = Arrow.Meta.TimeUnit.MILLISECOND, MICROS = Arrow.Meta.TimeUnit.MICROSECOND,
+                          NANOS = Arrow.Meta.TimeUnit.NANOSECOND)
+
+"""
+Julia type for a timestamp column: `DateTime` when that is lossless (naive
+milliseconds), otherwise `Arrow.Timestamp{unit, tz}` with `tz` `:UTC` or `nothing`.
+"""
+timestamp_julia_type(ts::TimestampType) =
+    ts.unit == :MILLIS && !ts.is_adjusted_to_utc ? DateTime :
+    Arrow.Timestamp{ARROW_TIME_UNITS[ts.unit], ts.is_adjusted_to_utc ? :UTC : nothing}
+
+"""Convert primitive values based on the Parquet type and the leaf's annotation (see `leaf_annotation`)."""
 function convert_primitive_values(values, ptype, ctype)
     if ctype == CT_DATE && ptype == INT32
         [Date(1970, 1, 1) + Day(v) for v in values]
-    elseif ctype == CT_TIMESTAMP_MILLIS && ptype == INT64
-        [DateTime(1970, 1, 1) + Millisecond(v) for v in values]
-    elseif ctype == CT_TIMESTAMP_MICROS && ptype == INT64
-        [DateTime(1970, 1, 1) + Microsecond(v) for v in values]
+    elseif ctype isa TimestampType && ptype == INT64
+        T = timestamp_julia_type(ctype)
+        # Arrow.Timestamp wraps one Int64, so the decoded values are reinterpreted in place
+        T === DateTime ? [DateTime(1970, 1, 1) + Millisecond(v) for v in values] : reinterpret(T, values)
     elseif (T = _converted_int_type(ctype)) !== nothing && T !== eltype(values)
         # Bit-truncating, not checked: unsigned values are stored in signed physical
         # types, and null slots hold arbitrary bits
@@ -712,7 +737,7 @@ end
 
 """Convert nested values into a FixedSizeListVector (flat child array + record-level nulls)."""
 function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int; nullable::Bool=false)
-    T = element_julia_type(elem.type, elem.converted_type)
+    T = element_julia_type(elem.type, leaf_annotation(elem))
     nrows = length(nulls)
     data = Vector{T}(undef, list_size * nrows)
     val_idx = 0
@@ -742,7 +767,7 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
                              max_def::Int, list_size::Int, elem::SchemaElement,
                              def_thresholds::Vector{Int}; nullable::Bool=false,
                              record_null_def::Int = max_def > 0 ? 1 : 0) where V
-    T = element_julia_type(elem.type, elem.converted_type)
+    T = element_julia_type(elem.type, leaf_annotation(elem))
     num_records = count(==(0), all_rep)
     data = Vector{T}(undef, list_size * num_records)
     nulls = falses(num_records)
@@ -813,7 +838,7 @@ Copy them directly into the flat FSL buffer — no rep/def level processing need
 """
 function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaElement,
                              list_size::Int; nullable::Bool=false)
-    T = element_julia_type(ptype, elem.converted_type)
+    T = element_julia_type(ptype, leaf_annotation(elem))
     # Count records from rep levels
     num_records = sum(pages) do page
         page.rep_levels === nothing ? page.num_values : count(==(0), page.rep_levels)
@@ -823,7 +848,7 @@ function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaEl
     nulls = falses(num_records)
 
     # Convert and copy page values in bulk using a function barrier for type stability
-    _fsl_dense_copy!(data, pages, ptype, elem.converted_type)
+    _fsl_dense_copy!(data, pages, ptype, leaf_annotation(elem))
 
     ET = nullable ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
     FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
@@ -853,8 +878,8 @@ function element_julia_type(ptype, ctype)
         String
     elseif ctype == CT_DATE && ptype == INT32
         Date
-    elseif ctype in (CT_TIMESTAMP_MILLIS, CT_TIMESTAMP_MICROS) && ptype == INT64
-        DateTime
+    elseif ctype isa TimestampType && ptype == INT64
+        timestamp_julia_type(ctype)
     elseif (T = _converted_int_type(ctype)) !== nothing
         T
     elseif ptype == INT96

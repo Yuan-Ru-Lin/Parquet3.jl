@@ -19,9 +19,15 @@ function writer_parquet_type(::Type{T}) where T
     T === UInt16  && return (INT32, CT_UINT_16)
     T === UInt32  && return (INT32, CT_UINT_32)
     T === UInt64  && return (INT64, CT_UINT_64)
-    # Days / milliseconds since the Unix epoch
-    T === Date     && return (INT32, CT_DATE)
-    T === DateTime && return (INT64, CT_TIMESTAMP_MILLIS)
+    T === Date    && return (INT32, CT_DATE)    # days since the Unix epoch
+    # Timestamps carry a logicalType (see writer_logical_type). As pyarrow does, the
+    # converted type is added only where it says the same thing: UTC millis or micros.
+    if T === DateTime || T <: Arrow.Timestamp
+        ts = writer_logical_type(T)
+        ctype = !ts.is_adjusted_to_utc ? nothing :
+                ts.unit == :MILLIS ? CT_TIMESTAMP_MILLIS : ts.unit == :MICROS ? CT_TIMESTAMP_MICROS : nothing
+        return (INT64, ctype)
+    end
     T === Float32 && return (FLOAT, nothing)
     T === Float64 && return (DOUBLE, nothing)
     T === Bool    && return (BOOLEAN, nothing)
@@ -29,8 +35,21 @@ function writer_parquet_type(::Type{T}) where T
     T === Vector{UInt8} && return (BYTE_ARRAY, nothing)
     error("write_parquet: unsupported column eltype $T " *
           "(supported: signed and unsigned integers up to 64 bits, Float32, Float64, Bool, String, " *
-          "Date, DateTime, Vector{UInt8}, " *
+          "Date, DateTime, Arrow.Timestamp, Vector{UInt8}, " *
           "vectors or NamedTuples of those, and Missing unions)")
+end
+
+"""
+The `logicalType` to write for element type `T`, or `nothing`. `DateTime` is a naive
+millisecond timestamp. `Arrow.Timestamp{U, TZ}` keeps its unit; Parquet only has a UTC
+flag, so any time zone other than `nothing` is written as UTC-adjusted.
+"""
+writer_logical_type(::Type) = nothing
+writer_logical_type(::Type{DateTime}) = TimestampType(false, :MILLIS)
+function writer_logical_type(::Type{Arrow.Timestamp{U, TZ}}) where {U, TZ}
+    i = findfirst(==(U), values(ARROW_TIME_UNITS))
+    i === nothing && error("write_parquet: Parquet has no timestamp unit $U (supported: milli-, micro-, nanoseconds)")
+    TimestampType(TZ !== nothing, keys(ARROW_TIME_UNITS)[i])
 end
 
 # Vector{UInt8} is a byte string; any other vector element type is a list
@@ -72,7 +91,8 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
         leaf = (path = path, ptype = ptype, max_rep = max_rep, max_def = max_def,
                 rep = Int[], def = Int[], values = T[])
         (kind = :leaf, rep_level = max_rep, children = (),
-         elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype)],
+         elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype,
+                                   logical_type = writer_logical_type(T))],
          leaves = [leaf])
     end
 end
@@ -137,10 +157,14 @@ end
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
 Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Date, DateTime,
-Vector{UInt8}; vectors (written as
+Arrow.Timestamp, Vector{UInt8}; vectors (written as
 LIST) and NamedTuples (written as a struct group) of supported types, nested to any
 depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
 with PLAIN encoding in a single row group.
+
+`DateTime` is written as a naive millisecond timestamp. `Arrow.Timestamp{U, TZ}` keeps
+its unit (milli-, micro-, or nanoseconds) and is written as UTC-adjusted unless `TZ`
+is `nothing`, so a timestamp column from `read_parquet` writes back unchanged.
 
 `compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:zstd`, `:lz4`, or
 `:uncompressed`; a string is accepted too.

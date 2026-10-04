@@ -70,6 +70,12 @@ const PARQUET_MAGIC = UInt8[0x50, 0x41, 0x52, 0x31]  # "PAR1"
 # Metadata structs using @kwdef for clean keyword constructors
 =============================================================================#
 
+"""The TIMESTAMP member of the LogicalType union — the only logical type we parse."""
+@kwdef struct TimestampType
+    is_adjusted_to_utc::Bool = false
+    unit::Symbol = :MILLIS    # :MILLIS, :MICROS, or :NANOS
+end
+
 @kwdef struct SchemaElement
     type::Union{ParquetType, Nothing} = nothing
     type_length::Union{Int32, Nothing} = nothing
@@ -80,6 +86,7 @@ const PARQUET_MAGIC = UInt8[0x50, 0x41, 0x52, 0x31]  # "PAR1"
     scale::Union{Int32, Nothing} = nothing
     precision::Union{Int32, Nothing} = nothing
     field_id::Union{Int32, Nothing} = nothing
+    logical_type::Union{TimestampType, Nothing} = nothing
 end
 
 @kwdef struct Statistics

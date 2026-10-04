@@ -115,8 +115,8 @@ session and table shape.
 
 Narrow and unsigned integers are stored in INT32/INT64 with a converted-type annotation;
 `encode_plain` converts with `% Int32` / `% Int64`, the inverse of the reader's `% T`.
-`Date` is written as INT32 days and `DateTime` as INT64 milliseconds since the Unix epoch,
-with converted types DATE and TIMESTAMP_MILLIS (no `logicalType`; that is deferred to v0.3).
+`Date` is written as INT32 days since the Unix epoch with converted type DATE. Timestamps
+are described under Timestamp Design.
 
 Current writer scope: flat, list, and struct columns nested to any depth (Int8–Int64, UInt8–UInt64,
 Float32/Float64, Bool, String, Date, DateTime, bytes + Missing unions), PLAIN, one row group. Each v1 data page
@@ -125,13 +125,37 @@ in `src/compression.jl`; Snappy is the default, as in pyarrow, whose codec names
 (`:lz4` means LZ4_RAW; the deprecated Hadoop-framed LZ4 is not written). Next steps are
 in `tasks/todo.md`.
 
+## Timestamp Design
+
+Julia's `DateTime` holds milliseconds and no zone, so it is exact only for a naive
+millisecond timestamp. The reader therefore uses a mixed rule (`timestamp_julia_type`):
+naive milliseconds → `DateTime`; everything else → `Arrow.Timestamp{U, TZ}` with `TZ`
+`:UTC` or `nothing`. `Arrow.Timestamp` is a bits type wrapping one `Int64`, so the decoded
+INT64 values are reinterpreted in place, with no per-value conversion.
+
+`leaf_annotation(elem)` is the single place that decides what a leaf means: the parsed
+`logicalType` TIMESTAMP if present, else TIMESTAMP_MILLIS / TIMESTAMP_MICROS read as
+UTC-adjusted (the spec's meaning, and pyarrow's), else the plain converted type. Every
+assembly path (flat, list, struct member, list<struct>, FixedSizeList) passes that
+annotation where it used to pass the converted type, so nested timestamps need no
+special cases.
+
+Thrift: `logicalType` is SchemaElement field 10, a union. `read_union` reads the one set
+member; only member 8 (TIMESTAMP: `isAdjustedToUTC` + a `TimeUnit` union of empty structs)
+is parsed, the rest is skipped. In the compact protocol a bool field's value is carried in
+the field header, so it is written with `writeBool`, not `write`.
+
+The writer emits `logicalType` for `DateTime` (naive millis) and `Arrow.Timestamp`. As
+pyarrow does, it adds the converted type only where it means the same thing: UTC millis
+or micros. pyarrow then reports the same converted and logical types as for its own files.
+
 ## Known Limitations
 
 - The first `write_parquet` call for each new table schema that contains a FixedSizeList (top-level, or nested in structs or lists) takes 5–20 s. The `ARROW:schema` entry is produced by Arrow.jl's generic writer, which Julia compiles per table type. Tables without a FixedSizeList skip that path, and later writes of the same schema in the same session are fast. Hand-building the schema message would avoid it; that was decided against for v0.2.0.
-- A written `DateTime` column is shown by pyarrow as `timestamp[ms, tz=UTC]`, not as a naive timestamp: the converted type TIMESTAMP_MILLIS means UTC-adjusted, and we do not write a `logicalType` that could say otherwise. The instants are unchanged. This holds with or without the `ARROW:schema` entry (checked 2026-10-03 with a FixedSizeList column present).
+- Parquet stores only a UTC flag for timestamps, not a time zone name. An `Arrow.Timestamp` with a named zone is written as UTC-adjusted and reads back as `:UTC`. pyarrow shows it as `tz=UTC` too, unless the file also has an `ARROW:schema` entry (i.e. a FixedSizeList is present), in which case pyarrow restores the zone name from there. The instants are the same either way.
 - `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
 - Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
-- `logicalType` annotations are not parsed, only `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both).
+- Of the `logicalType` union only the TIMESTAMP member is parsed; everything else still relies on `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both). INT96 timestamps and TIME are not converted.
 - A `FixedSizeList` is restored at top level and as a struct member (at any struct depth). Inside a list or a `List<Struct>` (e.g. `list<fixed_size_list>`, `list<struct<…fsl…>>`) it is read as a variable-length list and written back as one: values are correct, but the fixed size is lost.
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
 - LZ4 Hadoop framing (used by older Spark/Hadoop writers) is implemented but not tested end-to-end — only the standard LZ4 raw/frame format is covered by the test suite.

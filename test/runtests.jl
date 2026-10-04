@@ -1206,17 +1206,120 @@ print([None if v is None else v.isoformat() for v in t.column('ts').to_pylist()]
 print(t.column('ld').to_pylist(), t.column('s').to_pylist()[1])""")
             if result !== nothing
                 lines = split(result, '\n')
-                # Converted type TIMESTAMP_MILLIS means UTC-adjusted, so pyarrow shows tz=UTC
-                @test lines[1] == "date32[day] | timestamp[ms, tz=UTC] | list<element: date32[day]> | " *
-                                  "list<element: timestamp[ms, tz=UTC]> | struct<when: timestamp[ms, tz=UTC], day: date32[day]>"
+                # DateTime carries logicalType TIMESTAMP(isAdjustedToUTC=false), so pyarrow shows it naive
+                @test lines[1] == "date32[day] | timestamp[ms] | list<element: date32[day]> | " *
+                                  "list<element: timestamp[ms]> | struct<when: timestamp[ms], day: date32[day]>"
                 @test lines[2] == "[datetime.date(2024, 2, 29), None, datetime.date(1969, 12, 31)]"
-                @test lines[3] == "['2024-02-29T13:14:15.123000+00:00', '1969-12-31T23:59:59.999000+00:00', None]"
+                @test lines[3] == "['2024-02-29T13:14:15.123000', '1969-12-31T23:59:59.999000', None]"
                 @test lines[4] == "[[datetime.date(2020, 1, 1), None], [], [datetime.date(1970, 1, 1)]] None"
             else
                 @warn "Skipping pyarrow cross-check of dates: uv/pyarrow not available"
             end
         finally
             rm(f, force=true)
+        end
+    end
+
+    @testset "Timestamps via logicalType" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        TS{U, TZ} = Arrow.Timestamp{U, TZ}
+        MS, US, NS = Arrow.Meta.TimeUnit.MILLISECOND, Arrow.Meta.TimeUnit.MICROSECOND, Arrow.Meta.TimeUnit.NANOSECOND
+        src, out = wfile("test_ts_src.parquet"), wfile("test_ts_out.parquet")
+        pytable = """
+import pyarrow as pa, pyarrow.parquet as pq
+vals = {'ms': [1709212455123, None, -1, 4], 'us': [1709212455123456, None, -1, 4], 'ns': [1709212455123456789, None, -1, 4]}
+cols = {}
+for u in ('ms', 'us', 'ns'):
+    cols[u + '_naive'] = pa.array(vals[u], type=pa.timestamp(u))
+    cols[u + '_utc'] = pa.array(vals[u], type=pa.timestamp(u, tz='UTC'))
+cols['berlin'] = pa.array([1500, None, 3, 4], type=pa.timestamp('us', tz='Europe/Berlin'))
+cols['l'] = pa.array([[1500, None], None, [3], []], type=pa.list_(pa.timestamp('us')))
+cols['s'] = pa.array([{'t': 1500, 'n': 7}, None, {'t': None, 'n': 9}, {'t': 1, 'n': 2}],
+                     type=pa.struct([('t', pa.timestamp('ns', tz='UTC')), ('n', pa.timestamp('ms'))]))
+cols['los'] = pa.array([[{'t': 1500}], [], None, [{'t': 2}, {'t': 3}]], type=pa.list_(pa.struct([('t', pa.timestamp('us'))])))
+table = pa.table(cols)
+"""
+        # Single row group, then several: the element type must not depend on the chunk
+        for kwargs in ("{}", "{'row_group_size': 2}")
+            _with_pyarrow_file("timestamps ($kwargs)", "test_ts_src.parquet", pytable * "write_kwargs = $kwargs") do t
+                try
+                    # Mixed rule: naive milliseconds → DateTime, everything else → Arrow.Timestamp
+                    @test nonmissingtype(eltype(t.ms_naive)) == DateTime
+                    @test nonmissingtype(eltype(t.ms_utc))   == TS{MS, :UTC}
+                    @test nonmissingtype(eltype(t.us_naive)) == TS{US, nothing}
+                    @test nonmissingtype(eltype(t.us_utc))   == TS{US, :UTC}
+                    @test nonmissingtype(eltype(t.ns_naive)) == TS{NS, nothing}
+                    @test nonmissingtype(eltype(t.ns_utc))   == TS{NS, :UTC}
+                    @test nonmissingtype(eltype(t.berlin))   == TS{US, :UTC}
+
+                    # Sub-millisecond values survive exactly
+                    @test t.ms_naive[1] == DateTime(2024, 2, 29, 13, 14, 15, 123) && ismissing(t.ms_naive[2])
+                    @test t.us_naive[1].x == 1709212455123456 && t.us_utc[3].x == -1 && ismissing(t.us_naive[2])
+                    @test t.ns_utc[1].x == 1709212455123456789 && t.ns_naive[4].x == 4
+
+                    # Inside lists, structs and list<struct>
+                    @test t.l[1][1] == TS{US, nothing}(1500) && ismissing(t.l[1][2]) && ismissing(t.l[2])
+                    @test t.s[1].t == TS{NS, :UTC}(1500) && t.s[1].n == DateTime(1970, 1, 1, 0, 0, 0, 7) && ismissing(t.s[2])
+                    @test t.los[1][1].t == TS{US, nothing}(1500) && t.los.t[4] == [TS{US, nothing}(2), TS{US, nothing}(3)]
+
+                    # A read table writes back unchanged
+                    write_parquet(out, t)
+                    back = read_parquet(out)
+                    for k in Tables.columnnames(t)
+                        @test isequal(plain(Tables.getcolumn(back, k)), plain(Tables.getcolumn(t, k)))
+                    end
+                    @test all(k -> nonmissingtype(eltype(Tables.getcolumn(back, k))) == nonmissingtype(eltype(Tables.getcolumn(t, k))),
+                              (:ms_naive, :ms_utc, :us_naive, :us_utc, :ns_naive, :ns_utc, :berlin))
+
+                    # pyarrow sees the types and annotations it wrote itself. The one exception:
+                    # Parquet only has a UTC flag, so a named time zone comes back as UTC.
+                    result = _run_pyarrow("""
+import pyarrow.parquet as pq
+a, b = pq.read_table('$(src)'), pq.read_table('$(out)')
+print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).type], b.schema.field('berlin').type)
+print(all(a.column(n).cast(b.schema.field(n).type).combine_chunks().equals(b.column(n).combine_chunks()) for n in a.column_names))
+pa_, pb = pq.ParquetFile('$(src)').schema, pq.ParquetFile('$(out)').schema
+print(all(pa_.column(i).converted_type == pb.column(i).converted_type and str(pa_.column(i).logical_type) == str(pb.column(i).logical_type) for i in range(len(pa_.names))))""")
+                    lines = split(result, '\n')
+                    @test lines[1] == "['berlin'] timestamp[us, tz=UTC]"
+                    @test lines[2] == "True"
+                    @test lines[3] == "True"
+                finally
+                    rm(out, force=true)
+                end
+            end
+        end
+
+        # Columns built in Julia, including one next to a FixedSizeList (ARROW:schema is then written)
+        V = Parquet3.FixedSizeView{2, Int32}
+        tbl = (
+            dt     = [DateTime(2024, 2, 29, 13, 14, 15, 123), missing, DateTime(1969, 12, 31, 23, 59, 59, 999)],
+            us_utc = [TS{US, :UTC}(1709212455123456), missing, TS{US, :UTC}(-1)],
+            ns     = TS{NS, nothing}[TS{NS, nothing}(1), TS{NS, nothing}(2), TS{NS, nothing}(3)],
+            zoned  = [TS{MS, Symbol("Europe/Berlin")}(5), TS{MS, Symbol("Europe/Berlin")}(6), TS{MS, Symbol("Europe/Berlin")}(7)],
+        )
+        try
+            for (label, extra) in (("plain", (;)), ("with fsl", (f = [V(Int32[1, 2], 0), V(Int32[3, 4], 0), V(Int32[5, 6], 0)],)))
+                write_parquet(out, merge(tbl, extra))
+                t = read_parquet(out)
+                @test isequal(collect(t.dt), collect(tbl.dt)) && isequal(collect(t.us_utc), collect(tbl.us_utc))
+                @test collect(t.ns) == tbl.ns && [v.x for v in t.zoned] == [5, 6, 7]
+                @test nonmissingtype(eltype(t.zoned)) == TS{MS, :UTC}
+
+                result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(out)')
+print(' | '.join(str(t.schema.field(n).type) for n in ['dt', 'us_utc', 'ns', 'zoned']))
+print(t.column('us_utc').cast('int64').to_pylist(), t.column('ns').cast('int64').to_pylist(), t.column('dt').cast('int64').to_pylist())""")
+                lines = split(result, '\n')
+                @test lines[1] == (label == "plain" ? "timestamp[ms] | timestamp[us, tz=UTC] | timestamp[ns] | timestamp[ms, tz=UTC]" :
+                                                      "timestamp[ms] | timestamp[us, tz=UTC] | timestamp[ns] | timestamp[ms, tz=Europe/Berlin]")
+                @test lines[2] == "[1709212455123456, None, -1] [1, 2, 3] [1709212455123, None, -1]"
+            end
+            # Parquet has no second-resolution timestamps
+            @test_throws Exception write_parquet(out, (s = [TS{Arrow.Meta.TimeUnit.SECOND, nothing}(1)],))
+        finally
+            rm(out, force=true)
         end
     end
 

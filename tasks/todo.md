@@ -27,9 +27,19 @@ Nested writing is driven by element type, so reader outputs round-trip:
       pyarrow confirms equal values and, except FSL, equal types)
 - [x] Int8/Int16 and UInt8/16/32/64 writing (DONE, awaiting review): INT32/INT64 plus
       converted type; pyarrow restores the exact types.
-- [x] Date/DateTime writing (DONE, awaiting review; pulled into v0.2.0 on 2026-10-03 at the
-      planning session's request): INT32 + DATE, INT64 + TIMESTAMP_MILLIS; converted type
-      only, `logicalType` still deferred to v0.3.
+- [x] Date/DateTime writing (DONE, awaiting review).
+- [x] Timestamps through `logicalType` (DONE, awaiting review; decided for v0.2.0 on
+      2026-10-03 via the planning session). Read: naive ms → `DateTime`, everything else →
+      `Arrow.Timestamp{U,TZ}`; converted-type-only files read as UTC. Write: `DateTime` →
+      naive TIMESTAMP(MILLIS); `Arrow.Timestamp` keeps unit and UTC flag. Only the TIMESTAMP
+      member of the union is parsed/written.
+- [x] Reader fix found by the timestamp tests: `list<struct>` across row groups with a null
+      list in only some of them gave mismatched chunk types (`col.field` threw). List
+      nullability no longer trusts member `null_count` (pyarrow excludes null lists there).
+- [ ] Not done, found 2026-10-03: our `null_count` for a leaf under list→struct counts null
+      and empty lists; pyarrow's does not (it does for a leaf directly under a list). Values
+      are unaffected; our own list<struct> files read back with looser `Union{Missing,…}`
+      element types than pyarrow's.
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
 
 - [x] N1.5 (DONE, awaiting review: `_arrow_schema_kv`; our reader and pyarrow both restore
@@ -58,7 +68,7 @@ Nested writing is driven by element type, so reader outputs round-trip:
 Deferred (edge case, decided 2026-10-03): infer struct member types from rows when the
 `NamedTuple` eltype is not concrete (`[(a = missing,), (a = 2,)]`); currently a clear error.
 
-## Deferred to v0.3 — multi-RG, min/max stats, `logicalType` writing
+## Deferred to v0.3 — multi-RG, min/max stats, other logical types (LIST-only annotation, TIME, INT96)
 
 ## Arrow.write of nested columns (do with writer work)
 - [ ] `Arrow.write` does not see `NestedColumn` (StructColumn / ListOfStructsColumn) as an

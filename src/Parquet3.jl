@@ -11,7 +11,7 @@ using Thrift: TCompactProtocol, TMemoryTransport, TType,
     readStructBegin, readStructEnd, readFieldBegin, readFieldEnd,
     readListBegin, readListEnd, skip,
     writeStructBegin, writeStructEnd, writeFieldBegin, writeFieldEnd,
-    writeFieldStop, writeListBegin, writeListEnd
+    writeFieldStop, writeListBegin, writeListEnd, writeBool
 
 @define_integers 96
 

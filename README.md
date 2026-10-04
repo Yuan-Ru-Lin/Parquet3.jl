@@ -87,7 +87,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, single row group, null-count statistics). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, single row group, null-count statistics). `DateTime` is written as a naive millisecond timestamp and `Arrow.Timestamp{unit, tz}` with its unit and UTC flag, so timestamp columns from `read_parquet` write back unchanged (a named time zone becomes UTC, since Parquet only stores a UTC flag). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
 
 ### Encodings
 
@@ -113,7 +113,17 @@ Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Bin
 
 ### Logical Types
 
-ConvertedType annotations are respected: UTF8, Date, Timestamp (millis/micros), Int8/16/32/64, UInt8/16/32/64.
+ConvertedType annotations are respected: UTF8, Date, Int8/16/32/64, UInt8/16/32/64.
+
+Timestamps are read from `logicalType` (falling back to the converted type) and returned in the most convenient type that loses nothing:
+
+| Parquet timestamp | Returned as |
+|---|---|
+| milliseconds, not UTC-adjusted (naive) | `DateTime` |
+| milliseconds, UTC-adjusted | `Arrow.Timestamp{MILLISECOND, :UTC}` |
+| microseconds or nanoseconds | `Arrow.Timestamp{unit, tz}` with `tz` `:UTC` or `nothing` |
+
+`Arrow.Timestamp` wraps the stored `Int64` (`ts.x`), so microsecond and nanosecond values are exact. A file with only the older converted type (TIMESTAMP_MILLIS / TIMESTAMP_MICROS) is UTC-adjusted by definition and reads as `Arrow.Timestamp{…, :UTC}`. The same rule applies inside lists, structs and lists of structs.
 
 ## Developer Notes
 
