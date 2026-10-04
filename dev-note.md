@@ -160,6 +160,12 @@ an INT32 column is truncated to 32 bits at the end. Before E2 the decoder unpack
 UInt32 and converted with range checks, so it dropped pyarrow's INT32 columns with
 wrap-around deltas and INT64 columns with deltas wider than 32 bits.
 
+DELTA_LENGTH_BYTE_ARRAY (strings and bytes) is the lengths, delta-packed as INT32, followed
+by the values' bytes back to back; it reuses the delta encoder.
+
+Not written: dictionary encoding (on hold; `:dictionary` is not an accepted name), and
+DELTA_BYTE_ARRAY, which the reader does not decode either.
+
 ## Timestamp Design
 
 Julia's `DateTime` holds milliseconds and no zone, so it is exact only for a naive

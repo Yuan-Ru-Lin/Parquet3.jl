@@ -82,7 +82,7 @@ Goal: write every value encoding the reader decodes. One step at a time, each re
       Date, DateTime and Arrow.Timestamp fell out via `physical_ints`. Also fixed the decoder:
       it dropped pyarrow INT32 columns with wrap-around deltas and INT64 columns with deltas
       wider than 32 bits, and failed on zero values and on zigzag values beyond ±2^62.
-- [ ] E3 — DELTA_LENGTH_BYTE_ARRAY for strings and bytes (reuses E2 for lengths)
+- [x] E3 — DELTA_LENGTH_BYTE_ARRAY for strings and bytes; reuses E2 for lengths (DONE, awaiting review)
 - E4 — Dictionary (RLE_DICTIONARY): ON HOLD, v0.2.0 or v0.3 undecided (2026-10-04). `:dictionary`
       is not an accepted `encoding` name, and the bit-packed run encoder is not written.
       Would need: dictionary page, index page, `dictionary_page_offset`, bit-packed runs in

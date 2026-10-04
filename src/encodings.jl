@@ -419,6 +419,19 @@ function decode_delta_length_byte_array(data::AbstractVector{UInt8}, count::Int)
     VectorOfVectors(@view(data[pos : pos + total - 1]), elem_ptr)
 end
 
+"""
+    encode_delta_length_byte_array(values) -> Vector{UInt8}
+
+DELTA_LENGTH_BYTE_ARRAY (inverse of decode_delta_length_byte_array): all lengths,
+DELTA_BINARY_PACKED as INT32, followed by the values' bytes back to back.
+"""
+function encode_delta_length_byte_array(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})
+    out = IOBuffer()
+    write(out, encode_delta_binary_packed(Int32[sizeof(v) for v in values]))
+    foreach(v -> write(out, v), values)
+    take!(out)
+end
+
 #=============================================================================
 # Byte Stream Split Encoding
 =============================================================================#

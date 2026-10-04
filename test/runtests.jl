@@ -1492,6 +1492,75 @@ print(t.column('hits').to_pylist()[:4], t.column('wf').to_pylist()[1], t.column(
         end
     end
 
+    @testset "Encodings: DELTA_LENGTH_BYTE_ARRAY (E3)" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+
+        # encoder is the inverse of the decoder
+        for vals in (String[], ["a"], ["", "héllo", "", "x"^300, "z"], ["s$i" for i in 1:200])
+            enc = Parquet3.encode_delta_length_byte_array(vals)
+            @test [String(copy(v)) for v in Parquet3.decode_delta_length_byte_array(enc, length(vals))] == vals
+        end
+        bytes = [UInt8[1, 2], UInt8[], UInt8[0xff]]
+        @test [Vector{UInt8}(v) for v in Parquet3.decode_delta_length_byte_array(
+                   Parquet3.encode_delta_length_byte_array(bytes), 3)] == bytes
+
+        n = 300
+        tbl = (
+            id    = collect(1:n),
+            name  = ["event-$(i % 13)" for i in 1:n],
+            oname = [i % 5 == 0 ? missing : "é"^(i % 4) for i in 1:n],
+            blob  = [UInt8[j % 256 for j in 1:(i % 6)] for i in 1:n],
+            tags  = [["t$j" for j in 1:(i % 3)] for i in 1:n],
+            wf    = [(label = "wf$i", t0 = 0.5 * i) for i in 1:n],
+        )
+        strs = ["name", "oname", "blob", "tags.list.element", "wf.label"]
+        f = wfile("test_e3_dlba.parquet")
+        encodings_of(path) = (pf = open_parquet(path);
+            r = Dict(join(c.meta_data.path_in_schema, ".") => c.meta_data.encodings for c in pf.metadata.row_groups[1].columns);
+            close(pf); r)
+        DLBA = Parquet3.DELTA_LENGTH_BYTE_ARRAY
+        try
+            for codec in (:uncompressed, :gzip)
+                write_parquet(f, tbl; encoding = :delta_length_byte_array, compression = codec)
+                t = read_parquet(f)
+                @test all(k -> isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k])), keys(tbl))
+                e = encodings_of(f)
+                @test all(k -> DLBA in e[k], strs) && all(k -> !(DLBA in e[k]), ["id", "wf.t0"])
+            end
+
+            # All three encodings in one file, checked by pyarrow
+            write_parquet(f, tbl; encoding = Dict("name" => :delta_length_byte_array, "blob" => :delta_length_byte_array,
+                                                  "tags" => :delta_length_byte_array, "wf.label" => :delta_length_byte_array,
+                                                  "wf.t0" => :byte_stream_split, "id" => :delta_binary_packed))
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('$(f)')
+rg = pf.metadata.row_group(0)
+print(sorted(rg.column(i).path_in_schema for i in range(rg.num_columns) if 'DELTA_LENGTH_BYTE_ARRAY' in rg.column(i).encodings))
+t = pf.read()
+print(t.column('name').to_pylist()[:3], t.column('oname').to_pylist()[3:6], t.column('blob').to_pylist()[:3])
+print(t.column('tags').to_pylist()[:3], t.column('wf').to_pylist()[0], t.column('id').to_pylist()[-1])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "['blob', 'name', 'tags.list.element', 'wf.label']"
+                @test lines[2] == "['event-1', 'event-2', 'event-3'] ['', None, 'éé'] [b'\\x01', b'\\x01\\x02', b'\\x01\\x02\\x03']"
+                @test lines[3] == "[['t1'], ['t1', 't2'], []] {'label': 'wf1', 't0': 0.5} $(n)"
+            else
+                @warn "Skipping pyarrow cross-check of DELTA_LENGTH_BYTE_ARRAY: uv/pyarrow not available"
+            end
+
+            write_parquet(f, (s = String[], o = Union{Missing, String}[]); encoding = :delta_length_byte_array)
+            @test length(read_parquet(f).s) == 0
+            write_parquet(f, (o = Union{Missing, String}[missing, missing],); encoding = :delta_length_byte_array)
+            @test all(ismissing, read_parquet(f).o)
+            @test_throws "not valid for column id" write_parquet(f, tbl; encoding = Dict("id" => :delta_length_byte_array))
+            # Dictionary encoding is on hold, so its name is not accepted
+            @test_throws "unknown encoding" write_parquet(f, tbl; encoding = :dictionary)
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

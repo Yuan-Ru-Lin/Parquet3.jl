@@ -58,7 +58,8 @@ _is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple
 
 # Value encodings the writer can produce, by the lower-case Parquet name
 const WRITER_ENCODINGS = Dict(:plain => PLAIN, :byte_stream_split => BYTE_STREAM_SPLIT,
-                              :delta_binary_packed => DELTA_BINARY_PACKED)
+                              :delta_binary_packed => DELTA_BINARY_PACKED,
+                              :delta_length_byte_array => DELTA_LENGTH_BYTE_ARRAY)
 
 _encoding_name(enc::Encoding) = Symbol(lowercase(string(enc)))
 
@@ -70,12 +71,14 @@ end
 _encoding_supports(enc::Encoding, leaf) =
     enc == PLAIN ||
     (enc == BYTE_STREAM_SPLIT && leaf.ptype in (FLOAT, DOUBLE)) ||
-    (enc == DELTA_BINARY_PACKED && leaf.ptype in (INT32, INT64))
+    (enc == DELTA_BINARY_PACKED && leaf.ptype in (INT32, INT64)) ||
+    (enc == DELTA_LENGTH_BYTE_ARRAY && leaf.ptype == BYTE_ARRAY)
 
 """Encode a leaf's non-null values (inverse of `decode_values`)."""
 _encode_values(values, enc::Encoding) =
     enc == BYTE_STREAM_SPLIT ? encode_byte_stream_split(values) :
     enc == DELTA_BINARY_PACKED ? encode_delta_binary_packed(physical_ints(values)) :
+    enc == DELTA_LENGTH_BYTE_ARRAY ? encode_delta_length_byte_array(values) :
     encode_plain(values)
 
 # A key names a leaf, or a struct/list above it
@@ -230,7 +233,8 @@ or `:uncompressed`; a string is accepted too.
 
 `encoding` selects the value encoding: `:plain` (default), `:byte_stream_split`
 (Float32/Float64), or `:delta_binary_packed` (every type stored as an integer: all
-signed and unsigned integers, Date, DateTime, Arrow.Timestamp). A single name applies to the whole table, falling back to PLAIN for
+signed and unsigned integers, Date, DateTime, Arrow.Timestamp), or
+`:delta_length_byte_array` (String, Vector{UInt8}). A single name applies to the whole table, falling back to PLAIN for
 columns whose type does not allow it. A `Dict` sets it per column, keyed by the path
 used to reach the data, e.g. `Dict("x" => :byte_stream_split, "wf.values" => :plain)`;
 a key naming a struct or list covers everything under it. In a `Dict`, an encoding
