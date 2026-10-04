@@ -335,7 +335,7 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
                              row_groups = [rg], created_by = CREATED_BY,
                              key_value_metadata = _arrow_schema_kv(names, vectors))
 
-        footer = serialize_thrift(fmeta, FILE_METADATA_W)
+        footer = serialize_thrift(fmeta, FILE_METADATA_FIELDS)
         write(io, footer)
         write(io, htol(UInt32(length(footer))))
         write(io, PARQUET_MAGIC)
@@ -369,6 +369,6 @@ function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
             num_values = Int32(length(leaf.def)), encoding = enc,
             definition_level_encoding = RLE, repetition_level_encoding = RLE))
 
-    header_bytes = serialize_thrift(header, PAGE_HEADER_W)
+    header_bytes = serialize_thrift(header, PAGE_HEADER_FIELDS)
     (vcat(header_bytes, compressed), length(header_bytes) + length(data))
 end
