@@ -104,34 +104,35 @@ end
 
 Unpack `count` bit-packed values directly into `result` starting at `result[offset]`.
 """
-function unpack_bits!(result::Vector{UInt32}, offset::Int, data::AbstractVector{UInt8}, count::Int, bit_width::Int)
-    bit_width == 0 && (fill!(@view(result[offset:offset+count-1]), UInt32(0)); return)
+function unpack_bits!(result::Vector{U}, offset::Int, data::AbstractVector{UInt8}, count::Int, bit_width::Int) where {U <: Union{UInt32, UInt64}}
+    bit_width == 0 && (fill!(@view(result[offset:offset+count-1]), zero(U)); return)
     _unpack_bits_into!(result, offset, data, count, bit_width)
     nothing
 end
 
 """
 Inner loop shared by unpack_bits and unpack_bits!.
-Uses a UInt64 accumulator to extract values with shift+mask
-instead of byte-at-a-time inner loop.
+Uses an accumulator twice as wide as the values to extract them with shift+mask
+instead of a byte-at-a-time inner loop (UInt64 for levels and indices, UInt128
+for delta values, whose bit width can reach 64).
 """
-function _unpack_bits_into!(result::Vector{UInt32}, offset::Int, data::AbstractVector{UInt8}, count::Int, bit_width::Int)
-    mask = (UInt64(1) << bit_width) - 1
+function _unpack_bits_into!(result::Vector{U}, offset::Int, data::AbstractVector{UInt8}, count::Int, bit_width::Int) where {U <: Union{UInt32, UInt64}}
+    A = widen(U)
+    mask = (A(1) << bit_width) - A(1)
     data_len = length(data)
-    # Accumulator: holds up to 64 bits of loaded data
-    accum = UInt64(0)
+    accum = A(0)
     bits_in_accum = 0
     byte_pos = 1  # next byte to load from data
 
     @inbounds for i in 0:count-1
         # Ensure accumulator has enough bits
         while bits_in_accum < bit_width && byte_pos <= data_len
-            accum |= UInt64(data[byte_pos]) << bits_in_accum
+            accum |= A(data[byte_pos]) << bits_in_accum
             bits_in_accum += 8
             byte_pos += 1
         end
 
-        result[offset + i] = UInt32(accum & mask)
+        result[offset + i] = (accum & mask) % U
         accum >>= bit_width
         bits_in_accum -= bit_width
     end
@@ -264,8 +265,8 @@ end
 """Read a zigzag-encoded varint from `data` starting at `pos`, return (value, new_pos)."""
 function _read_zigzag(data::AbstractVector{UInt8}, pos::Int)
     n, pos = _read_varint(data, pos)
-    signed_n = reinterpret(Int64, n)
-    ((signed_n >> 1) ⊻ (-(signed_n & 1)), pos)
+    # Logical shift on the unsigned value, so the full Int64 range decodes
+    (reinterpret(Int64, (n >> 1) ⊻ -(n & 0x01)), pos)
 end
 
 """
@@ -273,6 +274,9 @@ end
 
 Decode delta binary packed encoding. Returns the decoded values and the
 byte position after the last consumed byte (for use by delta_length_byte_array).
+
+Deltas are added with wrap-around, as the encoding defines them; for an INT32 column
+the caller truncates the result to 32 bits, which completes the 32-bit wrap-around.
 """
 function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
     pos = 1
@@ -286,11 +290,12 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
     values_per_miniblock = block_size ÷ miniblocks_per_block
 
     result = Vector{Int64}(undef, min(count, total_value_count))
+    isempty(result) && return (result, pos)
     result[1] = first_value
     value_index = 2
 
     # Reusable buffer for unpacked deltas (avoids allocation per miniblock)
-    delta_buf = Vector{UInt32}(undef, values_per_miniblock)
+    delta_buf = Vector{UInt64}(undef, values_per_miniblock)
 
     # Decode blocks
     while value_index <= length(result) && pos <= length(data)
@@ -323,7 +328,7 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
                 unpack_bits!(delta_buf, 1, packed_data, values_per_miniblock, bit_width)
                 @inbounds for i in 1:values_to_read
                     value_index > length(result) && break
-                    delta = Int64(delta_buf[i]) + min_delta
+                    delta = (delta_buf[i] % Int64) + min_delta
                     result[value_index] = result[value_index - 1] + delta
                     value_index += 1
                 end
@@ -332,6 +337,61 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
     end
 
     (result, pos)
+end
+
+"""ZigZag varint (inverse of _read_zigzag)."""
+_write_zigzag(io::IO, v::Integer) = (x = Int64(v); _write_varint(io, reinterpret(UInt64, (x << 1) ⊻ (x >> 63))))
+
+"""
+Bit-pack `values` LSB-first at `bit_width` bits each (inverse of unpack_bits!),
+zero-padded to `count` values.
+"""
+function pack_bits(values::AbstractVector{<:Unsigned}, bit_width::Int, count::Int = length(values))
+    out = zeros(UInt8, cld(count * bit_width, 8))
+    accum, bits_in_accum, byte_pos = UInt128(0), 0, 1
+    @inbounds for v in values
+        accum |= UInt128(v) << bits_in_accum
+        bits_in_accum += bit_width
+        while bits_in_accum >= 8
+            out[byte_pos] = accum % UInt8
+            byte_pos += 1
+            accum >>= 8
+            bits_in_accum -= 8
+        end
+    end
+    bits_in_accum > 0 && (out[byte_pos] = accum % UInt8)
+    out
+end
+
+"""
+    encode_delta_binary_packed(values::Vector{<:Union{Int32, Int64}}) -> Vector{UInt8}
+
+DELTA_BINARY_PACKED (inverse of decode_delta_binary_packed): a header with the first
+value, then blocks of 128 deltas. Each block stores its minimum delta, and each of its
+4 miniblocks of 32 stores `delta - min_delta` bit-packed at the width of its largest
+value. Deltas wrap around in the values' own integer width, so they always fit in it.
+"""
+function encode_delta_binary_packed(values::Vector{T}) where {T <: Union{Int32, Int64}}
+    block_size, miniblocks = 128, 4
+    miniblock_size = block_size ÷ miniblocks
+    out = IOBuffer()
+    foreach(v -> _write_varint(out, UInt64(v)), (block_size, miniblocks, length(values)))
+    _write_zigzag(out, isempty(values) ? 0 : first(values))
+
+    deltas = T[values[i] - values[i - 1] for i in 2:length(values)]
+    for block in Iterators.partition(deltas, block_size)
+        min_delta = minimum(block)
+        _write_zigzag(out, min_delta)
+        packed = map(Iterators.partition(block, miniblock_size)) do miniblock
+            relative = [(d - min_delta) % unsigned(T) for d in miniblock]
+            bit_width = 8 * sizeof(T) - leading_zeros(maximum(relative))
+            (bit_width, pack_bits(relative, bit_width, miniblock_size))
+        end
+        # Bit widths of unused miniblocks in the last block are written as zero, with no data
+        write(out, UInt8[i <= length(packed) ? first(packed[i]) : 0 for i in 1:miniblocks])
+        foreach(p -> write(out, last(p)), packed)
+    end
+    take!(out)
 end
 
 #=============================================================================
@@ -402,17 +462,21 @@ end
 encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
     collect(reinterpret(UInt8, values))
 
-"""PLAIN-encode narrow/unsigned integers in their physical type, INT32 or INT64 (bit-preserving)."""
-encode_plain(values::Vector{T}) where {T <: Union{Int8, Int16, UInt8, UInt16, UInt32}} =
-    encode_plain(values .% Int32)
-encode_plain(values::Vector{UInt64}) = encode_plain(values .% Int64)
+"""
+Integer-like values as stored in their physical Parquet type, INT32 or INT64: narrow and
+unsigned integers bit-preserved, dates as days and datetimes as milliseconds since the
+Unix epoch, Arrow timestamps as their count of units.
+"""
+physical_ints(values::Vector{<:Union{Int32, Int64}}) = values
+physical_ints(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32}}) = values .% Int32
+physical_ints(values::Vector{UInt64}) = values .% Int64
+physical_ints(values::Vector{Date}) = Int32[Dates.value(v - Date(1970, 1, 1)) for v in values]
+physical_ints(values::Vector{DateTime}) = Int64[Dates.value(v - DateTime(1970, 1, 1)) for v in values]
+physical_ints(values::Vector{<:Arrow.Timestamp}) = Int64[v.x for v in values]
 
-"""PLAIN-encode dates as INT32 days and datetimes as INT64 milliseconds since the Unix epoch."""
-encode_plain(values::Vector{Date}) = encode_plain(Int32[Dates.value(v - Date(1970, 1, 1)) for v in values])
-encode_plain(values::Vector{DateTime}) = encode_plain(Int64[Dates.value(v - DateTime(1970, 1, 1)) for v in values])
-
-"""PLAIN-encode Arrow timestamps as their INT64 count of units since the Unix epoch."""
-encode_plain(values::Vector{<:Arrow.Timestamp}) = encode_plain(Int64[v.x for v in values])
+"""PLAIN-encode integer-like values through their physical type (see `physical_ints`)."""
+encode_plain(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32, UInt64, Date, DateTime, Arrow.Timestamp}}) =
+    encode_plain(physical_ints(values))
 
 """
 BYTE_STREAM_SPLIT-encode floats (inverse of decode_byte_stream_split_float32/float64):

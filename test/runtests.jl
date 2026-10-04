@@ -1395,6 +1395,103 @@ print(t.column('x').to_pylist()[:3], t.column('hits').to_pylist()[:4], t.column(
         end
     end
 
+    @testset "Encodings: DELTA_BINARY_PACKED (E2)" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+
+        # encoder is the inverse of the decoder, including wrap-around deltas and block boundaries
+        for T in (Int32, Int64), vals in (T[], T[7], T[1, 2, 3], fill(T(5), 129), T.(1:257), T.(cumsum(rand(-3:3, 300))),
+                                          T[typemin(T), typemax(T), 0, -1, typemax(T), typemin(T)], rand(T, 1000))
+            enc = Parquet3.encode_delta_binary_packed(vals)
+            dec, pos = Parquet3.decode_delta_binary_packed(enc, length(vals))
+            @test (T == Int32 ? dec .% Int32 : dec) == vals
+            @test isempty(vals) || pos == length(enc) + 1
+        end
+        @test length(Parquet3.encode_delta_binary_packed(collect(1:1000))) < 100
+        for w in (1, 7, 8, 13, 32, 33, 64), n in (1, 32)
+            vals = rand(UInt64, n) .>> (64 - w)
+            out = Vector{UInt64}(undef, n)
+            Parquet3.unpack_bits!(out, 1, Parquet3.pack_bits(vals, w), n, w)
+            @test out == vals
+        end
+
+        # The reader used to drop these pyarrow columns: 32-bit wrap-around and deltas wider than 32 bits
+        _with_pyarrow_file("pyarrow delta extremes", "test_e2_py.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+table = pa.table({
+    'i32': pa.array([-2**31, 2**31 - 1, 0, None, -5, 2**31 - 1, -2**31], type=pa.int32()),
+    'i64': pa.array([-2**63, 2**63 - 1, 0, None, 10**15, -10**15, 7], type=pa.int64()),
+})
+write_kwargs = {'use_dictionary': False, 'column_encoding': 'DELTA_BINARY_PACKED'}""") do t
+            @test isequal(collect(t.i32), [typemin(Int32), typemax(Int32), 0, missing, -5, typemax(Int32), typemin(Int32)])
+            @test isequal(collect(t.i64), [typemin(Int64), typemax(Int64), 0, missing, 10^15, -10^15, 7])
+        end
+
+        n = 400
+        TS = Arrow.Timestamp{Arrow.Meta.TimeUnit.MICROSECOND, :UTC}
+        tbl = (
+            id   = collect(1:n),
+            i32  = Int32[isodd(i) ? typemin(Int32) + i : typemax(Int32) - i for i in 1:n],
+            oi   = [i % 7 == 0 ? missing : i^2 for i in 1:n],
+            i8   = Int8[i % 100 for i in 1:n],
+            u32  = UInt32[typemax(UInt32) - i for i in 1:n],
+            u64  = UInt64[typemax(UInt64) - UInt64(i) for i in 1:n],
+            day  = [Date(2024, 1, 1) + Day(i) for i in 1:n],
+            dt   = [DateTime(2024, 1, 1) + Second(i) for i in 1:n],
+            ts   = [TS(1_700_000_000_000_000 + 250i) for i in 1:n],
+            x    = [0.5 * i for i in 1:n],
+            name = ["n$i" for i in 1:n],
+            hits = [Int32[j for j in 1:(i % 4)] for i in 1:n],
+            wf   = [(t0 = 0.1 * i, n = Int32(i)) for i in 1:n],
+        )
+        ints = ["id", "i32", "oi", "i8", "u32", "u64", "day", "dt", "ts", "hits.list.element", "wf.n"]
+        f = wfile("test_e2_delta.parquet")
+        encodings_of(path) = (pf = open_parquet(path);
+            r = Dict(join(c.meta_data.path_in_schema, ".") => c.meta_data.encodings for c in pf.metadata.row_groups[1].columns);
+            close(pf); r)
+        DBP = Parquet3.DELTA_BINARY_PACKED
+        try
+            # Whole table: every integer-backed leaf (narrow, unsigned, dates, timestamps) uses it
+            for codec in (:uncompressed, :snappy)
+                write_parquet(f, tbl; encoding = :delta_binary_packed, compression = codec)
+                t = read_parquet(f)
+                @test all(k -> isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k])), keys(tbl))
+                e = encodings_of(f)
+                @test all(k -> DBP in e[k], ints) && all(k -> !(DBP in e[k]), ["x", "name", "wf.t0"])
+            end
+            plain_size = (write_parquet(f, (id = tbl.id,); compression = :uncompressed); filesize(f))
+            @test (write_parquet(f, (id = tbl.id,); compression = :uncompressed, encoding = :delta_binary_packed); filesize(f)) < plain_size ÷ 10
+
+            # Mixed per-column encodings, checked by pyarrow
+            write_parquet(f, tbl; encoding = Dict("id" => :delta_binary_packed, "i32" => :delta_binary_packed, "u64" => :delta_binary_packed,
+                                                  "ts" => :delta_binary_packed, "hits" => :delta_binary_packed, "wf.n" => :delta_binary_packed,
+                                                  "x" => :byte_stream_split))
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('$(f)')
+rg = pf.metadata.row_group(0)
+print(sorted(rg.column(i).path_in_schema for i in range(rg.num_columns) if 'DELTA_BINARY_PACKED' in rg.column(i).encodings))
+t = pf.read()
+print(t.column('id').to_pylist() == list(range(1, $(n) + 1)), t.column('i32').to_pylist()[:2], t.column('u64').to_pylist()[0], t.column('ts').cast('int64').to_pylist()[0])
+print(t.column('hits').to_pylist()[:4], t.column('wf').to_pylist()[1], t.column('oi').to_pylist()[5:8], str(t.column('day')[0]), t.column('i8').to_pylist()[-1])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "['hits.list.element', 'i32', 'id', 'ts', 'u64', 'wf.n']"
+                @test lines[2] == "True [-2147483647, 2147483645] 18446744073709551614 1700000000000250"
+                @test lines[3] == "[[1], [1, 2], [1, 2, 3], []] {'t0': 0.2, 'n': 2} [36, None, 64] 2024-01-02 0"
+            else
+                @warn "Skipping pyarrow cross-check of DELTA_BINARY_PACKED: uv/pyarrow not available"
+            end
+
+            write_parquet(f, (a = Int64[], b = Union{Missing, Int32}[]); encoding = :delta_binary_packed)
+            @test length(read_parquet(f).a) == 0
+            write_parquet(f, (b = Union{Missing, Int32}[missing, missing],); encoding = :delta_binary_packed)
+            @test all(ismissing, read_parquet(f).b)
+            @test_throws "not valid for column x" write_parquet(f, tbl; encoding = Dict("x" => :delta_binary_packed))
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

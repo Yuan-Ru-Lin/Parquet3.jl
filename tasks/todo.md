@@ -78,10 +78,15 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
 Goal: write every value encoding the reader decodes. One step at a time, each reported for approval.
 - [x] E1 — BYTE_STREAM_SPLIT for Float32/Float64, the `encoding` keyword (one name for the
       whole table, or a `Dict` keyed by user path), and path resolution (DONE, awaiting review)
-- [ ] E2 — DELTA_BINARY_PACKED for Int32/Int64 (and narrow/unsigned ints and timestamps if it falls out)
+- [x] E2 — DELTA_BINARY_PACKED for Int32/Int64 (DONE, awaiting review). Narrow/unsigned ints,
+      Date, DateTime and Arrow.Timestamp fell out via `physical_ints`. Also fixed the decoder:
+      it dropped pyarrow INT32 columns with wrap-around deltas and INT64 columns with deltas
+      wider than 32 bits, and failed on zero values and on zigzag values beyond ±2^62.
 - [ ] E3 — DELTA_LENGTH_BYTE_ARRAY for strings and bytes (reuses E2 for lengths)
-- [ ] E4 — Dictionary (RLE_DICTIONARY): dictionary page, index page, `dictionary_page_offset`,
-      bit-packed runs in `encode_rle_bitpacked`; no size-based fallback (record as limitation)
+- E4 — Dictionary (RLE_DICTIONARY): ON HOLD, v0.2.0 or v0.3 undecided (2026-10-04). `:dictionary`
+      is not an accepted `encoding` name, and the bit-packed run encoder is not written.
+      Would need: dictionary page, index page, `dictionary_page_offset`, bit-packed runs in
+      `encode_rle_bitpacked`; no size-based fallback (record as limitation)
 Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, multiple pages.
 
 ## Deferred to v0.3 — multi-RG, min/max stats, other logical types (LIST-only annotation, TIME, INT96)

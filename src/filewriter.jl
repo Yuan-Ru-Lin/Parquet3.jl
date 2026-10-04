@@ -57,7 +57,8 @@ _is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && T !==
 _is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple
 
 # Value encodings the writer can produce, by the lower-case Parquet name
-const WRITER_ENCODINGS = Dict(:plain => PLAIN, :byte_stream_split => BYTE_STREAM_SPLIT)
+const WRITER_ENCODINGS = Dict(:plain => PLAIN, :byte_stream_split => BYTE_STREAM_SPLIT,
+                              :delta_binary_packed => DELTA_BINARY_PACKED)
 
 _encoding_name(enc::Encoding) = Symbol(lowercase(string(enc)))
 
@@ -67,11 +68,15 @@ end
 
 """Whether value encoding `enc` can be used for `leaf`'s physical type."""
 _encoding_supports(enc::Encoding, leaf) =
-    enc == PLAIN || (enc == BYTE_STREAM_SPLIT && leaf.ptype in (FLOAT, DOUBLE))
+    enc == PLAIN ||
+    (enc == BYTE_STREAM_SPLIT && leaf.ptype in (FLOAT, DOUBLE)) ||
+    (enc == DELTA_BINARY_PACKED && leaf.ptype in (INT32, INT64))
 
 """Encode a leaf's non-null values (inverse of `decode_values`)."""
 _encode_values(values, enc::Encoding) =
-    enc == BYTE_STREAM_SPLIT ? encode_byte_stream_split(values) : encode_plain(values)
+    enc == BYTE_STREAM_SPLIT ? encode_byte_stream_split(values) :
+    enc == DELTA_BINARY_PACKED ? encode_delta_binary_packed(physical_ints(values)) :
+    encode_plain(values)
 
 # A key names a leaf, or a struct/list above it
 _key_covers(key::String, leaf_key::String) = leaf_key == key || startswith(leaf_key, key * ".")
@@ -223,8 +228,9 @@ is `nothing`, so a timestamp column from `read_parquet` writes back unchanged.
 `compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:brotli`, `:zstd`, `:lz4`,
 or `:uncompressed`; a string is accepted too.
 
-`encoding` selects the value encoding: `:plain` (default) or `:byte_stream_split`
-(Float32/Float64). A single name applies to the whole table, falling back to PLAIN for
+`encoding` selects the value encoding: `:plain` (default), `:byte_stream_split`
+(Float32/Float64), or `:delta_binary_packed` (every type stored as an integer: all
+signed and unsigned integers, Date, DateTime, Arrow.Timestamp). A single name applies to the whole table, falling back to PLAIN for
 columns whose type does not allow it. A `Dict` sets it per column, keyed by the path
 used to reach the data, e.g. `Dict("x" => :byte_stream_split, "wf.values" => :plain)`;
 a key naming a struct or list covers everything under it. In a `Dict`, an encoding

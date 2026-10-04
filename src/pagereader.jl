@@ -52,7 +52,8 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
         decode_dictionary(dict, data, count)
     elseif encoding == DELTA_BINARY_PACKED
         vals, _ = decode_delta_binary_packed(data, count)
-        ptype == INT32 ? Int32.(vals) : vals
+        # Truncating, not checked: INT32 deltas wrap around in 32 bits
+        ptype == INT32 ? vals .% Int32 : vals
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
         decode_delta_length_byte_array(data, count)
     elseif encoding == BYTE_STREAM_SPLIT

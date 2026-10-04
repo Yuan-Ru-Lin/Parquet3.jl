@@ -148,7 +148,17 @@ are planned before the file is opened, so these errors leave no partial file. Th
 header's `encoding` and the column metadata's `encodings` state what was written.
 
 Implemented: PLAIN, BYTE_STREAM_SPLIT (Float32/Float64: the K bytes of each value are the
-columns of a K×n matrix, and the encoding is its rows laid end to end).
+columns of a K×n matrix, and the encoding is its rows laid end to end), and
+DELTA_BINARY_PACKED for every leaf whose physical type is INT32 or INT64. `physical_ints`
+maps narrow and unsigned integers, dates and timestamps to that physical type, for PLAIN
+and delta alike. Blocks hold 128 deltas in 4 miniblocks of 32, as pyarrow writes them.
+
+Delta arithmetic wraps around in the column's own width (so every delta fits in it), and
+`delta - min_delta` is taken as unsigned. The decoder mirrors that: deltas are unpacked as
+UInt64 (bit widths up to 64, through a UInt128 accumulator) and added with wrap-around, and
+an INT32 column is truncated to 32 bits at the end. Before E2 the decoder unpacked into
+UInt32 and converted with range checks, so it dropped pyarrow's INT32 columns with
+wrap-around deltas and INT64 columns with deltas wider than 32 bits.
 
 ## Timestamp Design
 
