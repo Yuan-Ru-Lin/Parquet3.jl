@@ -129,3 +129,102 @@ function _prune(node::ReadNode, columns)
     isempty(children) ? nothing :
         ReadNode(node.kind, node.name, node.key, node.path, node.def_level, node.rep_level, node.item_def, node.schema, children)
 end
+
+# ── Assembly ──────────────────────────────────────────────────────────────
+#
+# Two stages. Stage 1 runs per row group, in parallel, and produces each node's raw
+# buffers; nothing in it depends on whether a type admits `Missing`. Stage 2 runs once all
+# row groups are in: it joins what was observed and wraps the buffers in Arrow arrays, so
+# every chunk of a column gets the same type. A node's type admits `Missing` exactly when
+# a null was decoded at that node, in any row group; statistics are not consulted.
+#
+# A slot is null at a node when `def < node.def_level`, whatever the reason: the node
+# itself is null, or an ancestor is. A struct member is therefore missing wherever its
+# struct is, which is what `col.member` shows for those rows.
+
+"""Buffers of one plan node for one row group (stage 1)."""
+struct RawNode
+    values::Any                 # leaf: decoded and converted values, one per slot; otherwise `nothing`
+    nulls::BitVector            # per slot: null at this node
+    children::Vector{RawNode}
+end
+
+"""
+Stage 1 for `node` in row group `rg` (`nothing` for a file without row groups). Returns
+the node's buffers and, when `want_defs`, the definition level of every slot, taken from
+the node's leftmost leaf: one leaf's levels give the validity of all its ancestors.
+"""
+function _read_buffers(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, node::ReadNode, want_defs::Bool)
+    if node.kind == :leaf
+        pages = _read_pages_for_rg(data, rg, node.path, node.schema)
+        elem = node.schema.element
+        values, nulls = assemble_flat_column(pages, node.def_level)
+        converted = convert_primitive_values(values, elem.type, leaf_annotation(elem))
+        return (RawNode(converted, nulls, RawNode[]), want_defs ? _page_defs(pages, node.def_level) : nothing)
+    elseif node.kind == :struct
+        # A struct that can never be null (def_level 0) needs no levels of its own
+        need_defs = want_defs || node.def_level > 0
+        results = fetch.([Threads.@spawn _read_buffers(data, rg, child, need_defs && j == 1)
+                          for (j, child) in enumerate(node.children)])
+        children = RawNode[first(r) for r in results]
+        defs = results[1][2]
+        nulls = need_defs ? defs .< node.def_level : falses(length(first(children).nulls))
+        return (RawNode(nothing, nulls, children), defs)
+    end
+    error("the recursive reader does not assemble lists yet (column $(node.key))")
+end
+
+"""
+Stage 2: wrap the buffers of `node` — one `RawNode` per row group — in Arrow arrays, one
+per row group and all of the same type.
+"""
+function _wrap_buffers(node::ReadNode, chunks::Vector{RawNode}, meta)
+    nullable = any(chunk -> any(chunk.nulls), chunks)
+    if node.kind == :leaf
+        elem = node.schema.element
+        annotation = leaf_annotation(elem)
+        return [_build_leaf_array(chunk.values, chunk.nulls, elem.type, annotation; nullable, meta) for chunk in chunks]
+    end
+    members = [_wrap_buffers(child, RawNode[chunk.children[j] for chunk in chunks], nothing)
+               for (j, child) in enumerate(node.children)]
+    fnames = Tuple(Symbol(child.name) for child in node.children)
+    [_make_struct(Tuple(member[i] for member in members), fnames, chunk.nulls, nullable, meta)
+     for (i, chunk) in enumerate(chunks)]
+end
+
+"""Read one top-level column of the plan: stage 1 per row group, then stage 2."""
+function _read_column(data::Vector{UInt8}, row_groups::Vector{RowGroup}, node::ReadNode, field_meta)
+    rgs = isempty(row_groups) ? [nothing] : row_groups
+    chunks = RawNode[first(fetch(task)) for task in [Threads.@spawn _read_buffers(data, rg, node, false) for rg in rgs]]
+    arrays = _wrap_buffers(node, chunks, get(field_meta, node.name, nothing))
+    column = length(arrays) == 1 ? only(arrays) : ChainedVector(arrays)
+    node.kind == :struct ? StructColumn(column, Tuple(Symbol(child.name) for child in node.children)) : column
+end
+
+"""
+The recursive reader's entry point. Internal until it replaces `read_parquet`'s current
+paths (tasks/todo.md, Part 4, R7); until then it exists for the regression harness.
+"""
+function _read_parquet_recursive(pf::ParquetFile; columns::Union{AbstractVector{<:AbstractString}, Nothing} = nothing)
+    (; schema, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
+    plan = plan_read_tree(build_schema_tree(pf.metadata.schema))
+    columns === nothing || (plan = prune_read_plan(plan, columns))
+
+    tasks = [Threads.@spawn _read_column(pf.data, pf.metadata.row_groups, node, field_meta) for node in plan]
+    vectors = AbstractVector[try fetch(task) catch e; throw(ColumnReadError(node.name, _root_cause(e))) end
+                             for (node, task) in zip(plan, tasks)]
+
+    names = Symbol[Symbol(node.name) for node in plan]
+    Arrow.Table(names, Type[eltype(v) for v in vectors], vectors, Dict{Symbol, AbstractVector}(zip(names, vectors)),
+                schema !== nothing ? Ref(schema) : Ref{Arrow.Meta.Schema}(),
+                Ref{Union{Nothing, Base.ImmutableDict{String, String}}}(_parse_kv_metadata(pf.metadata.key_value_metadata)))
+end
+
+function _read_parquet_recursive(path::String; kwargs...)
+    pf = open_parquet(path)
+    try
+        return _read_parquet_recursive(pf; kwargs...)
+    finally
+        close(pf)
+    end
+end

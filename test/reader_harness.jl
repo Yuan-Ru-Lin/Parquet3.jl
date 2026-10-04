@@ -50,6 +50,10 @@ end
 Paths in `table` whose type admits `Missing` although no missing occurs there
 (`"col"`, `"col.field"`, `"col[]"` for list elements). The recursive reader must return
 none; the statistics-based reader returns some, and those are where types will tighten.
+
+A struct member counts as missing wherever its struct is missing: `col.field` returns the
+member for every row, and shows a missing for those rows. List elements exist only inside
+lists that are present.
 """
 function loose_nodes(table)
     out = String[]
@@ -66,13 +70,12 @@ function _loose_nodes!(out, path, ::Type{T}, vals) where T
     nested = S !== Union{} && (S <: NamedTuple || (S <: AbstractVector && eltype(S) !== UInt8))
     admits || nested || return            # a plain leaf type that cannot hold a missing
     admits && !any(ismissing, vals) && push!(out, path)
-    present = admits ? skipmissing(vals) : vals
     if S !== Union{} && S <: NamedTuple
         for (i, f) in enumerate(fieldnames(S))
-            _loose_nodes!(out, "$path.$f", fieldtype(S, i), (v[i] for v in present))
+            _loose_nodes!(out, "$path.$f", fieldtype(S, i), (v === missing ? missing : v[i] for v in vals))
         end
     elseif nested
-        _loose_nodes!(out, path * "[]", eltype(S), Iterators.flatten(present))
+        _loose_nodes!(out, path * "[]", eltype(S), Iterators.flatten(admits ? skipmissing(vals) : vals))
     end
 end
 
@@ -197,4 +200,12 @@ function run_reader_harness(read_old, read_new, corpus)
         old, new = read_old(path), read_new(path)
         (label = label, differences = reader_differences(old, new), loose_old = loose_nodes(old), loose_new = loose_nodes(new))
     end
+end
+
+"""Top-level columns of `path` that contain no list, which is what the recursive reader assembles at step R2."""
+function harness_list_free_columns(path::String)
+    pf = open_parquet(path)
+    plan = Parquet3.plan_read_tree(Parquet3.build_schema_tree(pf.metadata.schema))
+    close(pf)
+    [node.name for node in plan if all(leaf -> leaf.rep_level == 0, Parquet3.read_leaves(node))]
 end

@@ -321,6 +321,11 @@ Old path against new path, for every file in the corpus:
 - element types equal after stripping `Missing` at every level;
 - nullability checked by its own invariant, on the new result alone: at every node, the
   type admits `Missing` if and only if a missing occurs there.
+  Refined at R2: a struct member counts as missing wherever its struct is missing, because
+  `col.member` returns the member for every row and must show a missing for those rows
+  (pyarrow's `flatten` semantics). So a slot is null at a node when `def < node.def_level`,
+  for any reason. Counting only "the member itself is null" would give a tighter row type
+  but leave `col.member` returning undefined values under null structs.
 The cases where the new types are tighter than the old are collected and listed in the
 report, so the deliberate change is visible, not inferred.
 
@@ -342,7 +347,11 @@ entry point.
       Original wording: plan tree from the schema (kinds, levels, user paths) and the pruning function.
       Pure functions with unit tests, including legacy 2-level lists, MAP, bare repeated
       fields, and selections (leaf, group, overlapping, unmatched). No assembly.
-- [ ] R2 — two-stage assembly for leaves and structs without lists; nullability from
+- [x] R2 (DONE, awaiting review) — `_read_buffers` (stage 1), `_wrap_buffers` (stage 2),
+      `_read_parquet_recursive` (internal entry point). 64 corpus files, 345 list-free
+      columns: 0 differences, 0 loose nodes; types tighten in 8 files. Flat columns of
+      part-0 (local): old 13.7 ms, new 13.9 ms.
+      Original wording: two-stage assembly for leaves and structs without lists; nullability from
       levels. Harness on flat columns, structs, struct-of-struct, zero-row files,
       multi-row-group files with nulls in only some groups.
 - [ ] R3 — lists: `list<prim>`, `list<list>`, struct with list members, FixedSizeList (top

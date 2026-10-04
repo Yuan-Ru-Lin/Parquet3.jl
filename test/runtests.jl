@@ -1897,8 +1897,10 @@ include("reader_harness.jl")
         @test isempty(loose_nodes(tight))
         loose = (a = Union{Missing, Int}[1, 2], l = Union{Missing, Vector{Union{Missing, Int}}}[[1], [2]],
                  s = Union{Missing, @NamedTuple{x::Union{Missing, Int}}}[(x = 1,), (x = 2,)],
-                 m = Union{Missing, @NamedTuple{x::Union{Missing, Int}}}[(x = missing,), missing])
-        @test loose_nodes(loose) == ["a", "l", "l[]", "s", "s.x"]
+                 m = Union{Missing, @NamedTuple{x::Union{Missing, Int}}}[(x = missing,), missing],
+                 # a member is missing wherever its struct is, so `x` needs Missing here; `y`'s list elements do not
+                 n = Union{Missing, @NamedTuple{x::Union{Missing, Int}, y::Union{Missing, Vector{Union{Missing, Int}}}}}[(x = 1, y = [1]), missing])
+        @test loose_nodes(loose) == ["a", "l", "l[]", "s", "s.x", "n.y[]"]
 
         same = (a = [1, 2], l = [[1.5], Float64[]], s = [(x = "a", v = [1]), (x = "b", v = Int[])])
         @test isempty(reader_differences(same, same))
@@ -2004,5 +2006,43 @@ end
                           for n in plan for (path, acc) in items(n))
             end
         end
+    end
+end
+
+
+@testset "Recursive reader: leaves and structs (R2)" begin
+    mktempdir() do dir
+        # At this step the new reader assembles columns without lists; compare exactly those.
+        corpus = [(label, path, harness_list_free_columns(path)) for (label, path) in harness_corpus(dir)]
+        corpus = filter(c -> !isempty(c[3]), corpus)
+        @test length(corpus) > 40
+        results = map(corpus) do (label, path, cols)
+            old = read_parquet(path; columns = cols)
+            new = Parquet3._read_parquet_recursive(path; columns = cols)
+            (label = label, columns = length(cols), differences = reader_differences(old, new),
+             loose_old = loose_nodes(old), loose_new = loose_nodes(new))
+        end
+        @testset "$(r.label)" for r in results
+            @test isempty(r.differences)      # names, containers, values, element types up to Missing
+            @test isempty(r.loose_new)        # Missing only where a missing occurs
+        end
+        tightened = [(r.label, setdiff(r.loose_old, r.loose_new)) for r in results if !isempty(setdiff(r.loose_old, r.loose_new))]
+        @info "Recursive reader (R2): $(length(corpus)) files, $(sum(r.columns for r in results)) list-free columns; " *
+              "element types tighten in $(length(tightened)):\n" *
+              join(("  $label: $(join(nodes, ", "))" for (label, nodes) in tightened), "\n")
+    end
+
+    # Field metadata, member access and selection behave as with the current reader
+    mktempdir() do dir
+        path = joinpath(dir, "s.parquet")
+        write_parquet(path, (id = [1, 2, 3], s = Union{Missing, @NamedTuple{a::Union{Missing, Int32}, b::String}}[
+                                 (a = Int32(1), b = "x"), missing, (a = missing, b = "z")]))
+        t = Parquet3._read_parquet_recursive(path)
+        @test t.s isa Parquet3.StructColumn && isequal(t.s.a, [1, missing, missing]) && isequal(t.s.b, ["x", missing, "z"])
+        @test eltype(t.id) == Int64 && ismissing(t.s[2]) && t.s[3].b == "z"
+        only_b = Parquet3._read_parquet_recursive(path; columns = ["s.b"])
+        @test collect(propertynames(only_b)) == [:s] && propertynames(only_b.s) == (:b,)
+        @test isequal(collect(only_b.s), [(b = "x",), missing, (b = "z",)])
+        @test_throws ArgumentError Parquet3._read_parquet_recursive(path; columns = ["s.c"])
     end
 end
