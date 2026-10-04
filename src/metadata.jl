@@ -289,6 +289,3 @@ const PAGE_HEADER_W = [
 
 parse_file_metadata(data::Vector{UInt8}) =
     read_thrift(TCompactProtocol(TMemoryTransport(data)), FileMetaData, FILE_METADATA_FIELDS)
-
-parse_page_header(data::Vector{UInt8}) =
-    read_thrift(TCompactProtocol(TMemoryTransport(data)), PageHeader, PAGE_HEADER_FIELDS)

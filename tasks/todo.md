@@ -80,6 +80,8 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
 - [x] B — Project.toml: julia 1.10 (suite run on 1.10.11, 1.11.9, 1.12.5), ArrowTypes dep, Tables extra removed
 - [x] C — `read_parquet` throws `ColumnReadError` instead of warn-and-skip; the parquet-testing
       columns that throw are listed in dev-note Known Limitations and pinned by a test
+- [x] D — Arrow compat restricted to the 2.8 series (`~2.8.1`)
+- [x] E — dead code deleted (199 source lines); none of it was exported
 - [ ] Found by C, not fixed (were silently dropped before): empty v2 data page,
       `dictionary_page_offset = 0`, PLAIN fixed-length byte arrays, deprecated LZ4 codec (both
       framings), `rle_boolean_encoding`, >2 GB string column. Not implemented: DELTA_BYTE_ARRAY,
@@ -203,8 +205,9 @@ handling, and logical types on members. Bugs below are in priority order; one at
 - [x] `is_struct_group` docstring omits nested structs
 - [ ] `_plan_struct` fills dummy `leaf`/`path`/`thresholds` for `:struct` members
 - [ ] `_page_defs` re-walks levels `assemble_flat_column` already scanned
-- [ ] `assemble_column` / `assemble_nested*` in src/pagereader.jl are reached only from unit
-      tests, not the read path; `_assemble_nested_general` likely has the R8 offset bug. Delete or fix.
+- [x] Dead code deleted (2026-10-04): `assemble_column`, `assemble_nested_column`, `assemble_nested`,
+      `_assemble_nested_rep1`, `_assemble_nested_general`, `convert_fixed_size_list`, `find_column`,
+      `parse_page_header`. Their four level-array unit tests now drive the live `_to_arrow_nested`.
 - [x] `snulls` loop is just `record_defs .< own_def`
 
 ## Part 4 (future, if needed) — full closure: list<struct{list}>, list<struct{struct}>, maps

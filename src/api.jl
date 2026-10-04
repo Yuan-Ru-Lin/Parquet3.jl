@@ -757,30 +757,6 @@ function _converted_int_type(ctype)
     nothing
 end
 
-"""Convert nested values into a FixedSizeListVector (flat child array + record-level nulls)."""
-function convert_fixed_size_list(values, nulls::BitVector, elem::SchemaElement, list_size::Int; nullable::Bool=false)
-    T = element_julia_type(elem.type, leaf_annotation(elem))
-    nrows = length(nulls)
-    data = Vector{T}(undef, list_size * nrows)
-    val_idx = 0
-    @inbounds for row in 1:nrows
-        base = (row - 1) * list_size
-        if nulls[row]
-            for j in 1:list_size; data[base + j] = zero(T); end
-        else
-            val_idx += 1
-            inner = values[val_idx]
-            for j in 1:list_size
-                v = inner[j]
-                data[base + j] = v === missing ? zero(T) : T(v)
-            end
-        end
-    end
-    has_nulls = any(nulls) || nullable
-    ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
-    FixedSizeListVector{list_size, T, ET}(data, nulls, nrows)
-end
-
 """
 Direct FSL assembly: scatter values from rep/def levels into a flat buffer
 in a single pass, bypassing intermediate Vector{Vector{T}} creation.

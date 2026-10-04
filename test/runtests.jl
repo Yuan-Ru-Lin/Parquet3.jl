@@ -19,105 +19,34 @@ using Dates
         @test Parquet3.decode_rle_bitpacked(data, 3, 8) == UInt32[5, 5, 5]
     end
 
+    # Level arrays straight into the live list assembler (required lists, optional elements)
+    nested(rep, def, vals, max_def, max_rep) = Parquet3._to_arrow_nested(
+        rep, def, vals, max_def, max_rep, collect(1:max_rep), Parquet3.INT32, nothing)
+    plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
+
     @testset "Nested Column Assembly" begin
-        # Simulate list column: [[1, 2], [3], [4, 5, 6]]
-        # rep_levels: [0, 1, 0, 0, 1, 1] - 0 starts new record, 1 continues
-        # def_levels: [2, 2, 2, 2, 2, 2] - all non-null (max_def = 2)
-        page = Parquet3.DecodedPage(
-            Int32[1, 2, 3, 4, 5, 6],
-            [2, 2, 2, 2, 2, 2],   # def_levels
-            [0, 1, 0, 0, 1, 1],   # rep_levels
-            6
-        )
-
-        values, nulls = Parquet3.assemble_nested_column([page], 2, 1)
-
-        @test length(values) == 3
-        @test collect(skipmissing(values[1])) == [1, 2]
-        @test collect(skipmissing(values[2])) == [3]
-        @test collect(skipmissing(values[3])) == [4, 5, 6]
-        @test !any(nulls)
+        # [[1, 2], [3], [4, 5, 6]]: rep 0 starts a record, 1 continues its list; def 2 = value
+        col = nested([0, 1, 0, 0, 1, 1], [2, 2, 2, 2, 2, 2], Int32[1, 2, 3, 4, 5, 6], 2, 1)
+        @test col isa Arrow.List && plain(col) == Any[Any[1, 2], Any[3], Any[4, 5, 6]]
+        @test !(Missing <: eltype(col))
     end
 
     @testset "Nested Column with Nulls" begin
-        # Simulate: [[1, null, 2], [3]]
-        # rep_levels: [0, 1, 1, 0]
-        # def_levels: [2, 1, 2, 2] - def=1 means null element
-        page = Parquet3.DecodedPage(
-            Int32[1, 2, 3],
-            [2, 1, 2, 2],   # def_levels
-            [0, 1, 1, 0],   # rep_levels
-            4
-        )
-
-        values, nulls = Parquet3.assemble_nested_column([page], 2, 1)
-
-        @test length(values) == 2
-        @test values[1][1] == 1
-        @test values[1][2] === missing
-        @test values[1][3] == 2
-        @test collect(skipmissing(values[2])) == [3]
+        # [[1, null, 2], [3]]: def 1 = null element
+        col = nested([0, 1, 1, 0], [2, 1, 2, 2], Int32[1, 2, 3], 2, 1)
+        @test isequal(plain(col), Any[Any[1, missing, 2], Any[3]])
     end
 
     @testset "Deeply Nested (List<List<T>>)" begin
-        # Simulate: [[[1, 2], [3]], [[4, 5]]]
-        # Two records, each with a list of lists
-        # Record 0: outer = [[1,2], [3]]
-        #   - outer[0] = [1, 2]
-        #   - outer[1] = [3]
-        # Record 1: outer = [[4, 5]]
-        #   - outer[0] = [4, 5]
-        #
-        # Values: [1, 2, 3, 4, 5]
-        # rep_levels: [0, 2, 1, 0, 2]
-        #   - 0: new record, new outer, new inner → 1
-        #   - 2: continue inner → 2
-        #   - 1: new outer, new inner → 3
-        #   - 0: new record, new outer, new inner → 4
-        #   - 2: continue inner → 5
-        # def_levels: [3, 3, 3, 3, 3] - all defined (max_def = 3 for list.list.element)
-        page = Parquet3.DecodedPage(
-            Int32[1, 2, 3, 4, 5],
-            [3, 3, 3, 3, 3],   # def_levels
-            [0, 2, 1, 0, 2],   # rep_levels
-            5
-        )
-
-        values, nulls = Parquet3.assemble_nested(
-            [0, 2, 1, 0, 2],
-            [3, 3, 3, 3, 3],
-            Int32[1, 2, 3, 4, 5],
-            3, 2, Int32
-        )
-
-        @test length(values) == 2
-
-        # Record 0: [[1, 2], [3]]
-        @test length(values[1]) == 2
-        @test values[1][1] == [1, 2]
-        @test values[1][2] == [3]
-
-        # Record 1: [[4, 5]]
-        @test length(values[2]) == 1
-        @test values[2][1] == [4, 5]
+        # [[[1, 2], [3]], [[4, 5]]]: rep 2 continues the inner list, 1 starts a new inner list
+        col = nested([0, 2, 1, 0, 2], [3, 3, 3, 3, 3], Int32[1, 2, 3, 4, 5], 3, 2)
+        @test plain(col) == Any[Any[Any[1, 2], Any[3]], Any[Any[4, 5]]]
     end
 
     @testset "Triple Nested (List<List<List<T>>>)" begin
-        # Simulate: [[[[1, 2]]]]
-        # Single record with deeply nested structure
-        # rep_levels: [0, 3] - 0 starts everything, 3 continues innermost
-        # def_levels: [4, 4] - all defined
-        values, nulls = Parquet3.assemble_nested(
-            [0, 3],
-            [4, 4],
-            Int32[1, 2],
-            4, 3, Int32
-        )
-
-        @test length(values) == 1
-        @test length(values[1]) == 1      # outer list has 1 element
-        @test length(values[1][1]) == 1   # middle list has 1 element
-        @test values[1][1][1] == [1, 2]   # inner list is [1, 2]
+        # [[[[1, 2]]]]: rep 3 continues the innermost list
+        col = nested([0, 3], [4, 4], Int32[1, 2], 4, 3)
+        @test plain(col) == Any[Any[Any[Any[1, 2]]]]
     end
 
     @testset "Struct null attribution" begin

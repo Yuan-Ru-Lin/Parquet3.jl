@@ -177,16 +177,6 @@ function build_schema_tree(schema::Vector{SchemaElement})::SchemaNode
     first(build(1, 0, 0))
 end
 
-function find_column(root::SchemaNode, path::Vector{String})
-    node = root
-    for name in path
-        found = findfirst(c -> c.element.name == name, node.children)
-        found === nothing && return nothing
-        node = node.children[found]
-    end
-    node
-end
-
 """
     compute_def_thresholds(root::SchemaNode, path::Vector{String}) -> Vector{Int}
 
