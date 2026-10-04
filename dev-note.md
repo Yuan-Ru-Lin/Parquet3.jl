@@ -117,7 +117,10 @@ Narrow and unsigned integers are stored in INT32/INT64 with a converted-type ann
 `encode_plain` converts with `% Int32` / `% Int64`, the inverse of the reader's `% T`.
 
 Current writer scope: flat, list, and struct columns nested to any depth (Int8–Int64, UInt8–UInt64,
-Float32/Float64, Bool, String, bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are
+Float32/Float64, Bool, String, bytes + Missing unions), PLAIN, one row group. Each v1 data page
+body (levels + values) is compressed as a whole by `compress`, the inverse of `decompress`
+in `src/compression.jl`; Snappy is the default, as in pyarrow, whose codec names we follow
+(`:lz4` means LZ4_RAW; the deprecated Hadoop-framed LZ4 is not written). Next steps are
 in `tasks/todo.md`.
 
 ## Known Limitations

@@ -58,7 +58,8 @@ tbl = read_parquet("data.parquet"; columns=["id", "name"])  # read specific colu
 
 # Write any Tables.jl-compatible table (flat, list, and struct columns; see Supported Features)
 write_parquet("out.parquet", (id = Int32[1, 2], name = ["a", missing], hits = [[1.5, 2.5], Float64[]],
-                             vertex = [(x = 0.1, y = 0.2), (x = 0.3, y = 0.4)]))
+                             vertex = [(x = 0.1, y = 0.2), (x = 0.3, y = 0.4)]);
+              compression = :zstd)   # default :snappy
 ```
 
 `read_parquet` returns an `Arrow.Table`, which implements the Tables.jl interface:
@@ -86,7 +87,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression and multiple row groups are not yet written. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, single row group, null-count statistics). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
 
 ### Encodings
 

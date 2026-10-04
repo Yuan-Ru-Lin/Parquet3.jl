@@ -1,9 +1,9 @@
 # Compression codec implementations for Parquet
 # Uses CodecZlib, CodecZstd, CodecLz4 packages when available
 
-using CodecZlib: GzipDecompressor
-using CodecZstd: ZstdDecompressor
-using CodecLz4: LZ4_decompress_safe
+using CodecZlib: GzipDecompressor, GzipCompressor
+using CodecZstd: ZstdDecompressor, ZstdCompressor
+using CodecLz4: LZ4_decompress_safe, LZ4_compress_fast, LZ4_compressBound
 using Snappy: Snappy
 
 """
@@ -28,6 +28,28 @@ function decompress(data::Vector{UInt8}, codec::CompressionCodec, uncompressed_s
 end
 
 decompress_snappy(data::Vector{UInt8}, ::Int) = Snappy.uncompress(data)
+
+"""
+    compress(data::Vector{UInt8}, codec::CompressionCodec) -> Vector{UInt8}
+
+Compress data using the specified codec (inverse of `decompress`).
+"""
+function compress(data::Vector{UInt8}, codec::CompressionCodec)::Vector{UInt8}
+    codec == UNCOMPRESSED && return data
+    codec == SNAPPY && return Snappy.compress(data)
+    codec == GZIP && return transcode(GzipCompressor, data)
+    codec == ZSTD && return transcode(ZstdCompressor, data)
+    codec == LZ4_RAW && return compress_lz4_raw(data)
+    error("Unsupported compression codec for writing: $codec")
+end
+
+"""Compress to a raw LZ4 block using liblz4 (inverse of decompress_lz4_raw)."""
+function compress_lz4_raw(data::Vector{UInt8})::Vector{UInt8}
+    result = Vector{UInt8}(undef, LZ4_compressBound(length(data)))
+    n = LZ4_compress_fast(data, result, length(data), length(result))
+    n <= 0 && error("LZ4 compression failed (return code: $n)")
+    resize!(result, n)
+end
 
 #=============================================================================
 # Gzip Decompression
@@ -99,4 +121,4 @@ function decompress_lz4(data::Vector{UInt8}, uncompressed_size::Int, is_raw::Boo
 end
 
 # Re-export TranscodingStreams for gzip/zstd
-using TranscodingStreams: TranscodingStream
+using TranscodingStreams: TranscodingStream, transcode

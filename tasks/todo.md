@@ -50,7 +50,9 @@ Nested writing is driven by element type, so reader outputs round-trip:
       column (5–20 s, Arrow.jl compilation in `_arrow_schema_kv`). Needs a schema path that
       avoids Arrow.jl's generic writer.
 
-Open: compression — in v0.2.0 or v0.3?
+- [x] Compression (DONE, awaiting review, decided for v0.2.0 on 2026-10-03):
+      `write_parquet(...; compression)` with snappy (default, as pyarrow), gzip, zstd, lz4,
+      uncompressed; pyarrow reads all four.
 
 Deferred (edge case, decided 2026-10-03): infer struct member types from rows when the
 `NamedTuple` eltype is not concrete (`[(a = missing,), (a = 2,)]`); currently a clear error.

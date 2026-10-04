@@ -1,6 +1,10 @@
-# Parquet file writer (flat, list, and struct columns, arbitrarily nested; PLAIN, uncompressed, one row group)
+# Parquet file writer (flat, list, and struct columns, arbitrarily nested; PLAIN, one row group)
 
 const CREATED_BY = "Parquet3.jl"
+
+# Names follow pyarrow; its "lz4" is the LZ4_RAW codec
+const WRITER_CODECS = Dict(:uncompressed => UNCOMPRESSED, :none => UNCOMPRESSED, :snappy => SNAPPY,
+                           :gzip => GZIP, :zstd => ZSTD, :lz4 => LZ4_RAW)
 
 """Map a Julia element type to (ParquetType, ConvertedType or nothing)."""
 function writer_parquet_type(::Type{T}) where T
@@ -125,15 +129,21 @@ function _arrow_schema_kv(names::Vector{Symbol}, vectors::Vector)
 end
 
 """
-    write_parquet(path::String, tbl) -> path
+    write_parquet(path::String, tbl; compression=:snappy) -> path
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
 Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Vector{UInt8}; vectors (written as
 LIST) and NamedTuples (written as a struct group) of supported types, nested to any
 depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
-with PLAIN encoding, uncompressed, in a single row group.
+with PLAIN encoding in a single row group.
+
+`compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:zstd`, `:lz4`, or
+`:uncompressed`; a string is accepted too.
 """
-function write_parquet(path::String, tbl)
+function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractString} = :snappy)
+    codec = get(WRITER_CODECS, Symbol(lowercase(String(compression))), nothing)
+    codec === nothing && error("write_parquet: unknown compression $(repr(compression)) " *
+                               "(supported: $(join(sort!(String.(collect(keys(WRITER_CODECS)))), ", ")))")
     cols = Tables.columns(tbl)
     names = collect(Symbol, Tables.columnnames(cols))
     isempty(names) && error("write_parquet: table has no columns")
@@ -155,17 +165,17 @@ function write_parquet(path::String, tbl)
 
             for leaf in node.leaves
                 offset = position(io)
-                page = _data_page(leaf)
+                page, uncompressed_size = _data_page(leaf, codec)
                 write(io, page)
-                total_bytes += length(page)
+                total_bytes += uncompressed_size
 
                 meta = ColumnMetaData(
                     type = leaf.ptype,
                     encodings = [PLAIN, RLE],
                     path_in_schema = leaf.path,
-                    codec = UNCOMPRESSED,
+                    codec = codec,
                     num_values = Int64(length(leaf.def)),
-                    total_uncompressed_size = Int64(length(page)),
+                    total_uncompressed_size = Int64(uncompressed_size),
                     total_compressed_size = Int64(length(page)),
                     data_page_offset = Int64(offset),
                     # Every level entry without a value, as pyarrow counts it
@@ -190,9 +200,10 @@ end
 """
 Build one DataPage (v1) for a shredded leaf: thrift PageHeader followed by the
 length-prefixed RLE repetition levels (only under a list) and definition levels,
-then the PLAIN-encoded values.
+then the PLAIN-encoded values. In a v1 page, levels and values are compressed together.
+Returns `(page_bytes, uncompressed_size)`, both including the header.
 """
-function _data_page(leaf)
+function _data_page(leaf, codec::CompressionCodec)
     body = IOBuffer()
     for (levels, max_level) in ((leaf.rep, leaf.max_rep), (leaf.def, leaf.max_def))
         max_level == 0 && continue
@@ -202,14 +213,16 @@ function _data_page(leaf)
     end
     write(body, encode_plain(leaf.values))
     data = take!(body)
+    compressed = compress(data, codec)
 
     header = PageHeader(
         type = DATA_PAGE,
         uncompressed_page_size = Int32(length(data)),
-        compressed_page_size = Int32(length(data)),
+        compressed_page_size = Int32(length(compressed)),
         data_page_header = DataPageHeader(
             num_values = Int32(length(leaf.def)), encoding = PLAIN,
             definition_level_encoding = RLE, repetition_level_encoding = RLE))
 
-    vcat(serialize_thrift(header, PAGE_HEADER_W), data)
+    header_bytes = serialize_thrift(header, PAGE_HEADER_W)
+    (vcat(header_bytes, compressed), length(header_bytes) + length(data))
 end

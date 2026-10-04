@@ -1127,6 +1127,55 @@ print(b.schema.field('wf').type)""")
         end
     end
 
+    @testset "Compression" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        n = 2000
+        tbl = (
+            id   = collect(1:n),
+            x    = [0.5 * (i % 7) for i in 1:n],
+            name = [isodd(i) ? "event-$(i % 10)" : missing for i in 1:n],
+            hits = [Int32[i % 5, 1, 2][1:(i % 4)] for i in 1:n],
+            wf   = [(t0 = 0.1f0, values = fill(Int32(i % 3), 8)) for i in 1:n],
+        )
+        f = wfile("test_compression.parquet")
+        try
+            write_parquet(f, tbl; compression = :uncompressed)
+            raw_size = filesize(f)
+            for (codec, pyname) in ((:snappy, "SNAPPY"), (:gzip, "GZIP"), (:zstd, "ZSTD"), (:lz4, "LZ4"))
+                write_parquet(f, tbl; compression = codec)
+                @test filesize(f) < raw_size ÷ 2
+                t = read_parquet(f)
+                @test all(k -> isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k])), keys(tbl))
+
+                result = _run_pyarrow("""
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('$(f)')
+c = pf.metadata.row_group(0).column(0)
+t = pf.read()
+print(c.compression, c.total_compressed_size < c.total_uncompressed_size)
+print(t.column('id').to_pylist() == list(range(1, $(n) + 1)), t.column('hits').to_pylist()[:4], t.column('name').null_count)""")
+                if result !== nothing
+                    lines = split(result, '\n')
+                    @test lines[1] == "$pyname True"
+                    @test lines[2] == "True [[1], [2, 1], [3, 1, 2], []] $(n ÷ 2)"
+                else
+                    @warn "Skipping pyarrow cross-check of $codec: uv/pyarrow not available"
+                end
+            end
+
+            # default is snappy; strings accepted; zero-row tables compress too
+            write_parquet(f, tbl)
+            pf = open_parquet(f)
+            @test pf.metadata.row_groups[1].columns[1].meta_data.codec == Parquet3.SNAPPY
+            close(pf)
+            write_parquet(f, (a = Int32[], l = Vector{Float64}[]); compression = "zstd")
+            @test length(read_parquet(f).a) == 0
+            @test_throws Exception write_parquet(f, tbl; compression = :brotli)
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)
