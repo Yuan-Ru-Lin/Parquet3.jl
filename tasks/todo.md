@@ -59,8 +59,9 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
       `struct<a: int64, v: list<int64>>`, rows `[{a:1, v:[1]}, None]` →
       `MethodError: Cannot convert SubArray{…Vector…} to SubArray{…Arrow.Primitive…}`.
       Reproduced. Likely disappears once the row-by-row path is bypassed; re-check after.
-- [ ] dev-note "verified by round-trip" claim is false for the struct-with-list shape; fix
-      the claim and add a round-trip test with a null struct row.
+- [x] dev-note "verified by round-trip" claim is false for the struct-with-list shape; fix
+      the claim and add a round-trip test with a null struct row. (Claim corrected, failure
+      listed under Known Limitations, `@test_broken` pins it; the bug itself is still open.)
 
 ---
 

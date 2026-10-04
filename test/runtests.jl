@@ -1002,6 +1002,13 @@ table = pa.table({
                     @test back.fsl isa Parquet3.FixedSizeListVector{3, Int32}
                     @test back.fslf isa Parquet3.FixedSizeListVector{2, Float64}
 
+                    # Arrow IPC round-trip of nested reader columns. A struct with a list member
+                    # and a null struct row is a known Arrow.write failure (see dev-note.md).
+                    arrow_rt(col) = (io = IOBuffer(); Arrow.write(io, (c = col,)); seekstart(io);
+                                     isequal(plain(Arrow.Table(io).c), plain(col)))
+                    @test arrow_rt(t.ev) && arrow_rt(t.parts)
+                    @test_broken try arrow_rt(t.wf) catch; false end
+
                     # ARROW:schema is written only when a FixedSizeList column needs it
                     has_schema(path) = (pf = open_parquet(path); kv = pf.metadata.key_value_metadata; close(pf);
                                         kv !== nothing && any(e -> e.key == "ARROW:schema", kv))

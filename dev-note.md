@@ -33,7 +33,10 @@ plus a validity bitmap; `NamedTuple` elements are materialized lazily on `getind
 `col[i]` delegates row access to the wrapped `Arrow.Struct` (or `ChainedVector` of per-RG
 chunks), and `getproperty` maps `col.fieldname` to the full child column, chaining chunks
 per field for multi-RowGroup files. `Arrow.write` serializes it as a native struct column
-(the `NamedTuple` eltype drives `ArrowTypes.StructKind` inference), verified by round-trip.
+(the `NamedTuple` eltype drives `ArrowTypes.StructKind` inference). It does so by
+re-encoding the column row by row, not by reusing the wrapped buffers. The round-trip is
+tested for struct-of-struct and `List<Struct>` columns; it fails for one shape, listed
+under Known Limitations.
 
 Null attribution comes from raw definition levels. For
 `optional wf { optional t0; optional values (LIST) { repeated list { optional element }}}`
@@ -119,6 +122,7 @@ in `tasks/todo.md`.
 
 ## Known Limitations
 
+- `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
 - Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
 - `logicalType` annotations are not parsed, only `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both).
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
