@@ -1,4 +1,4 @@
-# Parquet file writer (flat, list, and struct columns, arbitrarily nested; PLAIN, one row group)
+# Parquet file writer (flat, list, and struct columns, arbitrarily nested; one row group)
 
 const CREATED_BY = "Parquet3.jl"
 
@@ -56,31 +56,85 @@ end
 _is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && T !== Vector{UInt8}
 _is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple
 
+# Value encodings the writer can produce, by the lower-case Parquet name
+const WRITER_ENCODINGS = Dict(:plain => PLAIN, :byte_stream_split => BYTE_STREAM_SPLIT)
+
+_encoding_name(enc::Encoding) = Symbol(lowercase(string(enc)))
+
+_parse_encoding(name) = get(WRITER_ENCODINGS, Symbol(lowercase(String(name)))) do
+    error("write_parquet: unknown encoding $(repr(name)) (supported: $(join(sort!(String.(collect(keys(WRITER_ENCODINGS)))), ", ")))")
+end
+
+"""Whether value encoding `enc` can be used for `leaf`'s physical type."""
+_encoding_supports(enc::Encoding, leaf) =
+    enc == PLAIN || (enc == BYTE_STREAM_SPLIT && leaf.ptype in (FLOAT, DOUBLE))
+
+"""Encode a leaf's non-null values (inverse of `decode_values`)."""
+_encode_values(values, enc::Encoding) =
+    enc == BYTE_STREAM_SPLIT ? encode_byte_stream_split(values) : encode_plain(values)
+
+# A key names a leaf, or a struct/list above it
+_key_covers(key::String, leaf_key::String) = leaf_key == key || startswith(leaf_key, key * ".")
+
+"""
+Resolve the `encoding` keyword into one value encoding per leaf.
+
+A single name applies to the whole table: it is used wherever the leaf's type allows
+it, PLAIN elsewhere. A mapping applies per column, keyed by the path a user would type
+(`"id"`, `"wf.values"`, `"particles.pt"`); a key naming a struct or list covers every
+leaf under it, and the most specific key wins. In a mapping, an encoding the leaf's type
+does not allow, or a key matching no column, is an error.
+"""
+function _leaf_encodings(encoding::Union{Symbol, AbstractString}, leaves)
+    enc = _parse_encoding(encoding)
+    [_encoding_supports(enc, leaf) ? enc : PLAIN for leaf in leaves]
+end
+
+function _leaf_encodings(encoding::AbstractDict, leaves)
+    spec = Dict(String(k) => _parse_encoding(v) for (k, v) in encoding)
+    unmatched = sort!(filter(k -> !any(leaf -> _key_covers(k, leaf.key), leaves), collect(keys(spec))))
+    isempty(unmatched) ||
+        error("write_parquet: encoding keys match no column: $(join(unmatched, ", ")) " *
+              "(columns: $(join((leaf.key for leaf in leaves), ", ")))")
+    map(leaves) do leaf
+        matches = filter(k -> _key_covers(k, leaf.key), collect(keys(spec)))
+        isempty(matches) && return PLAIN
+        enc = spec[argmax(length, matches)]
+        _encoding_supports(enc, leaf) ||
+            error("write_parquet: encoding $(_encoding_name(enc)) is not valid for column $(leaf.key) ($(leaf.ptype))")
+        enc
+    end
+end
+
 """
 Plan the schema subtree for a value of type `FT` named `name`, driven by element type:
 `NamedTuple` → group (struct), `AbstractVector` → standard 3-level LIST, anything else →
 primitive leaf. Every node is OPTIONAL. `path`, `max_rep`, `max_def` describe the parent.
+`key` is the parent's user-facing path: the schema path without a list's structural
+`list`/`element` segments, which is what the `encoding` keyword is keyed by.
 
 Returns a node with its `kind`, depth-first `elements` (schema), and all `leaves` below
 it. A leaf is one column chunk: path, max levels, and the rep/def levels and non-null
 values that `_shred!` appends to.
 """
-function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int, max_def::Int) where FT
+function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int, max_def::Int,
+                    key::Vector{String} = String[]; structural::Bool = false) where FT
     T = Base.nonmissingtype(FT)
     path = [path; name]
+    structural || (key = [key; name])
     max_def += 1
     if _is_struct_type(T)
         isconcretetype(T) && fieldcount(T) > 0 ||
             error("write_parquet: struct $(join(path, '.')) needs a concrete, non-empty NamedTuple type, got $T " *
                   "(rows of differing field types need a typed vector, e.g. @NamedTuple{a::Union{Missing, Int64}}[...])")
-        children = [_plan_node(String(f), ft, path, max_rep, max_def) for (f, ft) in zip(fieldnames(T), fieldtypes(T))]
+        children = [_plan_node(String(f), ft, path, max_rep, max_def, key) for (f, ft) in zip(fieldnames(T), fieldtypes(T))]
         group = SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(length(children)))
         (kind = :struct, rep_level = max_rep, children = children,
          elements = [group; reduce(vcat, [c.elements for c in children])],
          leaves = reduce(vcat, [c.leaves for c in children]))
     elseif _is_list_type(T)
         # optional group name (LIST) { repeated group list { optional <element> } }
-        child = _plan_node("element", eltype(T), [path; "list"], max_rep + 1, max_def + 1)
+        child = _plan_node("element", eltype(T), [path; "list"], max_rep + 1, max_def + 1, key; structural = true)
         (kind = :list, rep_level = max_rep + 1, children = [child],
          elements = [SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(1), converted_type = CT_LIST);
                      SchemaElement(repetition_type = REPEATED, name = "list", num_children = Int32(1));
@@ -88,7 +142,7 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
          leaves = child.leaves)
     else
         ptype, ctype = writer_parquet_type(T)
-        leaf = (path = path, ptype = ptype, max_rep = max_rep, max_def = max_def,
+        leaf = (path = path, key = join(key, "."), ptype = ptype, max_rep = max_rep, max_def = max_def,
                 rep = Int[], def = Int[], values = T[])
         (kind = :leaf, rep_level = max_rep, children = (),
          elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype,
@@ -153,14 +207,14 @@ function _arrow_schema_kv(names::Vector{Symbol}, vectors::Vector)
 end
 
 """
-    write_parquet(path::String, tbl; compression=:snappy) -> path
+    write_parquet(path::String, tbl; compression=:snappy, encoding=:plain) -> path
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
 Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Date, DateTime,
 Arrow.Timestamp, Vector{UInt8}; vectors (written as
 LIST) and NamedTuples (written as a struct group) of supported types, nested to any
 depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
-with PLAIN encoding in a single row group.
+in a single row group.
 
 `DateTime` is written as a naive millisecond timestamp. `Arrow.Timestamp{U, TZ}` keeps
 its unit (milli-, micro-, or nanoseconds) and is written as UTC-adjusted unless `TZ`
@@ -168,8 +222,16 @@ is `nothing`, so a timestamp column from `read_parquet` writes back unchanged.
 
 `compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:zstd`, `:lz4`, or
 `:uncompressed`; a string is accepted too.
+
+`encoding` selects the value encoding: `:plain` (default) or `:byte_stream_split`
+(Float32/Float64). A single name applies to the whole table, falling back to PLAIN for
+columns whose type does not allow it. A `Dict` sets it per column, keyed by the path
+used to reach the data, e.g. `Dict("x" => :byte_stream_split, "wf.values" => :plain)`;
+a key naming a struct or list covers everything under it. In a `Dict`, an encoding
+that does not fit the column's type, or a key matching no column, is an error.
 """
-function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractString} = :snappy)
+function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractString} = :snappy,
+                       encoding::Union{Symbol, AbstractString, AbstractDict} = :plain)
     codec = get(WRITER_CODECS, Symbol(lowercase(String(compression))), nothing)
     codec === nothing && error("write_parquet: unknown compression $(repr(compression)) " *
                                "(supported: $(join(sort!(String.(collect(keys(WRITER_CODECS)))), ", ")))")
@@ -180,6 +242,10 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
     nrows = length(vectors[1])
     all(v -> length(v) == nrows, vectors) || error("write_parquet: ragged columns")
 
+    # Plan every column first, so a bad type or encoding fails before the file is touched
+    nodes = [_plan_node(String(name), eltype(col), String[], 0, 0) for (name, col) in zip(names, vectors)]
+    leaf_encodings = Iterators.Stateful(_leaf_encodings(encoding, reduce(vcat, [node.leaves for node in nodes])))
+
     open(path, "w") do io
         write(io, PARQUET_MAGIC)
 
@@ -187,20 +253,20 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
         chunks = ColumnChunk[]
         total_bytes = 0
 
-        for (name, col) in zip(names, vectors)
-            node = _plan_node(String(name), eltype(col), String[], 0, 0)
+        for (node, col) in zip(nodes, vectors)
             foreach(v -> _shred!(node, v, 0, 0), col)
             append!(schema, node.elements)
 
             for leaf in node.leaves
                 offset = position(io)
-                page, uncompressed_size = _data_page(leaf, codec)
+                enc = popfirst!(leaf_encodings)
+                page, uncompressed_size = _data_page(leaf, codec, enc)
                 write(io, page)
                 total_bytes += uncompressed_size
 
                 meta = ColumnMetaData(
                     type = leaf.ptype,
-                    encodings = [PLAIN, RLE],
+                    encodings = [enc, RLE],
                     path_in_schema = leaf.path,
                     codec = codec,
                     num_values = Int64(length(leaf.def)),
@@ -229,10 +295,10 @@ end
 """
 Build one DataPage (v1) for a shredded leaf: thrift PageHeader followed by the
 length-prefixed RLE repetition levels (only under a list) and definition levels,
-then the PLAIN-encoded values. In a v1 page, levels and values are compressed together.
+then the values in encoding `enc`. In a v1 page, levels and values are compressed together.
 Returns `(page_bytes, uncompressed_size)`, both including the header.
 """
-function _data_page(leaf, codec::CompressionCodec)
+function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
     body = IOBuffer()
     for (levels, max_level) in ((leaf.rep, leaf.max_rep), (leaf.def, leaf.max_def))
         max_level == 0 && continue
@@ -240,7 +306,7 @@ function _data_page(leaf, codec::CompressionCodec)
         write(body, htol(UInt32(length(rle))))
         write(body, rle)
     end
-    write(body, encode_plain(leaf.values))
+    write(body, _encode_values(leaf.values, enc))
     data = take!(body)
     compressed = compress(data, codec)
 
@@ -249,7 +315,7 @@ function _data_page(leaf, codec::CompressionCodec)
         uncompressed_page_size = Int32(length(data)),
         compressed_page_size = Int32(length(compressed)),
         data_page_header = DataPageHeader(
-            num_values = Int32(length(leaf.def)), encoding = PLAIN,
+            num_values = Int32(length(leaf.def)), encoding = enc,
             definition_level_encoding = RLE, repetition_level_encoding = RLE))
 
     header_bytes = serialize_thrift(header, PAGE_HEADER_W)

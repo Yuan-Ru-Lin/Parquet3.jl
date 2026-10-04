@@ -1323,6 +1323,76 @@ print(t.column('us_utc').cast('int64').to_pylist(), t.column('ns').cast('int64')
         end
     end
 
+    @testset "Encodings: BYTE_STREAM_SPLIT (E1) and the encoding keyword" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+
+        # encoder is the inverse of the decoder
+        for T in (Float32, Float64), vals in (T[1.5, -2.25, NaN, Inf, 0.0, floatmin(T)], T[], T[3.0])
+            enc = Parquet3.encode_byte_stream_split(vals)
+            dec = T == Float32 ? Parquet3.decode_byte_stream_split_float32(enc, length(vals)) :
+                                 Parquet3.decode_byte_stream_split_float64(enc, length(vals))
+            @test length(enc) == sizeof(T) * length(vals) && isequal(collect(dec), vals)
+        end
+
+        n = 500
+        tbl = (
+            id   = collect(1:n),
+            x    = [isodd(i) ? 0.25 * i : missing for i in 1:n],
+            f    = Float32[sin(i) for i in 1:n],
+            hits = [Float32[0.5f0 * j for j in 1:(i % 4)] for i in 1:n],
+            wf   = [(t0 = 0.1 * i, dt = 0.5f0, n = Int32(i)) for i in 1:n],
+            parts = [[(pt = 1.5f0 * i, q = Int32(1)) for _ in 1:(i % 3)] for i in 1:n],
+        )
+        f = wfile("test_e1_bss.parquet")
+        encodings_of(path) = (pf = open_parquet(path);
+            r = Dict(join(c.meta_data.path_in_schema, ".") => c.meta_data.encodings for c in pf.metadata.row_groups[1].columns);
+            close(pf); r)
+        roundtrips(path) = (t = read_parquet(path); all(k -> isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k])), keys(tbl)))
+        BSS, PL = Parquet3.BYTE_STREAM_SPLIT, Parquet3.PLAIN
+        try
+            # One name for the whole table: floats use it, everything else stays PLAIN
+            for codec in (:uncompressed, :zstd)
+                write_parquet(f, tbl; encoding = :byte_stream_split, compression = codec)
+                @test roundtrips(f)
+                e = encodings_of(f)
+                @test all(k -> BSS in e[k] && !(PL in e[k]), ["x", "f", "hits.list.element", "wf.t0", "wf.dt", "parts.list.element.pt"])
+                @test all(k -> PL in e[k] && !(BSS in e[k]), ["id", "wf.n", "parts.list.element.q"])
+            end
+
+            # Per column, keyed by the path a user would type; the most specific key wins
+            write_parquet(f, tbl; encoding = Dict("x" => :byte_stream_split, "hits" => "BYTE_STREAM_SPLIT",
+                                                  "wf.t0" => :byte_stream_split, "parts.pt" => :byte_stream_split,
+                                                  "parts" => :plain, "id" => :plain))
+            @test roundtrips(f)
+            e = encodings_of(f)
+            @test all(k -> BSS in e[k], ["x", "hits.list.element", "wf.t0", "parts.list.element.pt"])
+            @test all(k -> !(BSS in e[k]), ["id", "f", "wf.dt", "wf.n", "parts.list.element.q"])
+
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('$(f)')
+rg = pf.metadata.row_group(0)
+print(sorted(rg.column(i).path_in_schema for i in range(rg.num_columns) if 'BYTE_STREAM_SPLIT' in rg.column(i).encodings))
+t = pf.read()
+print(t.column('x').to_pylist()[:3], t.column('hits').to_pylist()[:4], t.column('wf').to_pylist()[0], t.column('parts').to_pylist()[1])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "['hits.list.element', 'parts.list.element.pt', 'wf.t0', 'x']"
+                @test lines[2] == "[0.25, None, 0.75] [[0.5], [0.5, 1.0], [0.5, 1.0, 1.5], []] {'t0': 0.1, 'dt': 0.5, 'n': 1} [{'pt': 3.0, 'q': 1}, {'pt': 3.0, 'q': 1}]"
+            else
+                @warn "Skipping pyarrow cross-check of BYTE_STREAM_SPLIT: uv/pyarrow not available"
+            end
+
+            # In a mapping nothing falls back silently
+            @test_throws "not valid for column id" write_parquet(f, tbl; encoding = Dict("id" => :byte_stream_split))
+            @test_throws "not valid for column wf.n" write_parquet(f, tbl; encoding = Dict("wf" => :byte_stream_split))
+            @test_throws "match no column: nope, wf.values" write_parquet(f, tbl; encoding = Dict("nope" => :plain, "wf.values" => :plain))
+            @test_throws "unknown encoding" write_parquet(f, tbl; encoding = :rle_magic)
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

@@ -119,11 +119,27 @@ Narrow and unsigned integers are stored in INT32/INT64 with a converted-type ann
 are described under Timestamp Design.
 
 Current writer scope: flat, list, and struct columns nested to any depth (Int8–Int64, UInt8–UInt64,
-Float32/Float64, Bool, String, Date, DateTime, bytes + Missing unions), PLAIN, one row group. Each v1 data page
+Float32/Float64, Bool, String, Date, DateTime, bytes + Missing unions), one row group. Each v1 data page
 body (levels + values) is compressed as a whole by `compress`, the inverse of `decompress`
 in `src/compression.jl`; Snappy is the default, as in pyarrow, whose codec names we follow
 (`:lz4` means LZ4_RAW; the deprecated Hadoop-framed LZ4 is not written). Next steps are
 in `tasks/todo.md`.
+
+## Writer Encodings
+
+`write_parquet(...; encoding)` picks the value encoding per leaf; levels are always RLE.
+Each encoder sits beside its decoder in `src/encodings.jl` as its inverse. `_plan_node`
+gives every leaf a user-facing `key`: the schema path without a list's structural
+`list`/`element` segments (`particles.list.element.pt` → `particles.pt`). The key is
+threaded through planning, not derived by dropping names, so a struct field that happens
+to be called `list` or `element` keeps its segment. `_leaf_encodings` resolves the keyword:
+a single name is best-effort (PLAIN where the type does not allow it); a `Dict` is strict
+(wrong type or unmatched key is an error) and the longest matching key wins. All columns
+are planned before the file is opened, so these errors leave no partial file. The page
+header's `encoding` and the column metadata's `encodings` state what was written.
+
+Implemented: PLAIN, BYTE_STREAM_SPLIT (Float32/Float64: the K bytes of each value are the
+columns of a K×n matrix, and the encoding is its rows laid end to end).
 
 ## Timestamp Design
 

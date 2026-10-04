@@ -414,6 +414,14 @@ encode_plain(values::Vector{DateTime}) = encode_plain(Int64[Dates.value(v - Date
 """PLAIN-encode Arrow timestamps as their INT64 count of units since the Unix epoch."""
 encode_plain(values::Vector{<:Arrow.Timestamp}) = encode_plain(Int64[v.x for v in values])
 
+"""
+BYTE_STREAM_SPLIT-encode floats (inverse of decode_byte_stream_split_float32/float64):
+byte 1 of every value, then byte 2 of every value, and so on. With the values' bytes as
+the columns of a K×n matrix, that is its rows laid end to end.
+"""
+encode_byte_stream_split(values::Vector{T}) where {T <: Union{Float32, Float64}} =
+    vec(permutedims(reshape(reinterpret(UInt8, values), sizeof(T), :)))
+
 """PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
 function encode_plain(values::Vector{Bool})
     bytes = zeros(UInt8, cld(length(values), 8))
