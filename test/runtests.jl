@@ -348,6 +348,35 @@ table = pa.table({'x': [1.0, 2.0], 'y': pa.array([10, 20], type=pa.int32()), 'pl
     end
 end
 
+@testset "Narrow and unsigned integers" begin
+    _with_pyarrow_file("narrow/unsigned ints", "test_small_ints.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+st = pa.struct([('i8', pa.int8()), ('u32', pa.uint32()), ('l', pa.list_(pa.uint64()))])
+table = pa.table({
+    'i8':  pa.array([-5, None, 127], type=pa.int8()),
+    'i16': pa.array([None, -32768, 7], type=pa.int16()),
+    'u8':  pa.array([255, None, 0], type=pa.uint8()),
+    'u16': pa.array([65535, 1, None], type=pa.uint16()),
+    'u32': pa.array([2**32 - 1, None, 2**31], type=pa.uint32()),
+    'u64': pa.array([2**64 - 1, 2**63, None], type=pa.uint64()),
+    's':   pa.array([{'i8': -5, 'u32': 2**32 - 1, 'l': [2**64 - 1, None]}, None,
+                     {'i8': None, 'u32': None, 'l': None}], type=st),
+})""") do tbl
+        @test isequal(tbl.i8,  Union{Missing, Int8}[-5, missing, 127])
+        @test isequal(tbl.i16, Union{Missing, Int16}[missing, -32768, 7])
+        @test isequal(tbl.u8,  Union{Missing, UInt8}[255, missing, 0])
+        @test isequal(tbl.u16, Union{Missing, UInt16}[65535, 1, missing])
+        @test isequal(tbl.u32, Union{Missing, UInt32}[typemax(UInt32), missing, 2^31])
+        @test isequal(tbl.u64, Union{Missing, UInt64}[typemax(UInt64), UInt64(2)^63, missing])
+
+        @test :s in propertynames(tbl)
+        @test isequal(tbl.s.i8,  Union{Missing, Int8}[-5, missing, missing])
+        @test isequal(tbl.s.u32, Union{Missing, UInt32}[typemax(UInt32), missing, missing])
+        @test isequal(tbl.s.l[1], Union{Missing, UInt64}[typemax(UInt64), missing])
+        @test ismissing(tbl.s[2]) && ismissing(tbl.s.l[3])
+    end
+end
+
 @testset "Struct Columns" begin
     _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq

@@ -694,7 +694,9 @@ function convert_primitive_values(values, ptype, ctype)
     elseif ctype == CT_TIMESTAMP_MICROS && ptype == INT64
         [DateTime(1970, 1, 1) + Microsecond(v) for v in values]
     elseif (T = _converted_int_type(ctype)) !== nothing && T !== eltype(values)
-        T.(values)
+        # Bit-truncating, not checked: unsigned values are stored in signed physical
+        # types, and null slots hold arbitrary bits
+        values .% T
     else
         values
     end

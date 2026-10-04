@@ -79,7 +79,7 @@ Reviewer confirmed def/rep-level arithmetic, eltype stability across row groups,
 handling, and logical types on members. Bugs below are in priority order; one at a time.
 
 ### A. Whole struct column dropped (leaf-level cause, struct amplifies: one bad member loses all)
-- [ ] R1 Narrow/unsigned int member. `assemble_flat_column` leaves null slots `undef`, then
+- [x] R1 Narrow/unsigned int member (fixed: `values .% T` in `convert_primitive_values`). `assemble_flat_column` leaves null slots `undef`, then
       `convert_primitive_values` runs a checked `T.(values)` over them
       (src/api.jl:696-697, src/pagereader.jl:186, reached from api.jl:322).
       - `struct<x: int8>` rows `[{x:-5}, None, {x:None}]` → `InexactError`, flaky
@@ -104,7 +104,8 @@ handling, and logical types on members. Bugs below are in priority order; one at
 - [ ] R7 Row group with zero rows: `first(pages)` in `assemble_flat_column` looks fragile.
 
 ### D. Tests to add (alongside the fix they cover)
-- [ ] narrow + unsigned int members with nulls (R1); `list<string>` member with null element (R2)
+- [x] narrow + unsigned int members with nulls (R1)
+- [ ] `list<string>` member with null element (R2)
 - [ ] required struct and required members; all-null struct; zero-row file (R5)
 - [ ] `write_statistics=False` with multiple row groups; multi-RG struct with a list member
 - [ ] `columns=["s.a"]` (R4)
