@@ -91,6 +91,20 @@ _shred_stop!(node, rep::Int, def::Int) =
     foreach(leaf -> (push!(leaf.rep, rep); push!(leaf.def, def)), node.leaves)
 
 """
+The table's Arrow schema as an `ARROW:schema` key-value entry (base64 of an IPC schema
+message), which lets Arrow-based readers restore types Parquet's own schema cannot
+express, such as FixedSizeList. Arrow.jl derives the schema from the column element
+types, so a zero-row copy of the table is enough; its first stream message is the schema.
+"""
+function _arrow_schema_kv(names::Vector{Symbol}, vectors::Vector)
+    empties = NamedTuple{Tuple(names)}(Tuple(eltype(v)[] for v in vectors))
+    buf = take!(Arrow.tobuffer(empties))
+    # Encapsulated message: 0xFFFFFFFF continuation, Int32 metadata length, metadata
+    len = ltoh(reinterpret(Int32, buf[5:8])[1])
+    KeyValue(key = "ARROW:schema", value = Base64.base64encode(buf[1:8 + len]))
+end
+
+"""
     write_parquet(path::String, tbl) -> path
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
@@ -142,7 +156,8 @@ function write_parquet(path::String, tbl)
 
         rg = RowGroup(columns = chunks, total_byte_size = Int64(total_bytes), num_rows = Int64(nrows))
         fmeta = FileMetaData(version = Int32(1), schema = schema, num_rows = Int64(nrows),
-                             row_groups = [rg], created_by = CREATED_BY)
+                             row_groups = [rg], created_by = CREATED_BY,
+                             key_value_metadata = [_arrow_schema_kv(names, vectors)])
 
         footer = serialize_thrift(fmeta, FILE_METADATA_W)
         write(io, footer)

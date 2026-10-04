@@ -205,11 +205,17 @@ const ROW_GROUP_W = [
     (3, TType.I64,  o -> o.num_rows,        (p, v) -> write(p, Int64(v))),
 ]
 
+const KEY_VALUE_W = [
+    (1, TType.STRING, o -> o.key,   (p, v) -> write(p, v)),
+    (2, TType.STRING, o -> o.value, (p, v) -> write(p, v)),
+]
+
 const FILE_METADATA_W = [
     (1, TType.I32,    o -> o.version,    (p, v) -> write(p, Int32(v))),
     (2, TType.LIST,   o -> o.schema,     (p, v) -> write_list(p, TType.STRUCT, v, (q, s) -> write_thrift(q, s, SCHEMA_ELEMENT_W))),
     (3, TType.I64,    o -> o.num_rows,   (p, v) -> write(p, Int64(v))),
     (4, TType.LIST,   o -> o.row_groups, (p, v) -> write_list(p, TType.STRUCT, v, (q, r) -> write_thrift(q, r, ROW_GROUP_W))),
+    (5, TType.LIST,   o -> o.key_value_metadata, (p, v) -> write_list(p, TType.STRUCT, v, (q, kv) -> write_thrift(q, kv, KEY_VALUE_W))),
     (6, TType.STRING, o -> o.created_by, (p, v) -> write(p, v)),
 ]
 

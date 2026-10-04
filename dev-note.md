@@ -99,7 +99,14 @@ are byte strings, not lists. `null_count` counts every level entry without a val
 
 Because dispatch is on element type, the reader's containers (`Arrow.List`, `StructColumn`,
 `ListOfStructsColumn`, `FixedSizeListVector`, `ChainedVector` chunks) are written without
-special cases; `FixedSizeListVector` currently comes out as a plain LIST.
+special cases.
+
+A `FixedSizeListVector` is written as a plain LIST, as pyarrow does; the fixed size lives
+in the `ARROW:schema` key-value entry. `_arrow_schema_kv` gets that entry from Arrow.jl
+instead of building FlatBuffers by hand: it serializes a zero-row copy of the table and
+keeps the first IPC message, which is the schema. The entry is written for every file.
+Cost: Arrow.jl compiles its schema code for each new set of column types, which adds
+first-call latency to `write_parquet`.
 
 Current writer scope: flat, list, and struct columns nested to any depth (Int32/Int64/Float32/Float64/
 Bool/String/bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are

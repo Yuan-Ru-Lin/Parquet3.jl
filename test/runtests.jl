@@ -984,6 +984,7 @@ table = pa.table({
     'parts': pa.array([[{'pt': 1.0, 'q': 1}, {'pt': 2.0, 'q': None}], [], None, [{'pt': 3.0, 'q': -1}],
                        [{'pt': 4.0, 'q': 1}], []], type=pa.list_(pt)),
     'fsl': pa.FixedSizeListArray.from_arrays(pa.array(range(18), type=pa.int32()), 3),
+    'fslf': pa.FixedSizeListArray.from_arrays(pa.array([0.5 * i for i in range(12)], type=pa.float64()), 2),
 })
 """
         # Single row group, then several (columns arrive as ChainedVector)
@@ -997,17 +998,21 @@ table = pa.table({
                         @test isequal(plain(Tables.getcolumn(back, k)), plain(Tables.getcolumn(t, k)))
                     end
                     @test back.wf isa Parquet3.StructColumn && back.parts isa Parquet3.ListOfStructsColumn
+                    # FixedSizeList survives via the ARROW:schema metadata we write (N1.5)
+                    @test back.fsl isa Parquet3.FixedSizeListVector{3, Int32}
+                    @test back.fslf isa Parquet3.FixedSizeListVector{2, Float64}
 
                     # pyarrow sees the same values and types as in its own file
-                    # (FixedSizeList is written as a plain list until N1.5)
                     result = _run_pyarrow("""
 import pyarrow.parquet as pq
 a, b = pq.read_table('$(src)'), pq.read_table('$(out)')
 print([n for n in a.column_names if a.column(n).to_pylist() != b.column(n).to_pylist()])
-print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).type])""")
+print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).type])
+print(b.schema.field('fsl').type, '|', b.schema.field('fslf').type)""")
                     lines = split(result, '\n')
                     @test lines[1] == "[]"
-                    @test lines[2] == "['fsl']"
+                    @test lines[2] == "[]"
+                    @test lines[3] == "fixed_size_list<element: int32>[3] | fixed_size_list<element: double>[2]"
                 finally
                     rm(out, force=true)
                 end

@@ -30,7 +30,9 @@ Nested writing is driven by element type, so reader outputs round-trip:
       such columns cannot be read and written back today.
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
 
-- [ ] N1.5 — FixedSizeList fidelity (REQUIRED for v0.2.0, decided 2026-10-03): written as a
+- [x] N1.5 (DONE, awaiting review: `_arrow_schema_kv`; our reader and pyarrow both restore
+      fixed_size_list; pyarrow cannot write an FSL with null rows to Parquet, so that case
+      is untested) — FixedSizeList fidelity (REQUIRED for v0.2.0, decided 2026-10-03): written as a
       plain LIST plus `ARROW:schema` key-value metadata so it reads back as
       `FixedSizeListVector`. Spike first: get the schema message from Arrow.jl (serialize
       the table schema, take the first IPC message) rather than hand-building FlatBuffers;
