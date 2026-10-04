@@ -2,6 +2,52 @@
 # Schema tree → plan tree → prune to the selected columns → recursive assembly.
 
 """
+    ColumnReadError(column, cause)
+
+Thrown by `read_parquet` when a column cannot be read, for example because it uses an
+encoding or type that is not supported yet. `cause` is the original exception. The other
+columns can still be read by passing `columns=` without the failing one.
+"""
+struct ColumnReadError <: Exception
+    column::String
+    cause::Exception
+end
+
+function Base.showerror(io::IO, e::ColumnReadError)
+    print(io, "ColumnReadError: failed to read column \"", e.column, "\". To read the other columns, ",
+          "pass `columns=` without it. Caused by: ")
+    showerror(io, e.cause)
+end
+
+# Column tasks nest: unwrap to the exception that actually failed
+_root_cause(e) = e isa TaskFailedException ? _root_cause(e.task.exception) : e
+
+"""
+    read_parquet(path::String; columns=nothing) -> Arrow.Table
+
+Read a Parquet file and return an Arrow.Table (Tables.jl-compatible).
+
+`columns` selects what to read, by the dotted paths used to reach the data: `"id"` for a
+column, `"wf.values"` for a struct member, `"particles.pt"` for a member of a list of
+structs, `"m.key"` for a map's keys. A name selects everything under it; selecting a
+member returns its column with only the selected parts. Leaves that are not selected are
+not decoded. A name that matches nothing is an `ArgumentError`.
+
+A column's element type admits `Missing` exactly where a null occurs in the data read.
+
+A column that cannot be read throws a [`ColumnReadError`](@ref) naming it; nothing is
+skipped silently.
+"""
+function read_parquet(path::String; columns::Union{AbstractVector{<:AbstractString}, Nothing}=nothing)
+    pf = open_parquet(path)
+    try
+        return read_parquet(pf; columns=columns)
+    finally
+        close(pf)
+    end
+end
+
+"""
 One node of the read plan. Three kinds, mirroring the writer:
 
 - `:leaf`   — a primitive column chunk; contributes values and element validity.
@@ -131,6 +177,148 @@ function _prune(node::ReadNode, columns)
     children = ReadNode[p for p in (_prune(child, columns) for child in node.children) if p !== nothing]
     isempty(children) ? nothing :
         ReadNode(node.kind, node.name, node.key, node.path, node.def_level, node.rep_level, node.item_def, node.schema, children)
+end
+
+# ── Levels and fixed-size list buffers ────────────────────────────────────
+
+"""Concatenate def levels across pages (pages without def levels are all-present)."""
+function _page_defs(pages::Vector{<:DecodedPage}, max_def::Int)
+    total = sum(p.num_values for p in pages; init=0)
+    out = Vector{Int}(undef, total)
+    pos = 1
+    for p in pages
+        if p.def_levels === nothing
+            fill!(@view(out[pos:pos+p.num_values-1]), max_def)
+        else
+            copyto!(out, pos, p.def_levels, 1, p.num_values)
+        end
+        pos += p.num_values
+    end
+    out
+end
+
+"""Def levels at record starts (rep == 0) of a repeated member's level streams."""
+function _record_defs(all_rep, all_def)
+    out = Vector{Int}(undef, count(==(0), all_rep))
+    rec = 0
+    @inbounds for i in eachindex(all_rep)
+        all_rep[i] == 0 || continue
+        rec += 1
+        out[rec] = all_def[i]
+    end
+    out
+end
+
+"""
+Direct FSL assembly: scatter values from rep/def levels into a flat buffer
+in a single pass, bypassing intermediate Vector{Vector{T}} creation.
+"""
+function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
+                             max_def::Int, list_size::Int, elem::SchemaElement,
+                             def_thresholds::Vector{Int}; nullable::Bool=false,
+                             record_null_def::Int = max_def > 0 ? 1 : 0) where V
+    T = element_julia_type(elem.type, leaf_annotation(elem))
+    num_records = count(==(0), all_rep)
+    data = Vector{T}(undef, list_size * num_records)
+    nulls = falses(num_records)
+
+    inner_threshold = length(def_thresholds) >= 1 ? def_thresholds[1] : 1
+
+    record_idx = 0
+    value_idx = 1
+    slot_idx = 0  # position within current record's list
+
+    @inbounds for i in eachindex(all_rep)
+        rep = all_rep[i]
+        def = all_def[i]
+
+        if rep == 0
+            # New record
+            record_idx += 1
+            slot_idx = 0
+            base = (record_idx - 1) * list_size
+
+            # Null record: def == 0 for a top-level column; inside a struct, any def
+            # below the list member's own def level (struct null or list null)
+            if def < record_null_def
+                nulls[record_idx] = true
+                # Zero-fill the null record's slots
+                for j in 1:list_size
+                    data[base + j] = zero(T)
+                end
+                continue
+            end
+        end
+
+        base = (record_idx - 1) * list_size
+
+        if def == max_def
+            slot_idx += 1
+            if slot_idx <= list_size
+                data[base + slot_idx] = T(values[value_idx])
+            end
+            value_idx += 1
+        elseif def >= inner_threshold
+            # Null leaf value
+            slot_idx += 1
+            if slot_idx <= list_size
+                data[base + slot_idx] = zero(T)
+            end
+        end
+    end
+
+    has_nulls = any(nulls) || nullable
+    ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
+    FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
+end
+
+"""Check if all pages in an FSL column have no nulls (all defs at max or no def levels)."""
+function _fsl_no_nulls(pages::Vector{<:DecodedPage}, max_def::Int)
+    for page in pages
+        if page.def_levels !== nothing
+            all(==(max_def), page.def_levels) || return false
+        end
+    end
+    true
+end
+
+"""
+Dense FSL assembly: when there are no nulls, page values are already contiguous.
+Copy them directly into the flat FSL buffer — no rep/def level processing needed.
+"""
+function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaElement,
+                             list_size::Int; nullable::Bool=false)
+    T = element_julia_type(ptype, leaf_annotation(elem))
+    # Count records from rep levels
+    num_records = sum(pages) do page
+        page.rep_levels === nothing ? page.num_values : count(==(0), page.rep_levels)
+    end
+
+    data = Vector{T}(undef, list_size * num_records)
+    nulls = falses(num_records)
+
+    # Convert and copy page values in bulk using a function barrier for type stability
+    _fsl_dense_copy!(data, pages, ptype, leaf_annotation(elem))
+
+    ET = nullable ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
+    FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
+end
+
+"""Type-stable inner loop: convert page values and copyto! into the flat buffer."""
+function _fsl_dense_copy!(data::Vector{T}, pages::Vector{<:DecodedPage}, ptype, ctype) where T
+    pos = 1
+    for page in pages
+        converted = convert_primitive_values(page.values, ptype, ctype)
+        n = length(converted)
+        if eltype(converted) === T
+            copyto!(data, pos, converted, 1, n)
+        else
+            @inbounds for i in 1:n
+                data[pos + i - 1] = T(converted[i])
+            end
+        end
+        pos += n
+    end
 end
 
 # ── Assembly ──────────────────────────────────────────────────────────────

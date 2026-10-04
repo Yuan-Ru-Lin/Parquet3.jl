@@ -261,3 +261,27 @@ function collect_page_data(pages::Vector{<:DecodedPage}, max_def::Int)
 
     (all_rep, all_def, all_values)
 end
+
+"""Read and decode all pages from one row group's column chunk."""
+function _read_pages_for_rg(data::Vector{UInt8}, rg::RowGroup, column_path::Vector{String}, node::SchemaNode)
+    idx = findfirst(c -> c.meta_data !== nothing && c.meta_data.path_in_schema == column_path, rg.columns)
+    idx === nothing && error("Column chunk not found: $(join(column_path, "."))")
+    type_length = Int(something(node.element.type_length, 0))
+    reader = ColumnReader(data, rg.columns[idx].meta_data, node, type_length)
+    pages = read_all_pages(reader)
+    isempty(pages) ? _empty_pages(node) : pages
+end
+
+# Zero-row file with no row groups at all
+_read_pages_for_rg(::Vector{UInt8}, ::Nothing, ::Vector{String}, node::SchemaNode) = _empty_pages(node)
+
+"""
+One empty page of the leaf's physical type, standing in for a column chunk without
+pages (zero-row row group or file) so the usual assembly yields typed empty columns.
+"""
+function _empty_pages(node::SchemaNode)
+    type_length = Int(something(node.element.type_length, 0))
+    values = decode_plain(node.element.type, UInt8[], 0, type_length)
+    [DecodedPage(values, node.max_def_level > 0 ? Int[] : nothing,
+                 node.max_rep_level > 0 ? Int[] : nothing, 0)]
+end

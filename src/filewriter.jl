@@ -6,52 +6,6 @@ const CREATED_BY = "Parquet3.jl"
 const WRITER_CODECS = Dict(:uncompressed => UNCOMPRESSED, :none => UNCOMPRESSED, :snappy => SNAPPY,
                            :gzip => GZIP, :brotli => BROTLI, :zstd => ZSTD, :lz4 => LZ4_RAW)
 
-"""Map a Julia element type to (ParquetType, ConvertedType or nothing)."""
-function writer_parquet_type(::Type{T}) where T
-    T === Union{} && error("write_parquet: column eltype is Missing; use a typed " *
-                           "column such as Union{Missing, Int64}[missing, ...]")
-    T === Int32   && return (INT32, nothing)
-    T === Int64   && return (INT64, nothing)
-    # Narrow and unsigned integers: stored in INT32/INT64, annotated with a converted type
-    T === Int8    && return (INT32, CT_INT_8)
-    T === Int16   && return (INT32, CT_INT_16)
-    T === UInt8   && return (INT32, CT_UINT_8)
-    T === UInt16  && return (INT32, CT_UINT_16)
-    T === UInt32  && return (INT32, CT_UINT_32)
-    T === UInt64  && return (INT64, CT_UINT_64)
-    T === Date    && return (INT32, CT_DATE)    # days since the Unix epoch
-    # Timestamps carry a logicalType (see writer_logical_type). As pyarrow does, the
-    # converted type is added only where it says the same thing: UTC millis or micros.
-    if T === DateTime || T <: Arrow.Timestamp
-        ts = writer_logical_type(T)
-        ctype = !ts.is_adjusted_to_utc ? nothing :
-                ts.unit == :MILLIS ? CT_TIMESTAMP_MILLIS : ts.unit == :MICROS ? CT_TIMESTAMP_MICROS : nothing
-        return (INT64, ctype)
-    end
-    T === Float32 && return (FLOAT, nothing)
-    T === Float64 && return (DOUBLE, nothing)
-    T === Bool    && return (BOOLEAN, nothing)
-    T <: AbstractString && return (BYTE_ARRAY, CT_UTF8)
-    T === Vector{UInt8} && return (BYTE_ARRAY, nothing)
-    error("write_parquet: unsupported column eltype $T " *
-          "(supported: signed and unsigned integers up to 64 bits, Float32, Float64, Bool, String, " *
-          "Date, DateTime, Arrow.Timestamp, Vector{UInt8}, " *
-          "vectors or NamedTuples of those, and Missing unions)")
-end
-
-"""
-The `logicalType` to write for element type `T`, or `nothing`. `DateTime` is a naive
-millisecond timestamp. `Arrow.Timestamp{U, TZ}` keeps its unit; Parquet only has a UTC
-flag, so any time zone other than `nothing` is written as UTC-adjusted.
-"""
-writer_logical_type(::Type) = nothing
-writer_logical_type(::Type{DateTime}) = TimestampType(false, :MILLIS)
-function writer_logical_type(::Type{Arrow.Timestamp{U, TZ}}) where {U, TZ}
-    i = findfirst(==(U), values(ARROW_TIME_UNITS))
-    i === nothing && error("write_parquet: Parquet has no timestamp unit $U (supported: milli-, micro-, nanoseconds)")
-    TimestampType(TZ !== nothing, keys(ARROW_TIME_UNITS)[i])
-end
-
 # Vector{UInt8} is a byte string; any other vector element type is a list
 _is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && T !== Vector{UInt8}
 _is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple

@@ -434,18 +434,6 @@ decode_byte_stream_split(::Type{T}, data::AbstractVector{UInt8}, count::Int) whe
 encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
     collect(reinterpret(UInt8, values))
 
-"""
-Integer-like values as stored in their physical Parquet type, INT32 or INT64: narrow and
-unsigned integers bit-preserved, dates as days and datetimes as milliseconds since the
-Unix epoch, Arrow timestamps as their count of units.
-"""
-physical_ints(values::Vector{<:Union{Int32, Int64}}) = values
-physical_ints(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32}}) = values .% Int32
-physical_ints(values::Vector{UInt64}) = values .% Int64
-physical_ints(values::Vector{Date}) = Int32[Dates.value(v - Date(1970, 1, 1)) for v in values]
-physical_ints(values::Vector{DateTime}) = Int64[Dates.value(v - DateTime(1970, 1, 1)) for v in values]
-physical_ints(values::Vector{<:Arrow.Timestamp}) = Int64[v.x for v in values]
-
 """PLAIN-encode integer-like values through their physical type (see `physical_ints`)."""
 encode_plain(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32, UInt64, Date, DateTime, Arrow.Timestamp}}) =
     encode_plain(physical_ints(values))

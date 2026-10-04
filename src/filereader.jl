@@ -99,3 +99,39 @@ function get_leaf_columns(root::SchemaNode)
     end
     result
 end
+
+"""
+    schema_string(pf::ParquetFile) -> String
+
+Get a human-readable schema representation.
+"""
+function schema_string(pf::ParquetFile)::String
+    lines = String[]
+
+    function format_element(elem::SchemaElement, indent::Int)
+        parts = String[]
+        elem.repetition_type !== nothing && push!(parts, string(elem.repetition_type))
+        elem.type !== nothing && push!(parts, string(elem.type))
+        (elem.num_children !== nothing && elem.num_children > 0) && push!(parts, "group")
+        push!(parts, elem.name)
+        elem.converted_type !== nothing && push!(parts, "($(elem.converted_type))")
+        "  "^indent * join(parts, " ")
+    end
+
+    function traverse(schema, idx, indent)
+        idx > length(schema) && return idx
+        elem = schema[idx]
+        push!(lines, format_element(elem, indent))
+
+        next_idx = idx + 1
+        if elem.num_children !== nothing
+            for _ in 1:elem.num_children
+                next_idx = traverse(schema, next_idx, indent + 1)
+            end
+        end
+        next_idx
+    end
+
+    traverse(pf.metadata.schema, 1, 0)
+    join(lines, "\n")
+end

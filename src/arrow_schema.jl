@@ -80,3 +80,14 @@ function _collect_fsl!(fsl::Dict{String,Int}, field, path::String)
         end
     end
 end
+
+"""Parse Parquet key-value metadata into Arrow-compatible ImmutableDict."""
+function _parse_kv_metadata(kv::Union{Vector{KeyValue}, Nothing})
+    kv === nothing && return nothing
+    isempty(kv) && return nothing
+    d = Base.ImmutableDict(kv[1].key => something(kv[1].value, ""))
+    for i in 2:length(kv)
+        d = Base.ImmutableDict(d, kv[i].key => something(kv[i].value, ""))
+    end
+    d
+end
