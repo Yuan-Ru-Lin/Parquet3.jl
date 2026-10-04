@@ -6,8 +6,9 @@ One node of the read plan. Three kinds, mirroring the writer:
 
 - `:leaf`   — a primitive column chunk; contributes values and element validity.
 - `:list`   — one child (its element); contributes offsets and validity. Covers the
-  standard 3-level LIST, the legacy 2-level forms, a bare repeated field, and MAP
-  (a list of key/value structs).
+  standard 3-level LIST, the legacy 2-level forms and a bare repeated field.
+- `:map`    — a list whose element is the key/value struct of a MAP group; assembled as
+  a list and presented as a map.
 - `:struct` — its members; contributes validity only.
 
 `key` is the path a user types (`"wf.values"`, `"particles.pt"`, `"m.key"`): it has no
@@ -63,7 +64,9 @@ function _plan_value(node::SchemaNode, name::String, key::String, path::Vector{S
     wrapped = node.element.converted_type == CT_LIST || _is_map(node)
     if wrapped && length(node.children) == 1 && _is_repeated(only(node.children))
         rep = only(node.children)
-        return ReadNode(:list, name, key, path, node.max_def_level, rep.max_rep_level, rep.max_def_level,
+        # A map needs both a key and a value; a MAP group with only keys is a list of them
+        kind = _is_map(node) && length(rep.children) == 2 ? :map : :list
+        return ReadNode(kind, name, key, path, node.max_def_level, rep.max_rep_level, rep.max_def_level,
                         node, [_plan_element(node, rep, name, key, [path; rep.element.name])])
     end
     # Any other group is a struct. That includes a group annotated LIST or MAP without the
@@ -101,7 +104,7 @@ Compact description of a plan node for tests and debugging, e.g.
 """
 function read_plan_string(node::ReadNode; top::Bool = true)
     body = node.kind == :leaf ? "leaf@$(node.def_level)" :
-           node.kind == :list ? "list@$(node.def_level)/$(node.item_def)<$(read_plan_string(only(node.children); top = false))>" :
+           node.kind in (:list, :map) ? "$(node.kind)@$(node.def_level)/$(node.item_def)<$(read_plan_string(only(node.children); top = false))>" :
            "struct@$(node.def_level){" * join(("$(c.name): $(read_plan_string(c; top = false))" for c in node.children), ", ") * "}"
     top ? "$(node.name): $body" : body
 end
@@ -312,8 +315,11 @@ function _wrap_buffers(node::ReadNode, chunks::Vector{RawNode}, meta)
         return [_fixed_size_list(chunk.values, nullable) for chunk in chunks]
     end
     elements = _wrap_buffers(only(node.children), RawNode[only(chunk.children) for chunk in chunks], nothing)
-    [_make_list(elements[i], _validity(chunk.nulls), chunk.offsets, length(chunk.nulls), nullable, meta)
-     for (i, chunk) in enumerate(chunks)]
+    lists = [_make_list(elements[i], _validity(chunk.nulls), chunk.offsets, length(chunk.nulls), nullable, meta)
+             for (i, chunk) in enumerate(chunks)]
+    # A map is presented as one only while it has both its key and its value: a selection
+    # of just one of them (`columns=["m.key"]`) leaves a list of structs with that member.
+    node.kind == :map && length(only(node.children).children) == 2 ? map(MapVector, lists) : lists
 end
 
 """The same fixed-size list buffers with the element type the whole column agreed on."""

@@ -81,6 +81,22 @@ sharing each level's offsets and validity. Both are one type, `NestedColumn`.
 wrapper exists; `Arrow.write` serializes a wrapped column by re-encoding it row by row,
 not by reusing the buffers (see Known Limitations for the one shape that fails).
 
+**Maps.** A MAP group plans as a `:map` node: a list whose element is the key/value struct.
+It assembles exactly as a list (Arrow's own layout for a map) and stage 2 wraps the
+result in `MapVector`, whose rows are `MapView{K,V} <: AbstractDict{K,V}`: two views, of
+the row's keys and of its values. This follows the FixedSizeListVector / FixedSizeView
+precedent: Arrow's convention for what the data is, our own zero-copy view for how a row
+is shown (`Arrow.Map` would build a `Dict` on every access and hide the key and value
+columns). Index access costs the same for 2 entries as for 2000. Entries keep file order
+and duplicates; lookup is a linear scan from the end, so the last entry of a duplicated
+key wins, as the format specifies and as `Dict(view)` gives. `MapVector` is an array type
+of its own, so a map inside a struct, a list or another map presents the same way, and
+`_member_list` sees through it, which keeps `col.key` / `col.value`. A map without
+values, or one pruned to its keys or its values, is a plain list. The writer maps any
+`AbstractDict` element type to a MAP (required key, optional value), so a map column
+writes back as a map; `Arrow.write` turns it into an `Arrow.Map` through ArrowTypes'
+`MapKind`, with no code of ours.
+
 **A column chunk with no pages** (zero-row file or row group) gets one empty page of the
 leaf's physical type (`_empty_pages`), so every shape assembles to a typed empty column,
 with no `Missing` anywhere since no null was seen.
@@ -106,10 +122,12 @@ leaf. `NamedTuple` types must be concrete, since member types are read from the 
 def 0 = null list, 1 = empty list, 2 = null element, 3 = value. `Vector{UInt8}` elements
 are byte strings, not lists. `null_count` follows pyarrow leaf by leaf (`_null_count`), for readers that derive
 nullability from it (ours did until the recursive reader; it now uses the decoded levels). pyarrow's rule is not written down anywhere; measured on
-pyarrow 23 across 18 leaf positions it is: a leaf that is itself a list's element counts
-every level entry without a value, null and empty lists included; a leaf below a struct
-inside a list counts only the list's existing slots, so null and empty lists are left out;
-outside lists the two agree. The test compares our statistics with pyarrow's for
+pyarrow 23 across 27 leaf positions it is: every level entry without a value is counted,
+null and empty lists included, for a leaf that is itself a list's element, for a map's key
+and value, and for every string or binary leaf; a fixed-width leaf below a struct inside a
+list counts only the list's existing slots, so null and empty lists are left out; outside
+lists the two agree. (The string/binary case was missed when the rule was first measured on
+18 leaves, none of which was a string under a list of structs; found 2026-10-04.) The test compares our statistics with pyarrow's for
 every shape, so a change in pyarrow's behaviour would show up there.
 
 Because dispatch is on element type, the reader's containers (`Arrow.List`, `StructColumn`,
@@ -234,6 +252,7 @@ corpus test when present and are not needed for a green run.
 - `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
 - Of the `logicalType` union only the TIMESTAMP member is parsed; everything else still relies on `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both). INT96 timestamps and TIME are not converted.
 - A `FixedSizeList` is restored at top level and as a struct member (at any struct depth). Inside a list (e.g. `list<fixed_size_list>`, `list<struct<…fsl…>>`) it is read as a variable-length list and written back as one: values are correct, but the fixed size is lost.
-- A map is read as a list of `(key, value)` structs, not as a `Dict`; written back, it is a list of structs, not a Parquet MAP.
+- A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.
+- Selecting only a map's keys or only its values (`columns=["m.key"]`) returns a list of one-member structs, not a map.
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
 - `open_parquet` / `read_parquet` on a non-existent path gives "File too small" instead of "File not found" (Mmap.mmap silently creates an empty file). Needs a guard in the public API.

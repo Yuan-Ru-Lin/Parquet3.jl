@@ -33,6 +33,69 @@ Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
     FixedSizeView{N,T}(v.data, (i - 1) * N)
 end
 
+# ── Map types ────────────────────────────────────────────────────────────────
+
+"""
+    MapView{K, V} <: AbstractDict{K, V}
+
+One row of a map column: a zero-copy view of that row's keys and values. It is what a
+map column returns on index access, as `FixedSizeView` is for a fixed-size list.
+
+Entries are kept as stored: iteration yields `key => value` pairs in file order, including
+duplicate keys, and `keys(m)` / `values(m)` are views into the column's key and value
+arrays. Lookup (`m[k]`, `get`, `haskey`) is a linear scan, which suits the small maps
+Parquet files hold; when a key occurs more than once the last entry wins, as the Parquet
+format specifies and as `Dict(m)` gives. Use `Dict(m)` for a hashed copy.
+"""
+struct MapView{K, V, KA <: AbstractVector{K}, VA <: AbstractVector{V}} <: AbstractDict{K, V}
+    keys::KA
+    values::VA
+end
+
+Base.length(m::MapView) = length(m.keys)
+Base.keys(m::MapView) = m.keys
+Base.values(m::MapView) = m.values
+Base.iterate(m::MapView, i::Int = 1) = i > length(m.keys) ? nothing : (m.keys[i] => m.values[i], i + 1)
+function Base.get(m::MapView, key, default)
+    i = findlast(isequal(key), m.keys)
+    i === nothing ? default : m.values[i]
+end
+# Short form, without the array type parameters
+function Base.show(io::IO, m::MapView)
+    print(io, "MapView(")
+    join(io, (sprint(show, k => v; context = io) for (k, v) in m), ", ")
+    print(io, ")")
+end
+Base.show(io::IO, ::MIME"text/plain", m::MapView) = show(io, m)
+
+"""
+Map column chunk: Arrow's layout for a map — a list of key/value entries, here an
+`Arrow.List` over an `Arrow.Struct` of the key and value arrays — presented as
+`MapView`s. It is an array type of its own so that a map nested in a struct or a list
+presents the same way as a top-level one.
+"""
+struct MapVector{ET, L <: AbstractVector} <: AbstractVector{ET}
+    entries::L
+end
+
+function MapVector(entries::Arrow.List)
+    ks, vs = entries.data.data
+    view_type(a) = SubArray{eltype(a), 1, typeof(a), Tuple{UnitRange{Int64}}, true}
+    M = MapView{eltype(ks), eltype(vs), view_type(ks), view_type(vs)}
+    MapVector{Missing <: eltype(entries) ? Union{Missing, M} : M, typeof(entries)}(entries)
+end
+
+Base.size(m::MapVector) = size(m.entries)
+Base.IndexStyle(::Type{<:MapVector}) = Base.IndexLinear()
+@Base.propagate_inbounds function Base.getindex(m::MapVector, i::Int)
+    row = m.entries[i]              # a view of the entries struct array, or missing
+    row === missing && return missing
+    ks, vs = parent(row).data
+    range = only(parentindices(row))
+    MapView(view(ks, range), view(vs, range))
+end
+Arrow.getmetadata(m::MapVector) = Arrow.getmetadata(m.entries)
+
 # ── Nested column containers ─────────────────────────────────────────────────
 
 """
@@ -52,6 +115,12 @@ const StructColumn{T, fnames, D} = NestedColumn{:struct, T, fnames, D}
 is a ragged per-field list sharing the parent's offsets and validity."""
 const ListOfStructsColumn{T, fnames, D} = NestedColumn{:list_of_structs, T, fnames, D}
 
+"""Map column: rows are `MapView`s; `col.key` and `col.value` are the keys and values of
+every row as ragged lists sharing the map's offsets and validity."""
+const MapColumn{T, fnames, D} = NestedColumn{:map, T, fnames, D}
+
+MapColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
+    NestedColumn{:map, T, fnames, typeof(data)}(data)
 StructColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
     NestedColumn{:struct, T, fnames, typeof(data)}(data)
 ListOfStructsColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
@@ -71,7 +140,7 @@ end
 
 """Project field `j` out of a nested container: struct → child column, list-over-struct → ragged list."""
 _child_column(s::Arrow.Struct, j::Int) = _wrap_nested(s.data[j])
-_child_column(l::Arrow.List, j::Int) = _wrap_nested(_member_list(l, j))
+_child_column(l::Union{Arrow.List, MapVector}, j::Int) = _wrap_nested(_member_list(l, j))
 function _child_column(cv::ChainedVector, j::Int)
     first(cv.arrays) isa Arrow.Struct ?
         _wrap_nested(ChainedVector([s.data[j] for s in cv.arrays])) :
@@ -86,15 +155,18 @@ function _member_list(l::Arrow.List, j::Int)
     child = l.data isa Arrow.Struct ? l.data.data[j] : _member_list(l.data, j)
     _make_list(child, l.validity, l.offsets.offsets, length(l), Missing <: eltype(l))
 end
+_member_list(m::MapVector, j::Int) = _member_list(m.entries, j)
 
 """The struct array reached from `v` through any number of list levels, or `nothing`."""
 _inner_struct(s::Arrow.Struct) = s
 _inner_struct(l::Arrow.List) = _inner_struct(l.data)
+_inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
 """
 Wrap an array whose elements are structs, directly (`StructColumn`) or through list levels
-(`ListOfStructsColumn`), so named access composes (`tbl.a.b.c`). Other arrays are returned as is.
+(`ListOfStructsColumn`), or maps (`MapColumn`), so named access composes (`tbl.a.b.c`).
+Other arrays are returned as is.
 """
 function _wrap_nested(v::AbstractVector)
     v isa ChainedVector && isempty(v.arrays) && return v
@@ -102,7 +174,8 @@ function _wrap_nested(v::AbstractVector)
     s = _inner_struct(chunk)
     s === nothing && return v
     fnames = _struct_fnames(typeof(s))
-    chunk isa Arrow.Struct ? StructColumn(v, fnames) : ListOfStructsColumn(v, fnames)
+    chunk isa Arrow.Struct ? StructColumn(v, fnames) :
+    chunk isa MapVector ? MapColumn(v, fnames) : ListOfStructsColumn(v, fnames)
 end
 _struct_fnames(::Type{<:Arrow.Struct{T, S, fnames}}) where {T, S, fnames} = fnames
 

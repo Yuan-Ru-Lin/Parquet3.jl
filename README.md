@@ -96,7 +96,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (single row group, null-count statistics). `DateTime` is written as a naive millisecond timestamp and `Arrow.Timestamp{unit, tz}` with its unit and UTC flag, so timestamp columns from `read_parquet` write back unchanged (a named time zone becomes UTC, since Parquet only stores a UTC flag). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:brotli`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written.
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`), structs (`NamedTuple` elements, written as a group) and maps (`AbstractDict` elements, written as a Parquet MAP) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (single row group, null-count statistics). `DateTime` is written as a naive millisecond timestamp and `Arrow.Timestamp{unit, tz}` with its unit and UTC flag, so timestamp columns from `read_parquet` write back unchanged (a named time zone becomes UTC, since Parquet only stores a UTC flag). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:brotli`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written.
 
 Values are PLAIN-encoded by default. `encoding` accepts:
 
@@ -137,10 +137,10 @@ Any nesting of lists, structs and maps is read, to any depth, by one recursive r
 | `List<T>`, `List<List<T>>`, … | `Arrow.List` | `col[i]` is a zero-copy view of the row's items |
 | struct | `StructColumn` | `col[i]` is a `NamedTuple`; `col.field` is the whole member column, zero-copy |
 | `List<Struct>`, at any list depth, with any members | `ListOfStructsColumn` | `col[i]` is the row's structs; `col.field` is that member for every row as a ragged list sharing the offsets (`particles.pt`) |
-| map | `ListOfStructsColumn` with fields `key` and `value` | `col[i]` is the row's `(key, value)` entries; `col.key`, `col.value` |
+| map | `MapColumn` | `col[i]` is a `MapView`, a zero-copy dictionary view of the row (`col[i]["k"]`, iteration in file order, `Dict(col[i])` for a hashed copy); `col.key` and `col.value` are all keys and all values, per row |
 | `FixedSizeList<T>` | `FixedSizeListVector{N,T}` | `col[i]` is a zero-copy `FixedSizeView{N,T}` into one flat vector |
 
-Named access composes through structs and lists: `tbl.event.vertex.x`, `tbl.s.hits.x`, `tbl.tracks.vertex.x` (one value per track, per row), `tbl.mm.value.key` (the keys of nested maps). Multi-row-group files chain the per-group chunks without copying.
+Named access composes through structs and lists: `tbl.event.vertex.x`, `tbl.s.hits.x`, `tbl.tracks.vertex.x` (one value per track, per row), `tbl.mm.value.key` (the keys of nested maps). A map nested in a struct, a list or another map presents the same way (`tbl.mm[i]["a"]["x"]`). When a key occurs twice in a row, lookup and `Dict(...)` take the last entry, as the Parquet format specifies; iteration shows both. Multi-row-group files chain the per-group chunks without copying.
 
 `FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored at top level and as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), and read as a variable-length list elsewhere. Legacy list layouts (2-level lists, bare repeated fields) and maps without values are read as pyarrow reads them.
 

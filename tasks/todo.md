@@ -424,36 +424,20 @@ entry point.
       they are leaf-level (encodings, codecs, page parsing), which this rewrite did not touch.
       (Correction: the parquet-testing directory has 64 `.parquet` files, not 128; the
       earlier "13 of 128" counted two tests per file.)
-- R8 (PROPOSED 2026-10-04, revised the same day; awaiting the user; not started) — maps with
-      Arrow's convention for what a map is, and our own zero-copy view for how it is shown
-      (the FixedSizeListVector / FixedSizeView precedent).
-      - Read: a MAP column keeps the columnar layout the reader already builds. `col.key` and
-        `col.value` stay as today. `col[i]` returns a lightweight `MapView{K,V} <:
-        AbstractDict{K,V}` over that row's keys and values: iteration in storage order
-        (duplicates and order preserved), `length`, `keys`, `values`, lookup by linear scan.
-        No allocation proportional to the row. `Dict(col[i])` for a real Dict. A key-only
-        map stays a list of keys.
-      - Write: an element type `<: AbstractDict` is written as a Parquet MAP (group annotated
-        MAP, repeated `key_value`, required key, optional value), for `Vector{Dict}` and for a
-        map column from `read_parquet` alike, nested or not. A vector of `(key, value)`
-        NamedTuples stays a list of structs.
-      - Check: whether `Arrow.write` serialises it as an Arrow map through `MapKind` without
-        extra code.
-      - Tests: pyarrow-written map / map of maps / map in struct / map in list; pyarrow reads
-        ours as map type with equal contents; read → write → read; `Arrow.write`; `col[i]`
-        does not allocate per entry; duplicate keys and order survive.
-      Points against, to weigh before starting:
-      - `AbstractDict` expects `get`, `haskey`, `iterate`, `length` at least; a linear-scan
-        `get` is O(entries), fine for small maps, surprising for large ones.
-      - With duplicate keys, `Dict(col[i])` and `col[i][k]` have to pick one (first or last);
-        that choice must be documented.
-      - The row type changes from "vector of (key, value) NamedTuples" (R5) to a dict view,
-        so R5's map behaviour is not final; nothing is released yet, so no user is affected.
-      - `columns=["m.key"]` returns a map without values; that stays a list of keys.
-      - A null key is invalid in Parquet; the reader has to decide what a file containing one
-        reads as.
-      - Whether it is a flag on `NestedColumn` or a small new wrapper: likely a third `kind`
-        on `NestedColumn`, since field access is already there.
+- [x] R8 (DONE, awaiting review; approved 2026-10-04 via the planning session) — maps.
+      Read: MAP → `MapColumn`; `col[i]` is a `MapView{K,V} <: AbstractDict` (two views, no
+      allocation per entry); `col.key` / `col.value` kept; nested maps present the same way.
+      Write: an `AbstractDict` element type is written as a Parquet MAP. `Arrow.write` yields
+      an `Arrow.Map` with no extra code. pyarrow reads our maps as map types with equal
+      contents, and its own map files read here with equal values.
+      Settled: duplicate keys — iteration keeps all entries in file order; lookup and
+      `Dict(view)` take the last (the format's rule). Null key — not rejected; the key type
+      admits `Missing` (untested: pyarrow cannot write one). A map pruned to its keys or
+      values, or without values, is a plain list. Lookup is a linear scan.
+- [x] Correction to the `null_count` rule (2026-10-04): string and binary leaves count every
+      entry without a value even under a struct in a list; only fixed-width leaves count
+      slots. The first measurement (18 leaves) had no string in that position. Now 27 leaves
+      match pyarrow, including map keys and values.
 
 ### Constraints carried from the brief
 - Structure and values of everything that assembles today are unchanged.

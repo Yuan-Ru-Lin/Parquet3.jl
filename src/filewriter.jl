@@ -55,6 +55,7 @@ end
 # Vector{UInt8} is a byte string; any other vector element type is a list
 _is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && T !== Vector{UInt8}
 _is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple
+_is_map_type(::Type{T}) where T = T !== Union{} && T <: AbstractDict
 
 # Value encodings the writer can produce, by the lower-case Parquet name
 const WRITER_ENCODINGS = Dict(:plain => PLAIN, :byte_stream_split => BYTE_STREAM_SPLIT,
@@ -116,8 +117,9 @@ end
 
 """
 Plan the schema subtree for a value of type `FT` named `name`, driven by element type:
-`NamedTuple` → group (struct), `AbstractVector` → standard 3-level LIST, anything else →
-primitive leaf. Every node is OPTIONAL. `path`, `max_rep`, `max_def` describe the parent.
+`NamedTuple` → group (struct), `AbstractVector` → standard 3-level LIST, `AbstractDict` →
+MAP, anything else → primitive leaf. Every node is OPTIONAL, except a map's key
+(`required`), which Parquet does not allow to be null. `path`, `max_rep`, `max_def` describe the parent.
 `key` is the parent's user-facing path: the schema path without a list's structural
 `list`/`element` segments, which is what the `encoding` keyword is keyed by. `rep_def`
 is the definition level of the nearest enclosing list's repeated node (0 outside lists).
@@ -127,26 +129,41 @@ it. A leaf is one column chunk: path, max levels, and the rep/def levels and non
 values that `_shred!` appends to.
 """
 function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int, max_def::Int,
-                    key::Vector{String} = String[]; structural::Bool = false, rep_def::Int = 0) where FT
+                    key::Vector{String} = String[]; structural::Bool = false, rep_def::Int = 0,
+                    required::Bool = false) where FT
     T = Base.nonmissingtype(FT)
     path = [path; name]
     structural || (key = [key; name])
-    max_def += 1
-    if _is_struct_type(T)
+    required || (max_def += 1)
+    repetition = required ? REQUIRED : OPTIONAL
+    if _is_map_type(T)
+        isconcretetype(T) ||
+            error("write_parquet: map $(join(path, '.')) needs a concrete dictionary type, got $T " *
+                  "(dictionaries of differing value types need a typed vector, e.g. Dict{String, Union{Missing, Float64}}[...])")
+        # optional group name (MAP) { repeated group key_value { required K key; optional V value } }
+        entry_path = [path; "key_value"]
+        keys = _plan_node("key", keytype(T), entry_path, max_rep + 1, max_def + 1, key; rep_def = max_def + 1, required = true)
+        vals = _plan_node("value", valtype(T), entry_path, max_rep + 1, max_def + 1, key; rep_def = max_def + 1)
+        (kind = :map, required = required, rep_level = max_rep + 1, children = [keys, vals],
+         elements = [SchemaElement(repetition_type = repetition, name = name, num_children = Int32(1), converted_type = CT_MAP);
+                     SchemaElement(repetition_type = REPEATED, name = "key_value", num_children = Int32(2));
+                     keys.elements; vals.elements],
+         leaves = [keys.leaves; vals.leaves])
+    elseif _is_struct_type(T)
         isconcretetype(T) && fieldcount(T) > 0 ||
             error("write_parquet: struct $(join(path, '.')) needs a concrete, non-empty NamedTuple type, got $T " *
                   "(rows of differing field types need a typed vector, e.g. @NamedTuple{a::Union{Missing, Int64}}[...])")
         children = [_plan_node(String(f), ft, path, max_rep, max_def, key; rep_def) for (f, ft) in zip(fieldnames(T), fieldtypes(T))]
-        group = SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(length(children)))
-        (kind = :struct, rep_level = max_rep, children = children,
+        group = SchemaElement(repetition_type = repetition, name = name, num_children = Int32(length(children)))
+        (kind = :struct, required = required, rep_level = max_rep, children = children,
          elements = [group; reduce(vcat, [c.elements for c in children])],
          leaves = reduce(vcat, [c.leaves for c in children]))
     elseif _is_list_type(T)
         # optional group name (LIST) { repeated group list { optional <element> } }
         child = _plan_node("element", eltype(T), [path; "list"], max_rep + 1, max_def + 1, key;
                            structural = true, rep_def = max_def + 1)
-        (kind = :list, rep_level = max_rep + 1, children = [child],
-         elements = [SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(1), converted_type = CT_LIST);
+        (kind = :list, required = required, rep_level = max_rep + 1, children = [child],
+         elements = [SchemaElement(repetition_type = repetition, name = name, num_children = Int32(1), converted_type = CT_LIST);
                      SchemaElement(repetition_type = REPEATED, name = "list", num_children = Int32(1));
                      child.elements],
          leaves = child.leaves)
@@ -154,8 +171,8 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
         ptype, ctype = writer_parquet_type(T)
         leaf = (path = path, key = join(key, "."), ptype = ptype, max_rep = max_rep, max_def = max_def, rep_def = rep_def,
                 rep = Int[], def = Int[], values = T[])
-        (kind = :leaf, rep_level = max_rep, children = (),
-         elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype,
+        (kind = :leaf, required = required, rep_level = max_rep, children = (),
+         elements = [SchemaElement(type = ptype, repetition_type = repetition, name = name, converted_type = ctype,
                                    logical_type = writer_logical_type(T))],
          leaves = [leaf])
     end
@@ -163,14 +180,15 @@ end
 
 """
 The `null_count` statistic as pyarrow writes it, which some readers use to decide whether
-a column can hold nulls (ours reads the levels instead). Measured on pyarrow 23, not specified anywhere:
-a leaf that is itself a list's element counts every level entry without a value, null
-and empty lists included. A leaf below a struct inside a list counts only the list's
-existing slots (`def >= rep_def`), so null and empty lists are left out. Outside lists
-the two agree.
+a column can hold nulls (ours reads the levels instead). Measured on pyarrow 23, not
+specified anywhere. Every level entry without a value is counted, null and empty lists
+included, for a leaf that is itself a list's element, for a map's key and value, and for
+every string or binary leaf. A fixed-width leaf below a struct inside a list counts only
+the list's existing slots (`def >= rep_def`), so null and empty lists are left out.
+Outside lists the two agree.
 """
-_null_count(leaf) = leaf.max_def == leaf.rep_def + 1 ? count(<(leaf.max_def), leaf.def) :
-                    count(d -> leaf.rep_def <= d < leaf.max_def, leaf.def)
+_null_count(leaf) = (leaf.ptype == BYTE_ARRAY || leaf.max_def <= leaf.rep_def + 1) ?
+    count(<(leaf.max_def), leaf.def) : count(d -> leaf.rep_def <= d < leaf.max_def, leaf.def)
 
 """
 Shred value `v` into the leaves under `node` (Dremel). `rep` is the repetition level of
@@ -178,8 +196,11 @@ this value; `def` counts the optional/repeated ancestors known to be present. A 
 or empty value is recorded in every leaf below, at the level where the path stopped.
 """
 function _shred!(node, v, rep::Int, def::Int)
-    ismissing(v) && return _shred_stop!(node, rep, def)
-    def += 1
+    if ismissing(v)
+        node.required && error("write_parquet: a map key cannot be missing")
+        return _shred_stop!(node, rep, def)
+    end
+    node.required || (def += 1)
     if node.kind == :leaf
         leaf = only(node.leaves)
         push!(leaf.rep, rep); push!(leaf.def, def); push!(leaf.values, v)
@@ -187,6 +208,14 @@ function _shred!(node, v, rep::Int, def::Int)
         foreach((child, field) -> _shred!(child, field, rep, def), node.children, values(v))
     elseif isempty(v)
         _shred_stop!(node, rep, def)
+    elseif node.kind == :map
+        # Like a list of entries; each entry's key and value share its levels
+        keys, vals = node.children
+        for (j, (k, val)) in enumerate(v)
+            r = j == 1 ? rep : node.rep_level
+            _shred!(keys, k, r, def + 1)
+            _shred!(vals, val, r, def + 1)
+        end
     else
         # First item inherits rep; later items continue this list
         child = only(node.children)
@@ -232,7 +261,7 @@ end
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
 Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Date, DateTime,
-Arrow.Timestamp, Vector{UInt8}; vectors (written as
+Arrow.Timestamp, Vector{UInt8}; dictionaries (`AbstractDict`, written as a MAP); vectors (written as
 LIST) and NamedTuples (written as a struct group) of supported types, nested to any
 depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
 in a single row group.

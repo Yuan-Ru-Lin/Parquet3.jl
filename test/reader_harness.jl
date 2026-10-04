@@ -5,7 +5,7 @@
 
 """
 Paths in `table` whose type admits `Missing` although no missing occurs there
-(`"col"`, `"col.field"`, `"col[]"` for list elements). The reader must return none: it
+(`"col"`, `"col.field"`, `"col[]"` for list elements, `"col{key}"` / `"col{value}"` for maps). The reader must return none: it
 derives nullability from the levels it decodes.
 
 A struct member counts as missing wherever its struct is missing: `col.field` returns the
@@ -24,13 +24,17 @@ end
 function _loose_nodes!(out, path, ::Type{T}, vals) where T
     S = Base.nonmissingtype(T)
     admits = Missing <: T
-    nested = S !== Union{} && (S <: NamedTuple || (S <: AbstractVector && eltype(S) !== UInt8))
+    nested = S !== Union{} && (S <: NamedTuple || S <: AbstractDict || (S <: AbstractVector && eltype(S) !== UInt8))
     admits || nested || return            # a plain leaf type that cannot hold a missing
     admits && !any(ismissing, vals) && push!(out, path)
     if S !== Union{} && S <: NamedTuple
         for (i, f) in enumerate(fieldnames(S))
             _loose_nodes!(out, "$path.$f", fieldtype(S, i), (v === missing ? missing : v[i] for v in vals))
         end
+    elseif S !== Union{} && S <: AbstractDict
+        present = admits ? skipmissing(vals) : vals
+        _loose_nodes!(out, path * "{key}", keytype(S), Iterators.flatten(keys(d) for d in present))
+        _loose_nodes!(out, path * "{value}", valtype(S), Iterators.flatten(values(d) for d in present))
     elseif nested
         _loose_nodes!(out, path * "[]", eltype(S), Iterators.flatten(admits ? skipmissing(vals) : vals))
     end

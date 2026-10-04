@@ -124,6 +124,9 @@ end
     @info "Test run" strict = TEST_STRICT pyarrow = version threads = Threads.nthreads() julia = VERSION
 end
 
+# Corpus, nullability check and pyarrow comparisons shared by the reader and writer tests
+include("reader_harness.jl")
+
 """Generate a parquet file via pyarrow, run tests, then clean up."""
 function _with_pyarrow_file(test_fn::Function, label::String, filename::String, pyscript::String)
     test_file = joinpath(@__DIR__, filename)
@@ -1578,6 +1581,12 @@ print(t.column('tags').to_pylist()[:3], t.column('wf').to_pylist()[0], t.column(
             los_clean = [[(a = 1, b = 2)], [(a = 3, b = 4), (a = 5, b = 6)], [(a = 7, b = 8)], [(a = 9, b = 0)]],
             los_empty = [[(a = 1, b = 2)], @NamedTuple{a::Int, b::Int}[], [(a = 7, b = 8)], [(a = 9, b = 0)]],
             l_empty   = [[1], Int[], [2, 3], [4]],
+            # string and binary leaves count differently from fixed-width ones under a struct in a list
+            los_s = Union{M, Vector{Union{M, @NamedTuple{n::Union{M, Int32}, s::Union{M, String}, f::Union{M, Float64}, b::Union{M, Vector{UInt8}}}}}}[
+                        [(n = 1, s = "x", f = 1.5, b = UInt8[1])], missing, [], [missing, (n = missing, s = missing, f = missing, b = missing)]],
+            # maps: null map, empty map, null value; and a map of maps
+            m    = Union{M, Dict{String, Union{M, Int}}}[Dict("a" => 1), missing, Dict{String, Union{M, Int}}(), Dict("b" => missing)],
+            mm   = [Dict("o" => Dict("i" => 1.5)), Dict{String, Dict{String, Float64}}(), Dict("p" => Dict{String, Float64}()), Dict("q" => Dict("j" => 2.5))],
         )
         ours, theirs = wfile("test_nc_ours.parquet"), wfile("test_nc_pyarrow.parquet")
         try
@@ -1594,10 +1603,11 @@ print([a.column(i).path_in_schema for i in range(a.num_columns)
 print([a.column(i).statistics.null_count for i in range(a.num_columns)])""")
             if result !== nothing
                 lines = split(result, '\n')
-                @test lines[1] == "True 18"
+                @test lines[1] == "True 27"
                 @test lines[2] == "[]"       # no leaf differs from pyarrow
-                # pinned so a change in either side shows up: los/sls/lls members count slots only
-                @test lines[3] == "[2, 3, 2, 2, 2, 2, 4, 2, 5, 3, 2, 6, 2, 0, 0, 0, 0, 1]"
+                # pinned so a change in either side shows up: fixed-width los/sls/lls members count slots
+                # only; string and binary members, and map keys and values, count every entry without a value
+                @test lines[3] == "[2, 3, 2, 2, 2, 2, 4, 2, 5, 3, 2, 6, 2, 0, 0, 0, 0, 1, 2, 4, 2, 4, 2, 3, 1, 2, 2]"
 
                 # Same data, same types, whichever writer produced the file
                 a, b = read_parquet(ours), read_parquet(theirs)
@@ -1614,6 +1624,93 @@ print([a.column(i).statistics.null_count for i in range(a.num_columns)])""")
         finally
             rm(ours, force=true); rm(theirs, force=true)
         end
+    end
+
+    @testset "Maps: Dict elements written as Parquet MAP, read back as MapView (R8)" begin
+        P = Parquet3
+        M = Missing
+        f, out = wfile("test_r8_maps.parquet"), wfile("test_r8_maps_rw.parquet")
+        D = Dict{String, Union{M, Int32}}
+        tbl = (
+            m   = Union{M, D}[D("a" => 1, "b" => missing), missing, D(), D("c" => 3)],
+            mm  = [Dict("o" => Dict(1 => 1.5, 2 => 2.5)), Dict{String, Dict{Int, Float64}}(), Dict("p" => Dict{Int, Float64}()), Dict("q" => Dict(3 => 3.5))],
+            sm  = [(tags = Dict("t" => "x"), n = i) for i in 1:4],
+            lm  = [[Dict("k" => 1.5), Dict{String, Float64}()], Dict{String, Float64}[], [Dict("u" => 2.5, "v" => 3.5)], [Dict("w" => 4.5)]],
+            ml  = [Dict("xs" => [1, 2], "ys" => Int[]), Dict{String, Vector{Int}}(), Dict("zs" => [3]), Dict{String, Vector{Int}}()],
+            id  = collect(1:4),
+        )
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            @test collect(propertynames(t)) == collect(keys(tbl))
+
+            # Rows are zero-copy dictionary views that equal the dictionaries written
+            @test t.m isa P.MapColumn && t.m[1] isa P.MapView{String, Union{M, Int32}}
+            for k in (:m, :mm, :ml)
+                @test all(isequal(a, b) for (a, b) in zip(getproperty(t, k), tbl[k]))
+            end
+            @test all(t.sm[i].tags == tbl.sm[i].tags && t.sm[i].n == i for i in 1:4)
+            @test all(collect(a) == b for (a, b) in zip(t.lm, tbl.lm))
+            @test ismissing(t.m[2]) && isempty(t.m[3]) && t.m[1]["a"] == 1 && ismissing(t.m[1]["b"])
+            @test t.mm[1]["o"][2] == 2.5 && t.ml[1]["xs"] == [1, 2] && haskey(t.m[4], "c") && !haskey(t.m[4], "a")
+            @test get(t.m[1], "zzz", 0) == 0 && length(t.m[1]) == 2 && Dict(t.m[4]) == Dict("c" => 3)
+            @test isempty(loose_nodes(t))
+
+            # The columnar view stays: all keys and all values, per row
+            @test propertynames(t.m) == (:key, :value)
+            @test sort(collect(t.m.key[1])) == ["a", "b"] && collect(t.m.key[4]) == ["c"] && ismissing(t.m.key[2])
+            @test collect(t.m.value[4]) == [3] && collect.(t.lm.key[3]) |> only |> sort == ["u", "v"]
+            @test collect.(t.mm.value.value[4]) == [[3.5]] && t.sm.tags isa P.MapColumn && collect(t.sm.tags.value[2]) == ["x"]
+
+            # Index access does not allocate per entry: the same cost for 2 entries and for 2000
+            big = Dict(string(i) => i for i in 1:2000)
+            write_parquet(out, (small = [Dict("a" => 1, "b" => 2)], big = [big]))
+            b = read_parquet(out)
+            b.small[1]; b.big[1]
+            @test (@allocated b.big[1]) == (@allocated b.small[1]) && length(b.big[1]) == 2000 && b.big[1]["1234"] == 1234
+
+            # pyarrow reads our file as map types with the contents we wrote
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(' | '.join(str(t.schema.field(n).type) for n in ['m', 'mm', 'sm', 'lm', 'ml']))
+print([None if r is None else sorted(r, key=lambda kv: kv[0]) for r in t.column('m').to_pylist()])
+print(t.column('lm').to_pylist()[0], t.column('ml').to_pylist()[2], t.column('sm').to_pylist()[0])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "map<string, int32 ('m')> | map<string, map<int64, double ('value')> ('mm')> | " *
+                                  "struct<tags: map<string, string ('tags')>, n: int64> | list<element: map<string, double ('element')>> | " *
+                                  "map<string, list<element: int64> ('ml')>"
+                @test lines[2] == "[[('a', 1), ('b', None)], None, [], [('c', 3)]]"
+                @test lines[3] == "[[('k', 1.5)], []] [('zs', [3])] {'tags': [('t', 'x')], 'n': 1}"
+            end
+
+            # A map column from read_parquet writes back as a map, unchanged
+            write_parquet(out, t)
+            back = read_parquet(out)
+            @test all(isequal(collect(getproperty(back, k)), collect(getproperty(t, k))) && eltype(getproperty(back, k)) == eltype(getproperty(t, k))
+                      for k in (:m, :mm, :ml))
+
+            # Arrow.write serialises it as an Arrow map (dictionaries on the Arrow side)
+            io = IOBuffer(); Arrow.write(io, (m = t.m, id = t.id)); seekstart(io)
+            a = Arrow.Table(io)
+            @test a.m isa Arrow.Map && all(isequal(Dict(x), y) for (x, y) in zip(skipmissing(t.m), skipmissing(a.m))) && ismissing(a.m[2])
+
+            # A vector of (key, value) NamedTuples is a list of structs, not a map
+            write_parquet(out, (kv = [[(key = "a", value = 1)], @NamedTuple{key::String, value::Int}[]],))
+            @test read_parquet(out).kv isa P.ListOfStructsColumn
+            # Keys cannot be missing; value types must be concrete
+            @test_throws "map key cannot be missing" write_parquet(out, (d = [Dict{Union{M, String}, Int}(missing => 1)],))
+            @test_throws "concrete dictionary type" write_parquet(out, (d = [Dict("x" => missing, "y" => 1.5), Dict("z" => 2.5)],))
+        finally
+            rm(f, force=true); rm(out, force=true)
+        end
+
+        # Storage order and duplicate keys are kept; lookup and Dict() take the last entry, as the format specifies
+        dup = P.MapView(["a", "b", "a"], [1, 2, 3])
+        @test collect(dup) == ["a" => 1, "b" => 2, "a" => 3] && length(dup) == 3
+        @test dup["a"] == 3 && Dict(dup) == Dict("a" => 3, "b" => 2) && collect(keys(dup)) == ["a", "b", "a"]
+        @test sprint(show, dup) == "MapView(\"a\" => 1, \"b\" => 2, \"a\" => 3)"
     end
 
     @testset "RLE encoder round-trip (unit)" begin
@@ -1971,7 +2068,6 @@ end
 # Reader: plan, assembly, nested shapes, selection
 # =============================================================================
 
-include("reader_harness.jl")
 
 @testset "Reader corpus: every file reads in full, with exact nullability" begin
     @testset "loose_nodes" begin
@@ -2056,17 +2152,17 @@ end
         @test strings(first(plan_of(ptfile("repeated_no_annotation.parquet")))) == [
             "id: leaf@0", "phoneNumbers: struct@1{phone: list@1/2<struct@2{number: leaf@2, kind: leaf@3}>}"]
         @test strings(first(plan_of(ptfile("map_no_value.parquet")))) == [
-            "my_map: list@0/1<struct@1{key: leaf@1, value: leaf@2}>", "my_map_no_v: list@0/1<leaf@1>",   # as pyarrow: a list of the keys
+            "my_map: map@0/1<struct@1{key: leaf@1, value: leaf@2}>", "my_map_no_v: list@0/1<leaf@1>",   # as pyarrow: a list of the keys
             "my_list: list@0/1<leaf@1>"]
         nested_maps, _ = plan_of(ptfile("nested_maps.snappy.parquet"))
-        @test strings(nested_maps)[1] == "a: list@1/2<struct@2{key: leaf@2, value: list@3/4<struct@4{key: leaf@4, value: leaf@4}>}>"
+        @test strings(nested_maps)[1] == "a: map@1/2<struct@2{key: leaf@2, value: map@3/4<struct@4{key: leaf@4, value: leaf@4}>}>"
         @test [l.key for l in P.read_leaves(nested_maps[1])] == ["a.key", "a.value.key", "a.value.value"]
         @test strings(first(plan_of(ptfile("nested_lists.snappy.parquet"))))[1] == "a: list@1/2<list@3/4<list@5/6<leaf@7>>>"
 
         # Every schema plans, and the plan agrees with the schema tree: the same leaves in the
         # same order with the same levels, each under as many lists as its repetition level.
         depths(node, n = 0) = node.kind == :leaf ? [(node, n)] :
-            reduce(vcat, [depths(c, n + (node.kind == :list)) for c in node.children])
+            reduce(vcat, [depths(c, n + (node.kind in (:list, :map))) for c in node.children])
         for f in filter(endswith(".parquet"), readdir(PARQUET_TESTING_DIR))
             plan, tree = plan_of(ptfile(f))
             leaves, columns = [l for n in plan for l in P.read_leaves(n)], P.get_leaf_columns(tree)
@@ -2149,15 +2245,15 @@ end
             @test t.lsl isa P.ListOfStructsColumn && propertynames(t.lsl) == (:x, :adc)
             @test t.lss isa P.ListOfStructsColumn && t.lls isa P.ListOfStructsColumn && propertynames(t.lls) == (:id, :vertex)
             @test t.sls isa P.StructColumn && t.sls.hits isa P.ListOfStructsColumn
-            @test t.m isa P.ListOfStructsColumn && propertynames(t.m) == (:key, :value) && t.sm.tags isa P.ListOfStructsColumn
+            @test t.m isa P.MapColumn && propertynames(t.m) == (:key, :value) && t.sm.tags isa P.MapColumn && t.mm isa P.MapColumn
 
             # Rows
             @test isequal(plain(t.lsl[2]), Any[(x = 0.0f0, adc = Any[0])]) && ismissing(t.lsl[5]) && isempty(t.lsl[4])
             @test isequal(plain(t.lsl[3]), Any[(x = 0.0f0, adc = Any[0, missing]), (x = 0.5f0, adc = missing)])
             @test isequal(plain(t.sls[2]), (run = 1, hits = Any[(x = 0.0f0, adc = Any[0])])) && ismissing(t.sls[4]) && ismissing(t.sls[3].hits)
-            @test isequal(plain(t.m[3]), Any[(key = "k0", value = 0), (key = "k1", value = missing)]) && ismissing(t.m[4])
-            @test isequal(plain(t.mm[2]), Any[(key = "a", value = Any[(key = "x", value = 1), (key = "y", value = missing)]),
-                                              (key = "b", value = missing), (key = "c", value = Any[])])
+            @test t.m[3] isa P.MapView && isequal(collect(t.m[3]), ["k0" => 0, "k1" => missing]) && ismissing(t.m[4]) && isempty(t.m[1])
+            @test t.mm[2]["a"]["x"] == 1 && ismissing(t.mm[2]["a"]["y"]) && ismissing(t.mm[2]["b"]) && isempty(t.mm[2]["c"])
+            @test collect(keys(t.mm[2])) == ["a", "b", "c"] && t.sm[2].tags["t"] == 1.5
 
             # Named fields, through every list level and composed across structs
             @test plain(t.lsl.x[3]) == Any[0.0f0, 0.5f0] && isequal(plain(t.lsl.adc[3]), Any[Any[0, missing], missing])
