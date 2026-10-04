@@ -21,8 +21,13 @@ Nested writing is driven by element type, so reader outputs round-trip:
 - [x] N3 — composition: struct{list}, struct-of-struct, list<struct>, list<list>
       (recursive shredder over the schema tree; N1/N2 become its base cases) (DONE, awaiting
       review; `_plan_node` + `_shred!` replace the per-shape shredders)
-- [ ] N4 — read→write round-trip of reader containers (`Arrow.List`, `StructColumn`,
-      `ListOfStructsColumn`, `FixedSizeListVector` written as plain LIST)
+- [x] N4 — read→write round-trip of reader containers (`Arrow.List`, `StructColumn`,
+      `ListOfStructsColumn`, `FixedSizeListVector` written as plain LIST) (DONE, awaiting
+      review; no writer change needed, tests only; single- and multi-RG sources;
+      pyarrow confirms equal values and, except FSL, equal types)
+- [ ] Gap found in N4: the reader returns element types the writer rejects — Int8/Int16,
+      UInt8/16/32/64 (not in any plan yet), Date/DateTime (deferred to v0.3). A file with
+      such columns cannot be read and written back today.
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
 
 - [ ] N1.5 — FixedSizeList fidelity (REQUIRED for v0.2.0, decided 2026-10-03): written as a

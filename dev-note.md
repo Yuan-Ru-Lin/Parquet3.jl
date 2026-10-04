@@ -97,6 +97,10 @@ def 0 = null list, 1 = empty list, 2 = null element, 3 = value. `Vector{UInt8}` 
 are byte strings, not lists. `null_count` counts every level entry without a value
 (including empty lists), matching pyarrow.
 
+Because dispatch is on element type, the reader's containers (`Arrow.List`, `StructColumn`,
+`ListOfStructsColumn`, `FixedSizeListVector`, `ChainedVector` chunks) are written without
+special cases; `FixedSizeListVector` currently comes out as a plain LIST.
+
 Current writer scope: flat, list, and struct columns nested to any depth (Int32/Int64/Float32/Float64/
 Bool/String/bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are
 in `tasks/todo.md`.

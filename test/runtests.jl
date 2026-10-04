@@ -961,6 +961,60 @@ print(t.column('sl').to_pylist())""")
         end
     end
 
+    @testset "Read → write round-trip of reader containers (N4)" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        src, out = wfile("test_n4_src.parquet"), wfile("test_n4_out.parquet")
+        pytable = """
+import pyarrow as pa, pyarrow.parquet as pq
+wf = pa.struct([('t0', pa.float64()), ('values', pa.list_(pa.int32()))])
+ev = pa.struct([('id', pa.int64()), ('vertex', pa.struct([('x', pa.float32()), ('tag', pa.string())]))])
+pt = pa.struct([('pt', pa.float32()), ('q', pa.int32())])
+table = pa.table({
+    'i32': pa.array([1, None, 3, 4, 5, 6], type=pa.int32()),
+    'f64': pa.array([0.1, 0.2, 0.3, 0.4, 0.5, 0.6], type=pa.float64()),
+    'flag': pa.array([True, False, None, True, False, True]),
+    'name': pa.array(['a', None, 'déjà', '', 'e', 'f']),
+    'blob': pa.array([b'ab', b'', None, b'c', b'x', b'y'], type=pa.binary()),
+    'hits': pa.array([[1, 2], [], None, [None, 4], [5], [6, 7, 8]], type=pa.list_(pa.int32())),
+    'words': pa.array([['a', None], None, [], ['b'], ['c', 'd'], ['e']], type=pa.list_(pa.string())),
+    'll': pa.array([[[1, 2], [3]], [], [[4]], None, [[5], None, [], [None, 6]], [[7]]], type=pa.list_(pa.list_(pa.int64()))),
+    'wf': pa.array([{'t0': 0.5, 'values': [1, None]}, None, {'t0': 1.5, 'values': None}, {'t0': 2.5, 'values': []},
+                    {'t0': None, 'values': [9]}, {'t0': 3.5, 'values': [1, 2, 3]}], type=wf),
+    'ev': pa.array([{'id': i, 'vertex': {'x': 0.5 * i, 'tag': 'v%d' % i}} for i in range(6)], type=ev),
+    'parts': pa.array([[{'pt': 1.0, 'q': 1}, {'pt': 2.0, 'q': None}], [], None, [{'pt': 3.0, 'q': -1}],
+                       [{'pt': 4.0, 'q': 1}], []], type=pa.list_(pt)),
+    'fsl': pa.FixedSizeListArray.from_arrays(pa.array(range(18), type=pa.int32()), 3),
+})
+"""
+        # Single row group, then several (columns arrive as ChainedVector)
+        for kwargs in ("{}", "{'row_group_size': 4}")
+            _with_pyarrow_file("reader containers ($kwargs)", "test_n4_src.parquet", pytable * "write_kwargs = $kwargs") do t
+                try
+                    write_parquet(out, t)
+                    back = read_parquet(out)
+                    @test collect(Tables.columnnames(back)) == collect(Tables.columnnames(t))
+                    for k in Tables.columnnames(t)
+                        @test isequal(plain(Tables.getcolumn(back, k)), plain(Tables.getcolumn(t, k)))
+                    end
+                    @test back.wf isa Parquet3.StructColumn && back.parts isa Parquet3.ListOfStructsColumn
+
+                    # pyarrow sees the same values and types as in its own file
+                    # (FixedSizeList is written as a plain list until N1.5)
+                    result = _run_pyarrow("""
+import pyarrow.parquet as pq
+a, b = pq.read_table('$(src)'), pq.read_table('$(out)')
+print([n for n in a.column_names if a.column(n).to_pylist() != b.column(n).to_pylist()])
+print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).type])""")
+                    lines = split(result, '\n')
+                    @test lines[1] == "[]"
+                    @test lines[2] == "['fsl']"
+                finally
+                    rm(out, force=true)
+                end
+            end
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)
