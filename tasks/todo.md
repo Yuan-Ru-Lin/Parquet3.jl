@@ -253,6 +253,8 @@ decoded, so `columns=["wf.t0"]` does not touch the waveform values.
   `pt`; a key naming a struct or list selects everything under it; overlapping keys union.
 - Keys are the short dotted paths the writer's `encoding` keyword uses: no `list`/`element`
   segments, and for a MAP no `key_value` segment (`"m.key"`, `"m.value"`).
+- Decided by the user 2026-10-04: keys are the short dotted paths only. No alias for full
+  Parquet paths (`particles.list.element.pt`), and no bare leaf names (ambiguous).
 - This replaces today's matching by Parquet path or by bare leaf name. An unmatched key is
   an error naming the key(s) (decided by the user 2026-10-04; replaces today's warning once
   the new reader becomes the default at R7).
