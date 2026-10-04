@@ -3,7 +3,7 @@
 ## Architecture
 
 - **Memory-mapped IO**: Files are read via `Mmap.mmap`, producing a shared read-only `Vector{UInt8}`. No `IOStream` seek/read — safe for concurrent access.
-- **Per-RowGroup parallelism**: Each column spawns tasks (`Threads.@spawn`) that process row groups in parallel. Results are composed via `ChainedVector` (zero-copy, no concatenation).
+- **Per-RowGroup parallelism**: Each column spawns tasks (`Threads.@spawn`) that process row groups in parallel, and the leaves of a struct in parallel within a row group. Results are composed via `ChainedVector` (zero-copy, no concatenation).
 - **Arrow-native arrays**: Decoded Parquet pages are assembled directly into `Arrow.Primitive`, `Arrow.BoolVector`, and `Arrow.List` — matching Parquet's Dremel encoding to Arrow's offset-based layout in a single pass. These are built through Arrow.jl's internal positional constructors, which are not public API, so the compat bound is tight (`Arrow = "~2.8.1"`, the 2.8 series only) and must be re-checked on each Arrow minor release.
 
 ## FixedSizeList Design
@@ -17,65 +17,69 @@ This package uses two structs to circumvent the issue:
 
 `FixedSizeListVector` is not an `Arrow.ArrowVector` subtype. It registers `ArrowKind = FixedSizeListKind{N,T}` so `Arrow.write` can serialize it correctly, but:
 
-- FSL fields are detected from ARROW:schema at top level and inside structs (`parse_arrow_schema` keys a struct member by its dotted path, e.g. `"wf.values"`); a struct member is assembled by the same dense/direct FSL paths as a top-level column, with the struct's null threshold. Nested FixedSizeList (e.g., `FixedSizeList<FixedSizeList<T>>`) is not supported.
+- FSL fields are detected from ARROW:schema at top level and inside structs (`parse_arrow_schema` keys a struct member by its dotted path, e.g. `"wf.values"`). Nested FixedSizeList (e.g., `FixedSizeList<FixedSizeList<T>>`) is not supported.
 - Composition with other Arrow types (e.g., `List<FixedSizeList<T>>`) falls back to variable-length lists at all levels.
 - If you write the table to an Arrow IPC file with `Arrow.write` and read it back with `Arrow.read`, FixedSizeList columns will come back as Arrow.jl's native `NTuple`-based `FixedSizeList`, not as `FixedSizeListVector`. The data is preserved, but the zero-copy view behavior is lost.
 
-## Struct Design
+## Reader Design
 
-Parquet has no physical struct storage — a group is pure schema nesting over independently
-stored leaf columns, so struct support is an assembly feature. Each member leaf is decoded
-with the existing page machinery, then wrapped in `Arrow.Struct` (a tuple of child columns
-plus a validity bitmap; `NamedTuple` elements are materialized lazily on `getindex`).
+The reader (`src/reader.jl`) is the inverse of the writer's `_plan_node` / `_shred!`:
+schema tree → plan tree → prune to the selection → recursive assembly. It replaced three
+shape-specific paths (leaf/list, struct, list<struct>) and a flattened fallback.
 
-`Arrow.Struct` stores fields positionally with no name-based access, so — following the
-`FixedSizeListVector` precedent — the public container is our own `StructColumn` wrapper:
-`col[i]` delegates row access to the wrapped `Arrow.Struct` (or `ChainedVector` of per-RG
-chunks), and `getproperty` maps `col.fieldname` to the full child column, chaining chunks
-per field for multi-RowGroup files. `Arrow.write` serializes it as a native struct column
-(the `NamedTuple` eltype drives `ArrowTypes.StructKind` inference). It does so by
-re-encoding the column row by row, not by reusing the wrapped buffers. The round-trip is
-tested for struct-of-struct and `List<Struct>` columns; it fails for one shape, listed
-under Known Limitations.
+**Plan tree** (`plan_read_tree`). Three node kinds: `:leaf` (values and element
+validity), `:list` (offsets and validity; one child), `:struct` (validity; its members).
+A list covers the standard 3-level LIST, the legacy 2-level forms, a bare repeated field,
+and MAP (a list of key/value structs; a map without values is a list of its keys, as in
+pyarrow). Each node records the definition level from which it is non-null, its
+repetition depth, and for a list the level from which an item exists. A node's `key` is
+the path a user types (`"wf.values"`, `"particles.pt"`, `"m.key"`), without a list's
+`list`/`element` or a map's `key_value` segments — the same keys as the writer's
+`encoding` keyword.
 
-Null attribution comes from raw definition levels. For
-`optional wf { optional t0; optional values (LIST) { repeated list { optional element }}}`
-(max_def = 4 on the `values` leaf): def 0 = struct null, 1 = list null, 2 = empty list,
-3 = element null, 4 = value. Struct validity is derived from the first member's def levels
-(`def <` the group's own def level), taken at record starts (rep == 0) when that member is
-a list. List members reuse `_to_arrow_nested` with a
-`record_null_def` threshold: below it the record is a null list (for top-level list columns
-the threshold is 1, preserving the old `def == 0` behavior).
+**Pruning** (`prune_read_plan`). `columns=` keeps the selected leaves and their ancestors.
+Assembly never knows it was handed a subset: structure comes from the leftmost *remaining*
+leaf. Unselected leaves are not in the plan, so they are not decoded. An unmatched key is
+an error.
 
-Element-type stability across row-group chunks (required for `ChainedVector`) is decided
-before reading data: a struct can only be null where *every* member is null, so if any flat
-member's column-chunk statistics report zero nulls, the struct eltype excludes `Missing`.
+**Slots.** A node has one slot per item of its nearest enclosing list, or one per row
+outside lists. A level entry starts a slot when `rep <= slot_rep && def >= slot_def`,
+where those are the enclosing list's repetition depth and item level. A slot is null at a
+node when `def < node.def_level`, for any reason: the node is null or an ancestor is. A
+struct member is therefore missing wherever its struct is, which is what `col.member`
+must show for those rows (pyarrow's `flatten` semantics).
 
-Nested structs assemble recursively via a per-column plan (`_plan_struct`); one leftmost
-leaf's def levels encode the nullness of every ancestor group, so each nesting level slices
-its own validity from the same `record_defs` vector by comparing against its own def level.
+**One leaf's levels serve every ancestor.** All leaves under a node carry the same
+structure above it (the Dremel invariant), so each list or struct takes its offsets and
+validity from its leftmost leaf's levels (`_list_structure`, `_slot_nulls`), one short
+pass per node. Every other leaf only places its values in slots (`_scatter_leaf`; without
+null elements the decoded values are used as they are).
 
-`List<Struct>` inverts the decomposition: every member leaf carries an identical copy of the
-list structure in its rep/def levels (a Dremel invariant), so offsets and list/element
-validity are built once from the first member, remaining members contribute child arrays at
-element granularity, and the result is `Arrow.List` over `Arrow.Struct`, wrapped in
-`ListOfStructsColumn` (named field access returns a ragged per-field list sharing offsets).
+**Two stages.** Stage 1 (`_read_buffers`) runs per row group in parallel and returns raw
+buffers per node; nothing in it depends on whether a type admits `Missing`. Stage 2
+(`_wrap_buffers`) runs once all row groups are in: a node's type admits `Missing` exactly
+when a null was decoded at that node in any row group, and every chunk is wrapped with
+that one type, so `ChainedVector` composition is stable. Statistics are not consulted, so
+element types do not depend on the writer. Consequence: types depend on the data read;
+two files with the same schema can differ in `Missing`.
 
-Unsupported shapes (`List<Struct{List}>`, maps) fall back to flattened dotted columns; a
-repeated leaf claims the bare top-level column name only when it is the sole leaf under that
-top, so multi-leaf fallbacks can no longer silently collide on one name.
+**FixedSizeList.** A list node that `ARROW:schema` declares fixed-size, with a primitive
+element and outside other lists, is read into one flat vector: straight copies of the
+page values when there are no nulls (the dense path, which is what makes waveforms fast),
+a scatter by level otherwise. It reports one level entry per row to its parent, so
+nothing above it does per-element work.
 
-## Nested List Assembly
+**Wrappers.** `_wrap_nested` (src/api.jl) gives named field access to any array whose
+elements are structs, directly (`StructColumn`) or through list levels
+(`ListOfStructsColumn`); `_member_list` projects a field through every list level,
+sharing each level's offsets and validity. Both are one type, `NestedColumn`.
+`Arrow.Struct` stores fields positionally with no name-based access, which is why the
+wrapper exists; `Arrow.write` serializes a wrapped column by re-encoding it row by row,
+not by reusing the buffers (see Known Limitations for the one shape that fails).
 
-`_to_arrow_nested` turns rep/def levels into nested `Arrow.List`s in one pass. An entry
-with rep = r continues the level-r list, so new lists open at levels r+1..max_rep; each
-opening pushes a start offset and a validity bit for that level, provided its parent item
-exists (`def >=` the parent's repeated-node threshold). A level-k list is null when def is
-below its own group's def level, i.e. `def < thresholds[k] - 1`. Null leaf elements take a
-slot in the child array that is never read.
-
-A column chunk with no pages (zero-row file or row group) is given one empty page of the
-leaf's physical type (`_empty_pages`), so every column kind assembles to a typed empty column.
+**A column chunk with no pages** (zero-row file or row group) gets one empty page of the
+leaf's physical type (`_empty_pages`), so every shape assembles to a typed empty column,
+with no `Missing` anywhere since no null was seen.
 
 ## Writer Design
 
@@ -85,8 +89,7 @@ write field tables that emit only the fields we produce. Encoders in `src/encodi
 are inverses of the decoders beside them (`encode_plain`, `encode_rle_bitpacked` —
 RLE-runs-only, always a valid form of the hybrid encoding). `src/filewriter.jl`
 assembles pages (length-prefixed RLE def levels + PLAIN values), column chunks, and
-the footer. All columns are written OPTIONAL with null-count statistics so the
-reader's statistics-based eltype derivation works on our own files.
+the footer. All columns are written OPTIONAL, with null-count statistics for readers that use them.
 
 Nested writing is one recursion over the column's element type. `_plan_node` builds the
 schema subtree — `NamedTuple` → group, `AbstractVector` → 3-level LIST, otherwise a
@@ -97,14 +100,12 @@ depth, except the first item, which inherits the enclosing one. A null or empty 
 recorded in every leaf below the node where the path stopped. `_data_page` writes any
 leaf. `NamedTuple` types must be concrete, since member types are read from the type. For example `List<primitive>` has
 def 0 = null list, 1 = empty list, 2 = null element, 3 = value. `Vector{UInt8}` elements
-are byte strings, not lists. `null_count` follows pyarrow leaf by leaf (`_null_count`), because readers, ours included,
-derive nullability from it. pyarrow's rule is not written down anywhere; measured on
+are byte strings, not lists. `null_count` follows pyarrow leaf by leaf (`_null_count`), for readers that derive
+nullability from it (ours did until the recursive reader; it now uses the decoded levels). pyarrow's rule is not written down anywhere; measured on
 pyarrow 23 across 18 leaf positions it is: a leaf that is itself a list's element counts
 every level entry without a value, null and empty lists included; a leaf below a struct
 inside a list counts only the list's existing slots, so null and empty lists are left out;
-outside lists the two agree. The reader does not depend on which convention a file uses
-for correctness: a writer that counts more only makes element types looser
-(`Union{Missing, …}`), never wrong. The test compares our statistics with pyarrow's for
+outside lists the two agree. The test compares our statistics with pyarrow's for
 every shape, so a change in pyarrow's behaviour would show up there.
 
 Because dispatch is on element type, the reader's containers (`Arrow.List`, `StructColumn`,
@@ -200,14 +201,14 @@ or micros. pyarrow then reports the same converted and logical types as for its 
 
 ## Known Limitations
 
-- A column that cannot be read is an error: `read_parquet` throws `ColumnReadError`, naming the column and keeping the original exception as `cause`; nothing is skipped silently. The other columns can be read with `columns=`. Columns in the Apache parquet-testing files that currently throw (pinned by the test "every file reads fully or is a known gap"; all of these predate v0.2.0 and were silently dropped before):
+- A column that cannot be read is an error: `read_parquet` throws `ColumnReadError`, naming the column and keeping the original exception as `cause`; nothing is skipped silently. The other columns can be read with `columns=`. Columns in the Apache parquet-testing files that currently throw (pinned by the test "every file reads fully or is a known gap"; all of these predate v0.2.0 and were silently dropped before; they are leaf-level, so the recursive reader did not change them — 13 of the 64 files):
   - Not implemented: DELTA_BYTE_ARRAY encoding (`delta_byte_array`, `delta_encoding_optional_column`, `delta_encoding_required_column`: string columns); BYTE_STREAM_SPLIT for anything but FLOAT/DOUBLE (`byte_stream_split_extended`: float16, int32, fixed-length, decimal); RLE-encoded boolean values (`datapage_v2.snappy` column `d`).
-  - Bugs, not yet investigated: an empty v2 data page (`datapage_v2_empty_datapage.snappy`); `dictionary_page_offset = 0` (`dict-page-offset-zero`); PLAIN fixed-length byte arrays (`fixed_length_byte_array`); the deprecated LZ4 codec in both its Hadoop-framed and unframed forms (`hadoop_lz4_compressed`, `hadoop_lz4_compressed_larger`, `non_hadoop_lz4_compressed`); `rle_boolean_encoding` (fails in gzip decompression); string data over 2 GB in one column (`large_string_map.brotli`: 32-bit offsets overflow).
+  - Bugs, not yet investigated: an empty v2 data page (`datapage_v2_empty_datapage.snappy`); `dictionary_page_offset = 0` (`dict-page-offset-zero`); PLAIN fixed-length byte arrays (`fixed_length_byte_array`); the deprecated LZ4 codec in both its Hadoop-framed and unframed forms (`hadoop_lz4_compressed`, `hadoop_lz4_compressed_larger`, `non_hadoop_lz4_compressed`); `rle_boolean_encoding` (fails in gzip decompression); string data over 2 GB in one column (`large_string_map.brotli`: 32-bit offsets overflow in the map's keys; `columns=["arr.value"]` reads).
 - The first `write_parquet` call for each new table schema that contains a FixedSizeList (top-level, or nested in structs or lists) takes 5–20 s. The `ARROW:schema` entry is produced by Arrow.jl's generic writer, which Julia compiles per table type. Tables without a FixedSizeList skip that path, and later writes of the same schema in the same session are fast. Hand-building the schema message would avoid it; that was decided against for v0.2.0.
 - Parquet stores only a UTC flag for timestamps, not a time zone name. An `Arrow.Timestamp` with a named zone is written as UTC-adjusted and reads back as `:UTC`. pyarrow shows it as `tz=UTC` too, unless the file also has an `ARROW:schema` entry (i.e. a FixedSizeList is present), in which case pyarrow restores the zone name from there. The instants are the same either way.
 - `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
-- Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
 - Of the `logicalType` union only the TIMESTAMP member is parsed; everything else still relies on `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both). INT96 timestamps and TIME are not converted.
-- A `FixedSizeList` is restored at top level and as a struct member (at any struct depth). Inside a list or a `List<Struct>` (e.g. `list<fixed_size_list>`, `list<struct<…fsl…>>`) it is read as a variable-length list and written back as one: values are correct, but the fixed size is lost.
+- A `FixedSizeList` is restored at top level and as a struct member (at any struct depth). Inside a list (e.g. `list<fixed_size_list>`, `list<struct<…fsl…>>`) it is read as a variable-length list and written back as one: values are correct, but the fixed size is lost.
+- A map is read as a list of `(key, value)` structs, not as a `Dict`; written back, it is a list of structs, not a Parquet MAP.
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
 - `open_parquet` / `read_parquet` on a non-existent path gives "File too small" instead of "File not found" (Mmap.mmap silently creates an empty file). Needs a guard in the public API.

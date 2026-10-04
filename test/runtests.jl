@@ -19,34 +19,47 @@ using Dates
         @test Parquet3.decode_rle_bitpacked(data, 3, 8) == UInt32[5, 5, 5]
     end
 
-    # Level arrays straight into the live list assembler (required lists, optional elements)
-    nested(rep, def, vals, max_def, max_rep) = Parquet3._to_arrow_nested(
-        rep, def, vals, max_def, max_rep, collect(1:max_rep), Parquet3.INT32, nothing)
-    plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
+    # Level arrays straight into the reader's list assembly. `list_node(k)` is the k-th of
+    # nested required lists with optional elements: it is non-null from def k-1 and has an
+    # item from def k; its slots are the items of list k-1 (or the rows, for k = 1).
+    list_node(k) = Parquet3.ReadNode(:list, "l", "l", ["l"], k - 1, k, k,
+                                     Parquet3.SchemaNode(element = Parquet3.SchemaElement()), Parquet3.ReadNode[])
+    structure(rep, def, k) = Parquet3._list_structure(Parquet3.Levels(rep, def), k - 1, k - 1, list_node(k))
 
     @testset "Nested Column Assembly" begin
         # [[1, 2], [3], [4, 5, 6]]: rep 0 starts a record, 1 continues its list; def 2 = value
-        col = nested([0, 1, 0, 0, 1, 1], [2, 2, 2, 2, 2, 2], Int32[1, 2, 3, 4, 5, 6], 2, 1)
-        @test col isa Arrow.List && plain(col) == Any[Any[1, 2], Any[3], Any[4, 5, 6]]
-        @test !(Missing <: eltype(col))
+        rep, def = [0, 1, 0, 0, 1, 1], [2, 2, 2, 2, 2, 2]
+        @test structure(rep, def, 1) == (Int32[0, 2, 3, 6], falses(3))
+        values, nulls = Parquet3._scatter_leaf(Int32[1, 2, 3, 4, 5, 6], def, 1, 2)
+        @test values == [1, 2, 3, 4, 5, 6] && !any(nulls)
     end
 
     @testset "Nested Column with Nulls" begin
-        # [[1, null, 2], [3]]: def 1 = null element
-        col = nested([0, 1, 1, 0], [2, 1, 2, 2], Int32[1, 2, 3], 2, 1)
-        @test isequal(plain(col), Any[Any[1, missing, 2], Any[3]])
+        # [[1, null, 2], [3]]: def 1 = null element, which takes a slot but no value
+        rep, def = [0, 1, 1, 0], [2, 1, 2, 2]
+        @test structure(rep, def, 1) == (Int32[0, 3, 4], falses(2))
+        values, nulls = Parquet3._scatter_leaf(Int32[1, 2, 3], def, 1, 2)
+        @test values[[1, 3, 4]] == [1, 2, 3] && nulls == [false, true, false, false]
     end
 
     @testset "Deeply Nested (List<List<T>>)" begin
         # [[[1, 2], [3]], [[4, 5]]]: rep 2 continues the inner list, 1 starts a new inner list
-        col = nested([0, 2, 1, 0, 2], [3, 3, 3, 3, 3], Int32[1, 2, 3, 4, 5], 3, 2)
-        @test plain(col) == Any[Any[Any[1, 2], Any[3]], Any[Any[4, 5]]]
+        rep, def = [0, 2, 1, 0, 2], [3, 3, 3, 3, 3]
+        @test structure(rep, def, 1) == (Int32[0, 2, 3], falses(2))          # rows → inner lists
+        @test structure(rep, def, 2) == (Int32[0, 2, 3, 5], falses(3))       # inner lists → values
     end
 
     @testset "Triple Nested (List<List<List<T>>>)" begin
         # [[[[1, 2]]]]: rep 3 continues the innermost list
-        col = nested([0, 3], [4, 4], Int32[1, 2], 4, 3)
-        @test plain(col) == Any[Any[Any[Any[1, 2]]]]
+        rep, def = [0, 3], [4, 4]
+        @test [first(structure(rep, def, k)) for k in 1:3] == [Int32[0, 1], Int32[0, 1], Int32[0, 2]]
+    end
+
+    @testset "Null and empty lists" begin
+        # optional list of optional elements: [[7], null, [], [null]] → def 3 value, 0 null list, 1 empty, 2 null element
+        node = Parquet3.ReadNode(:list, "l", "l", ["l"], 1, 1, 2, Parquet3.SchemaNode(element = Parquet3.SchemaElement()), Parquet3.ReadNode[])
+        offsets, nulls = Parquet3._list_structure(Parquet3.Levels([0, 0, 0, 0], [3, 0, 1, 2]), 0, 0, node)
+        @test offsets == Int32[0, 1, 1, 1, 2] && nulls == [false, true, false, false]
     end
 
     @testset "Struct null attribution" begin
@@ -127,7 +140,7 @@ table = pa.table({
     'tags': [['x', 'y'], ['z'], ['w']],
     'scores': [[1, 2], [3, 4], [5, 6]],
 })""") do tbl
-        pf = open_parquet("test_colnames.parquet")
+        pf = open_parquet(joinpath(@__DIR__, "test_colnames.parquet"))
         expected = collect(string.(Tables.columnnames(tbl)))
         @test column_names(pf) == expected
         close(pf)
@@ -358,15 +371,19 @@ table = schema.empty_table()""") do tbl
     end
 end
 
-@testset "Unmatched column selection warns" begin
+@testset "Column selection" begin
     _with_pyarrow_file("column selection", "test_select.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
-table = pa.table({'id': [1, 2], 's': pa.array([{'a': 1}, {'a': 2}], type=pa.struct([('a', pa.int64())]))})""") do _
+table = pa.table({'id': [1, 2], 's': pa.array([{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}], type=pa.struct([('a', pa.int64()), ('b', pa.string())]))})""") do _
         path = joinpath(@__DIR__, "test_select.parquet")
         @test collect(propertynames(read_parquet(path; columns=["s"]))) == [:s]
-        @test_logs min_level=Base.CoreLogging.Warn read_parquet(path; columns=["id", "s"])
-        tbl = @test_logs (:warn, r"not found") min_level=Base.CoreLogging.Warn read_parquet(path; columns=["id", "s.a", "typo"])
-        @test collect(propertynames(tbl)) == [:id]
+        @test collect(propertynames(read_parquet(path; columns=["s", "id"]))) == [:id, :s]     # schema order
+        # A member is selected by its dotted path; the struct comes back with only that member
+        tbl = read_parquet(path; columns=["id", "s.a"])
+        @test collect(propertynames(tbl)) == [:id, :s] && propertynames(tbl.s) == (:a,) && tbl.s.a == [1, 2]
+        # A name that matches nothing is an error naming it
+        @test_throws "no column matches \"typo\"" read_parquet(path; columns=["id", "s.a", "typo"])
+        @test_throws ArgumentError read_parquet(path; columns=["a"])       # a bare member name is not a column
     end
 end
 
@@ -629,19 +646,18 @@ write_kwargs = {'row_group_size': 7}""") do tbl
         @test sum(length, ps.a) == sum(i % 4 for i in 0:29)
     end
 
-    # list<struct{list}> is not yet assembled — must fall back to distinct dotted
-    # columns instead of silently colliding on the top-level name
-    _with_pyarrow_file("unsupported list<struct{list}> fallback", "test_los_fallback.parquet", """
+    # list<struct{list}> is one column with named access to both members
+    _with_pyarrow_file("list<struct{list}>", "test_los_fallback.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 particles = pa.array(
     [[{'pt': 1.0, 'trace': [1, 2]}], [{'pt': 2.0, 'trace': [3]}, {'pt': 3.0, 'trace': []}]],
     type=pa.list_(pa.struct([pa.field('pt', pa.float64()),
                              pa.field('trace', pa.list_(pa.int32()))])))
 table = pa.table({'particles': particles})""") do tbl
-        names = collect(Tables.columnnames(tbl))
-        @test length(names) == length(unique(names)) == 2   # no collision, both leaves present
-        pt_col = Tables.getcolumn(tbl, only(filter(n -> contains(string(n), "pt"), names)))
-        @test collect(skipmissing(pt_col[2])) == [2.0, 3.0]
+        @test collect(Tables.columnnames(tbl)) == [:particles]
+        @test tbl.particles isa Parquet3.ListOfStructsColumn && propertynames(tbl.particles) == (:pt, :trace)
+        @test collect(tbl.particles.pt[2]) == [2.0, 3.0]
+        @test collect.(tbl.particles.trace[2]) == [[3], Int32[]] && tbl.particles[1][1].trace == [1, 2]
     end
 
     _with_pyarrow_file("multi-rowgroup struct", "test_struct_multi_rg.parquet", """
@@ -1612,7 +1628,7 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
     "fixed_length_byte_array.parquet" => ["flba_field"],
     "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
     "hadoop_lz4_compressed_larger.parquet" => ["a"],
-    "large_string_map.brotli.parquet" => ["arr.key_value.key"],
+    "large_string_map.brotli.parquet" => ["arr"],
     "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
     "rle_boolean_encoding.parquet" => ["datatype_boolean"],
 )
@@ -1880,19 +1896,13 @@ else
 end
 
 # =============================================================================
-# Recursive reader (Part 4)
+# Reader: plan, assembly, nested shapes, selection
 # =============================================================================
 
 include("reader_harness.jl")
 
-@testset "Reader harness (R0)" begin
-    @testset "oracle" begin
-        NT = @NamedTuple{a::Union{Missing, Int64}, v::Union{Missing, Vector{Union{Missing, Int32}}}}
-        @test harness_shape(Union{Missing, NT}) == (:struct, (:a, :v), (Int64, (:list, Int32)))
-        @test harness_shape(Union{Missing, NT}) == harness_shape(@NamedTuple{a::Int64, v::Vector{Int32}})
-        @test harness_shape(Parquet3.FixedSizeView{3, Int32}) == (:fixed_size_list, 3, Int32)
-        @test harness_shape(Vector{Int64}) != harness_shape(Vector{Int32})
-
+@testset "Reader corpus: every file reads in full, with exact nullability" begin
+    @testset "loose_nodes" begin
         tight = (a = [1, 2], l = [[1], Int[]], s = [(x = 1,), (x = 2,)], o = [1, missing])
         @test isempty(loose_nodes(tight))
         loose = (a = Union{Missing, Int}[1, 2], l = Union{Missing, Vector{Union{Missing, Int}}}[[1], [2]],
@@ -1901,30 +1911,20 @@ include("reader_harness.jl")
                  # a member is missing wherever its struct is, so `x` needs Missing here; `y`'s list elements do not
                  n = Union{Missing, @NamedTuple{x::Union{Missing, Int}, y::Union{Missing, Vector{Union{Missing, Int}}}}}[(x = 1, y = [1]), missing])
         @test loose_nodes(loose) == ["a", "l", "l[]", "s", "s.x", "n.y[]"]
-
-        same = (a = [1, 2], l = [[1.5], Float64[]], s = [(x = "a", v = [1]), (x = "b", v = Int[])])
-        @test isempty(reader_differences(same, same))
-        @test isempty(reader_differences(same, merge(same, (a = Union{Missing, Int}[1, 2],))))   # Missing is stripped
-        @test reader_differences(same, merge(same, (a = [1, 3],))) == ["a: values differ"]
-        @test reader_differences(same, merge(same, (a = Int32[1, 2],))) == ["a: element type Int64 vs Int32"]
-        @test reader_differences(same, merge(same, (l = [[1.5], missing],))) == ["l: values differ"]
-        @test only(reader_differences(same, (a = same.a, l = same.l))) |> startswith("column names differ")
     end
 
+    # pyarrow fixtures (shapes × writer options), our writer's files, the parquet-testing
+    # files without known gaps, and part-0.parquet where it exists locally
     mktempdir() do dir
         corpus = harness_corpus(dir)
         @test length(corpus) > 20
-        # Until the new reader exists, the old reader is compared with itself: this checks the
-        # corpus reads and the oracle is stable, and records where today's types are loose.
-        results = run_reader_harness(read_parquet, read_parquet, corpus)
-        @test all(r -> isempty(r.differences), results)
-        loose = [(r.label, r.loose_old) for r in results if !isempty(r.loose_old)]
-        @info "Reader harness: $(length(corpus)) files; statistics-based types are loose in $(length(loose)):\n" *
-              join(("  $label: $(join(nodes, ", "))" for (label, nodes) in loose), "\n")
+        @testset "$label" for (label, path) in corpus
+            @test isempty(loose_nodes(read_parquet(path)))      # Missing only where a missing occurs
+        end
     end
 end
 
-@testset "Reader plan and pruning (R1)" begin
+@testset "Reader: plan and pruning" begin
     P = Parquet3
     plan_of(path) = (pf = open_parquet(path); tree = P.build_schema_tree(pf.metadata.schema); close(pf);
                      (P.plan_read_tree(tree), tree))
@@ -1991,68 +1991,29 @@ end
         @test [l.key for l in P.read_leaves(nested_maps[1])] == ["a.key", "a.value.key", "a.value.value"]
         @test strings(first(plan_of(ptfile("nested_lists.snappy.parquet"))))[1] == "a: list@1/2<list@3/4<list@5/6<leaf@7>>>"
 
-        # Every schema plans, and the plan agrees with the schema tree the current reader uses:
-        # same leaves in the same order, same levels, and the lists enclosing a leaf have the
-        # item levels the current reader computes as thresholds.
-        items(node, acc = Int[]) = node.kind == :leaf ? [(node.path, acc)] :
-            reduce(vcat, [items(c, node.kind == :list ? [acc; node.item_def] : acc) for c in node.children])
+        # Every schema plans, and the plan agrees with the schema tree: the same leaves in the
+        # same order with the same levels, each under as many lists as its repetition level.
+        depths(node, n = 0) = node.kind == :leaf ? [(node, n)] :
+            reduce(vcat, [depths(c, n + (node.kind == :list)) for c in node.children])
         for f in filter(endswith(".parquet"), readdir(PARQUET_TESTING_DIR))
             plan, tree = plan_of(ptfile(f))
             leaves, columns = [l for n in plan for l in P.read_leaves(n)], P.get_leaf_columns(tree)
             @testset "$f" begin
                 @test [l.path for l in leaves] == first.(columns)
                 @test all(l.def_level == c.max_def_level && l.rep_level == c.max_rep_level for (l, (_, c)) in zip(leaves, columns))
-                @test all(acc == P.compute_def_thresholds(tree, path) && length(acc) == length(P.compute_def_thresholds(tree, path))
-                          for n in plan for (path, acc) in items(n))
+                @test all(leaf.rep_level == n for node in plan for (leaf, n) in depths(node))
             end
         end
     end
 end
 
 
-@testset "Recursive reader against the current reader (R2–R4)" begin
-    # Where the two readers are known to differ, and why. Each is checked against pyarrow below.
-    old_reader_bugs = Dict(
-        # A required list (bare repeated field) that is empty: the old reader returns `missing`
-        "parquet-testing:repeated_primitive_no_list.parquet" => ["Int32_list: values differ"],
-    )
-    mktempdir() do dir
-        # Every column the current reader assembles (it flattens the rest; those are tested in R5)
-        corpus = [(label, path, harness_r4_columns(path)) for (label, path) in harness_corpus(dir)]
-        corpus = filter(c -> !isempty(c[3]), corpus)
-        @test length(corpus) > 60
-        results = map(corpus) do (label, path, cols)
-            old = read_parquet(path; columns = cols)
-            new = Parquet3._read_parquet_recursive(path; columns = cols)
-            # Named field access must agree too, for struct and list-of-struct columns alike
-            fields = [(c, f) for c in Tables.columnnames(new) if Tables.getcolumn(new, c) isa Parquet3.NestedColumn
-                             for f in propertynames(Tables.getcolumn(new, c))]
-            field_diffs = ["$c.$f" for (c, f) in fields
-                           if !(harness_same(getproperty(Tables.getcolumn(old, c), f), getproperty(Tables.getcolumn(new, c), f)) &&
-                                harness_shape(eltype(getproperty(Tables.getcolumn(old, c), f))) ==
-                                harness_shape(eltype(getproperty(Tables.getcolumn(new, c), f))))]
-            (label = label, columns = length(cols), fields = length(fields), field_diffs = field_diffs,
-             differences = reader_differences(old, new),
-             loose_old = loose_nodes(old), loose_new = loose_nodes(new))
-        end
-        @testset "$(r.label)" for r in results
-            @test r.differences == get(old_reader_bugs, r.label, String[])   # names, containers, values, element types up to Missing
-            @test isempty(r.loose_new)        # Missing only where a missing occurs
-            @test isempty(r.field_diffs)      # col.field equals the current reader's
-        end
-        tightened = [(r.label, setdiff(r.loose_old, r.loose_new)) for r in results if !isempty(setdiff(r.loose_old, r.loose_new))]
-        @info "Recursive reader (R4): $(length(corpus)) files, $(sum(r.columns for r in results)) columns, " *
-              "$(sum(r.fields for r in results)) named fields; " *
-              "element types tighten in $(length(tightened)):\n" *
-              join(("  $label: $(join(nodes, ", "))" for (label, nodes) in tightened), "\n")
-    end
-
+@testset "Reader: leaves, structs, lists, fixed-size lists" begin
     if HAS_PARQUET_TESTING
-        # The one known difference: pyarrow reads the empty required list as [], as the new reader does
+        # An empty list that cannot be null (bare repeated field) is [], as pyarrow reads it; it used to read as missing
         path = joinpath(PARQUET_TESTING_DIR, "repeated_primitive_no_list.parquet")
-        new = Parquet3._read_parquet_recursive(path; columns = ["Int32_list"])
+        new = read_parquet(path; columns = ["Int32_list"])
         @test collect.(new.Int32_list) == [[0, 1, 2, 3], Int32[], [4], [5, 6, 7, 8]]
-        @test any(ismissing, read_parquet(path; columns = ["Int32_list"]).Int32_list)     # the old reader's answer
         result = _run_pyarrow("import pyarrow.parquet as pq; print(pq.read_table('$(path)').column('Int32_list').to_pylist())")
         result === nothing || @test result == "[[0, 1, 2, 3], [], [4], [5, 6, 7, 8]]"
     end
@@ -2069,36 +2030,36 @@ end
             fsl  = [fsv(1, 2), fsv(3, 4), fsv(5, 6), fsv(7, 8)],
             ll   = [[[1, 2], Int[]], Vector{Int}[], [[3]], [[4], [5, 6]]],
         ))
-        t = Parquet3._read_parquet_recursive(path)
+        t = read_parquet(path)
         @test t.fsl isa Parquet3.FixedSizeListVector{2, Int32} && collect.(t.fsl) == [[1, 2], [3, 4], [5, 6], [7, 8]]
         @test eltype(t.wf.values) == Union{Missing, V} && ismissing(t.wf.values[2]) && t.wf.values[3] == [3, 4]
         @test isequal(collect.(skipmissing(t.wf.tags)), [["a", missing], String[]]) && ismissing(t.wf[2]) && ismissing(t.wf[3].tags)
         @test collect(map(l -> collect.(l), t.ll)) == [[[1, 2], Int[]], Vector{Int}[], [[3]], [[4], [5, 6]]]
         @test !(Missing <: eltype(t.ll)) && !(Missing <: eltype(first(t.ll))) && eltype(first(first(t.ll))) == Int64
         # Selecting one member reads only that leaf; the struct's validity then comes from it
-        sel = Parquet3._read_parquet_recursive(path; columns = ["wf.tags", "ll"])
+        sel = read_parquet(path; columns = ["wf.tags", "ll"])
         @test collect(propertynames(sel)) == [:wf, :ll] && propertynames(sel.wf) == (:tags,)
         @test ismissing(sel.wf[2]) && ismissing(sel.wf[3].tags) && isequal(collect(sel.wf[1].tags), ["a", missing])
-        only_fsl = Parquet3._read_parquet_recursive(path; columns = ["wf.values"])
+        only_fsl = read_parquet(path; columns = ["wf.values"])
         @test only_fsl.wf.values isa Parquet3.FixedSizeListVector && ismissing(only_fsl.wf[2]) && only_fsl.wf[4].values == [5, 6]
     end
 
-    # Field metadata, member access and selection behave as with the current reader
+    # Member access and selection on a struct
     mktempdir() do dir
         path = joinpath(dir, "s.parquet")
         write_parquet(path, (id = [1, 2, 3], s = Union{Missing, @NamedTuple{a::Union{Missing, Int32}, b::String}}[
                                  (a = Int32(1), b = "x"), missing, (a = missing, b = "z")]))
-        t = Parquet3._read_parquet_recursive(path)
+        t = read_parquet(path)
         @test t.s isa Parquet3.StructColumn && isequal(t.s.a, [1, missing, missing]) && isequal(t.s.b, ["x", missing, "z"])
         @test eltype(t.id) == Int64 && ismissing(t.s[2]) && t.s[3].b == "z"
-        only_b = Parquet3._read_parquet_recursive(path; columns = ["s.b"])
+        only_b = read_parquet(path; columns = ["s.b"])
         @test collect(propertynames(only_b)) == [:s] && propertynames(only_b.s) == (:b,)
         @test isequal(collect(only_b.s), [(b = "x",), missing, (b = "z",)])
-        @test_throws ArgumentError Parquet3._read_parquet_recursive(path; columns = ["s.c"])
+        @test_throws ArgumentError read_parquet(path; columns = ["s.c"])
     end
 end
 
-@testset "Recursive reader: new shapes and maps (R5)" begin
+@testset "Reader: nested shapes and maps" begin
     P = Parquet3
     plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
 
@@ -2108,7 +2069,7 @@ end
             path, out = joinpath(dir, name), joinpath(dir, "rw_" * name)
             _run_pyarrow(HARNESS_NEW_SHAPES * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
                 (@warn "Skipping new-shape pyarrow fixtures: uv/pyarrow not available"; break)
-            t = P._read_parquet_recursive(path)
+            t = read_parquet(path)
             @test collect(propertynames(t)) == [:lsl, :lss, :sls, :lls, :m, :mm, :sm, :id]
             @test isempty(loose_nodes(t))
 
@@ -2136,7 +2097,7 @@ end
             @test plain(t.sm.tags.key[1]) == Any["t"] && plain(t.sm.tags.value[1]) == Any[1.5]
 
             # Selecting inside the new shapes
-            sel = P._read_parquet_recursive(path; columns = ["lsl.adc", "m.key", "sls.hits.x"])
+            sel = read_parquet(path; columns = ["lsl.adc", "m.key", "sls.hits.x"])
             @test collect(propertynames(sel)) == [:lsl, :sls, :m]
             @test propertynames(sel.lsl) == (:adc,) && propertynames(sel.m) == (:key,) && propertynames(sel.sls) == (:hits,)
             @test isequal(plain(sel.lsl.adc), plain(t.lsl.adc)) && isequal(plain(sel.m.key), plain(t.m.key))
@@ -2166,7 +2127,7 @@ end
                     [(tracks = @NamedTuple{hits::Vector{Int}, q::Int32}[],)], [(tracks = [(hits = [3], q = Int32(1))],)]],
         )
         write_parquet(path, tbl)
-        t = P._read_parquet_recursive(path)
+        t = read_parquet(path)
         @test collect(propertynames(t)) == collect(keys(tbl))
         for k in keys(tbl)
             @test isequal(plain(getproperty(t, k)), plain(tbl[k]))
@@ -2183,7 +2144,7 @@ end
                      "nested_lists.snappy", "list_columns", "null_list", "old_list_structure", "repeated_primitive_no_list"]
             pairs = map(files) do f
                 orig, out = joinpath(PARQUET_TESTING_DIR, f * ".parquet"), joinpath(dir, f * ".parquet")
-                write_parquet(out, P._read_parquet_recursive(orig))
+                write_parquet(out, read_parquet(orig))
                 (orig, out)
             end
             verdicts = harness_pyarrow_compare(pairs)
@@ -2191,20 +2152,13 @@ end
                 @test v == "equal"
             end
             # pyarrow rejects this file's schema; it reads here as a map of strings
-            t = P._read_parquet_recursive(joinpath(PARQUET_TESTING_DIR, "incorrect_map_schema.parquet"))
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "incorrect_map_schema.parquet"))
             @test plain(t.my_map.key) == Any[Any["parent", "name"]] && plain(t.my_map.value) == Any[Any["another", "report"]]
-        end
-    end
-
-    # Nothing in the corpus is left that the new reader cannot read in full, with exact nullability
-    mktempdir() do dir
-        @testset "$label" for (label, path) in harness_corpus(dir)
-            @test isempty(loose_nodes(P._read_parquet_recursive(path)))
         end
     end
 end
 
-@testset "Recursive reader: member selection (R6)" begin
+@testset "Reader: member selection" begin
     P = Parquet3
     plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
     mktempdir() do dir
@@ -2214,14 +2168,14 @@ end
             selections = [["id"], ["lsl"], ["lsl.adc"], ["lsl.x", "id"], ["lss.vertex.tag"], ["lss.vertex", "lss.id"], ["sls.run"],
                           ["sls.hits"], ["sls.hits.adc"], ["lls.vertex.x"], ["lls.id", "lsl.x"], ["m"], ["m.key"], ["m.value"],
                           ["mm.value.value"], ["mm.key", "mm.value.key"], ["sm.tags.value", "sm.n"], ["sm.tags"]]
-            verdicts = harness_compare_selections(P._read_parquet_recursive, path, selections, dir)
+            verdicts = harness_compare_selections(read_parquet, path, selections, dir)
             @testset "columns = $sel" for (sel, verdict) in zip(selections, verdicts)
                 @test verdict == "equal"
             end
 
             # A selection is the full column with the other members left out
-            full = P._read_parquet_recursive(path)
-            sel = P._read_parquet_recursive(path; columns = ["lss.vertex.tag", "sls.run", "m.value"])
+            full = read_parquet(path)
+            sel = read_parquet(path; columns = ["lss.vertex.tag", "sls.run", "m.value"])
             @test isequal(plain(sel.lss.vertex.tag), plain(full.lss.vertex.tag)) && propertynames(sel.lss.vertex) == (:tag,)
             @test isequal(plain(sel.sls.run), plain(full.sls.run)) && isequal(plain(sel.m.value), plain(full.m.value))
             @test ismissing(sel.sls[4]) && ismissing(sel.m[4])      # validity comes from the remaining leaf
@@ -2241,10 +2195,10 @@ table = pa.table({'id': [1, 2, 3], 's': pa.array([{'a': 1, 'b': 'x'}, None, {'a'
 pq.write_table(table, '$(path)', use_dictionary=False,
                column_encoding={'id': 'PLAIN', 's.a': 'PLAIN', 's.b': 'DELTA_BYTE_ARRAY', 'l.list.element.a': 'PLAIN', 'l.list.element.b': 'DELTA_BYTE_ARRAY'})
 print('SUCCESS')""") == "SUCCESS"
-            err = try P._read_parquet_recursive(path); nothing catch e; e end
+            err = try read_parquet(path); nothing catch e; e end
             @test err isa P.ColumnReadError && err.column == "s" && occursin("DELTA_BYTE_ARRAY", sprint(showerror, err))
-            @test_throws P.ColumnReadError P._read_parquet_recursive(path; columns = ["s.b"])
-            t = P._read_parquet_recursive(path; columns = ["id", "s.a", "l.a"])
+            @test_throws P.ColumnReadError read_parquet(path; columns = ["s.b"])
+            t = read_parquet(path; columns = ["id", "s.a", "l.a"])
             @test collect(t.id) == [1, 2, 3] && isequal(collect(t.s.a), [1, missing, 3]) && ismissing(t.s[2])
             @test isequal(plain(t.l), Any[Any[(a = 1,)], Any[], missing])
         end

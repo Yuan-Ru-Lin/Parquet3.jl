@@ -1,6 +1,5 @@
-# Recursive reader (Part 4): the read plan — the inverse of the writer's `_plan_node`.
-# Schema tree → plan tree → prune to the selected columns. Assembly follows in later steps;
-# nothing here is used by `read_parquet` yet.
+# The reader: the inverse of the writer's `_plan_node` / `_shred!`.
+# Schema tree → plan tree → prune to the selected columns → recursive assembly.
 
 """
 One node of the read plan. Three kinds, mirroring the writer:
@@ -331,11 +330,7 @@ function _read_column(ctx::ReadContext, row_groups::Vector{RowGroup}, node::Read
     _wrap_nested(length(arrays) == 1 ? only(arrays) : ChainedVector(arrays))
 end
 
-"""
-The recursive reader's entry point. Internal until it replaces `read_parquet`'s current
-paths (tasks/todo.md, Part 4, R7); until then it exists for the regression harness.
-"""
-function _read_parquet_recursive(pf::ParquetFile; columns::Union{AbstractVector{<:AbstractString}, Nothing} = nothing)
+function read_parquet(pf::ParquetFile; columns::Union{AbstractVector{<:AbstractString}, Nothing} = nothing)
     (; schema, fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
     plan = plan_read_tree(build_schema_tree(pf.metadata.schema))
     columns === nothing || (plan = prune_read_plan(plan, columns))
@@ -349,13 +344,4 @@ function _read_parquet_recursive(pf::ParquetFile; columns::Union{AbstractVector{
     Arrow.Table(names, Type[eltype(v) for v in vectors], vectors, Dict{Symbol, AbstractVector}(zip(names, vectors)),
                 schema !== nothing ? Ref(schema) : Ref{Arrow.Meta.Schema}(),
                 Ref{Union{Nothing, Base.ImmutableDict{String, String}}}(_parse_kv_metadata(pf.metadata.key_value_metadata)))
-end
-
-function _read_parquet_recursive(path::String; kwargs...)
-    pf = open_parquet(path)
-    try
-        return _read_parquet_recursive(pf; kwargs...)
-    finally
-        close(pf)
-    end
 end

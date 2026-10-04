@@ -388,28 +388,51 @@ entry point.
       Finding: "as in pyarrow" holds for `pq.ParquetFile(...).read(columns=<leaf paths>)`,
       which returns the pruned nested column. `pq.read_table(columns=["s.a"])` behaves
       differently: it returns a top-level column `a`, and cannot select inside lists.
-- [ ] R7 — switch the default; delete the old paths, the classification helpers and the
-      statistics-based nullability; docs; final benchmark. Re-run the parquet-testing files
-      with known read failures (task C list) against the new reader and report which still
-      fail and which went away; they are deliberately not fixed before the rewrite.
-
-- R8 (PROPOSED 2026-10-04, awaiting the user; not started) — maps the Arrow way, both
-      directions. Read: a MAP node wraps as `Arrow.Map`, so `col[i]` is a `Dict{K,V}` (at top
-      level, in structs, in lists, map of maps); a key-only map stays a list of keys. Write:
-      an element type `<: AbstractDict` is written as a Parquet MAP (group annotated MAP,
-      repeated `key_value`, required key, optional value); a vector of `(key, value)`
-      NamedTuples stays a list of structs. Tests against pyarrow in both directions, plus
-      `Arrow.write` of a map column.
+- [x] R7 (DONE, awaiting review; NOT merged into writer-w1) — `read_parquet` uses the
+      recursive reader. Deleted: the three old paths, the flattened fallback, the shape
+      classification helpers in `src/filereader.jl`, and statistics-based nullability.
+      Reader source (api.jl + filereader.jl + pagereader.jl + reader.jl): 1403 → 1202 lines.
+      Tests: the old-versus-new comparisons are retired with the old paths; the fallback
+      and unmatched-selection tests are rewritten; the four level-array unit tests now
+      drive `_list_structure` / `_scatter_leaf`.
+      Final benchmark on part-0 (local; three alternating process pairs, best of 15 each,
+      median of the three minima), writer-w1 → recursive-reader: all columns 198.0 → 196.5 ms;
+      `waveform_windowed` 165.8 → 166.5 ms; `waveform_presummed` 136.2 → 137.6 ms;
+      `tracelist` 5.1 → 4.5 ms. `waveform_windowed.t0` alone: 4.5 ms.
+      Task C read failures re-run: none went away. All 13 files fail at the same leaves;
+      they are leaf-level (encodings, codecs, page parsing), which this rewrite did not touch.
+      (Correction: the parquet-testing directory has 64 `.parquet` files, not 128; the
+      earlier "13 of 128" counted two tests per file.)
+- R8 (PROPOSED 2026-10-04, revised the same day; awaiting the user; not started) — maps with
+      Arrow's convention for what a map is, and our own zero-copy view for how it is shown
+      (the FixedSizeListVector / FixedSizeView precedent).
+      - Read: a MAP column keeps the columnar layout the reader already builds. `col.key` and
+        `col.value` stay as today. `col[i]` returns a lightweight `MapView{K,V} <:
+        AbstractDict{K,V}` over that row's keys and values: iteration in storage order
+        (duplicates and order preserved), `length`, `keys`, `values`, lookup by linear scan.
+        No allocation proportional to the row. `Dict(col[i])` for a real Dict. A key-only
+        map stays a list of keys.
+      - Write: an element type `<: AbstractDict` is written as a Parquet MAP (group annotated
+        MAP, repeated `key_value`, required key, optional value), for `Vector{Dict}` and for a
+        map column from `read_parquet` alike, nested or not. A vector of `(key, value)`
+        NamedTuples stays a list of structs.
+      - Check: whether `Arrow.write` serialises it as an Arrow map through `MapKind` without
+        extra code.
+      - Tests: pyarrow-written map / map of maps / map in struct / map in list; pyarrow reads
+        ours as map type with equal contents; read → write → read; `Arrow.write`; `col[i]`
+        does not allocate per entry; duplicate keys and order survive.
       Points against, to weigh before starting:
-      - `Arrow.Map` builds a `Dict` on every index access (allocation per row).
-      - A `Dict` drops duplicate keys and entry order, both of which Parquet allows.
-      - Columnar access to all keys or all values (`col.key`, `col.value`) is lost unless the
-        child stays reachable. Proposal if R8 goes ahead: keep it, by wrapping the `Arrow.Map`
-        in the existing wrapper so `col[i]` is a `Dict` while `col.key` / `col.value` still
-        return the ragged key and value lists.
-      - One more Arrow.jl internal positional constructor behind the tight compat bound.
-      - `columns=["m.key"]` (R6) returns a map without values; under R8 that would have to
-        stay a list of keys, as a key-only map does.
+      - `AbstractDict` expects `get`, `haskey`, `iterate`, `length` at least; a linear-scan
+        `get` is O(entries), fine for small maps, surprising for large ones.
+      - With duplicate keys, `Dict(col[i])` and `col[i][k]` have to pick one (first or last);
+        that choice must be documented.
+      - The row type changes from "vector of (key, value) NamedTuples" (R5) to a dict view,
+        so R5's map behaviour is not final; nothing is released yet, so no user is affected.
+      - `columns=["m.key"]` returns a map without values; that stays a list of keys.
+      - A null key is invalid in Parquet; the reader has to decide what a file containing one
+        reads as.
+      - Whether it is a flag on `NestedColumn` or a small new wrapper: likely a third `kind`
+        on `NestedColumn`, since field access is already there.
 
 ### Constraints carried from the brief
 - Structure and values of everything that assembles today are unchanged.

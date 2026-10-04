@@ -55,6 +55,7 @@ using Parquet3
 tbl = read_parquet("data.parquet")
 tbl.column_name          # access a column
 tbl = read_parquet("data.parquet"; columns=["id", "name"])  # read specific columns
+tbl = read_parquet("data.parquet"; columns=["wf.t0", "particles.pt"])  # only these members; the rest is not decoded
 
 # Write any Tables.jl-compatible table (flat, list, and struct columns; see Supported Features)
 write_parquet("out.parquet", (id = Int32[1, 2], name = ["a", missing], hits = [[1.5, 2.5], Float64[]],
@@ -62,7 +63,11 @@ write_parquet("out.parquet", (id = Int32[1, 2], name = ["a", missing], hits = [[
               compression = :zstd)   # default :snappy
 ```
 
-A column that cannot be read (an encoding or type not supported yet) throws a `Parquet3.ColumnReadError` naming it; nothing is skipped silently. Pass `columns=` without that column to read the rest.
+`columns` takes the dotted paths you would use to reach the data: `"id"` for a column, `"wf.values"` for a struct member, `"particles.pt"` for a member of a list of structs, `"m.key"` for a map's keys. A name selects everything under it. Selecting a member returns its column with only the selected parts (`wf` as a struct with only `t0`), and the other members are never decoded. A name that matches nothing is an `ArgumentError`. (pyarrow's `ParquetFile.read(columns=…)` prunes the same way; its `read_table` returns a selected struct member as a top-level column instead.)
+
+A column's element type admits `Missing` exactly where a null occurs in the data that was read; it does not depend on the schema's "optional" flags or on the writer's statistics. A member of a struct counts as missing wherever its struct is.
+
+A column that cannot be read (an encoding or type not supported yet) throws a `Parquet3.ColumnReadError` naming it; nothing is skipped silently. Pass `columns=` without that column, or without that member, to read the rest.
 
 `read_parquet` returns an `Arrow.Table`, which implements the Tables.jl interface:
 
@@ -102,7 +107,7 @@ Values are PLAIN-encoded by default. `encoding` accepts:
 
 Dictionary-encoded files are read, but dictionary encoding is not yet written (planned for v0.3).
 
-A single name applies to the whole table: it is used for every column whose type allows it, and the others stay PLAIN. A `Dict` chooses per column, keyed by the path used to reach the data: `encoding = Dict("x" => :byte_stream_split, "wf.values" => :plain, "particles.pt" => :byte_stream_split)`. A key naming a struct or list covers everything under it; in a `Dict`, an encoding that does not fit the column's type, or a key matching no column, is an error. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
+A single name applies to the whole table: it is used for every column whose type allows it, and the others stay PLAIN. A `Dict` chooses per column, keyed by the path used to reach the data: `encoding = Dict("x" => :byte_stream_split, "wf.values" => :plain, "particles.pt" => :byte_stream_split)`. A key naming a struct or list covers everything under it; in a `Dict`, an encoding that does not fit the column's type, or a key matching no column, is an error. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Every shape the writer produces reads back with `read_parquet`.
 
 ### Encodings
 
@@ -123,11 +128,19 @@ All codecs go through [ChunkCodecs.jl](https://github.com/JuliaIO/ChunkCodecs.jl
 
 ### Nested Types
 
-- `List<T>` — returned as `Arrow.List` (Tables.jl-compatible, iterable as nested arrays)
-- `List<List<T>>` and deeper — arbitrary nesting depth supported via nested `Arrow.List`
-- `Struct` — returned as `StructColumn` (columnar wrapper over `Arrow.Struct`): `col[i]` gives a lazily-built `NamedTuple` row, `col.fieldname` gives the full child column zero-copy (chained across row groups). Members may be primitives, strings, lists (e.g. `waveform: {t0: float, dt: float, values: list<int32>}`), or nested structs — named access composes (`tbl.event.vertex.x`).
-- `List<Struct>` — returned as `ListOfStructsColumn`: `col[i]` gives a lazy vector of `NamedTuple`s, `col.fieldname` gives that field as a ragged list column sharing the parent's offsets (e.g. `particles.pt`). Deeper combinations (`List<Struct{List}>`, maps) are not yet assembled and fall back to distinct flattened columns.
-- `FixedSizeList<T>` — returned as `FixedSizeListVector{N,T}` (flat `Vector{T}` with fixed stride, zero-copy `FixedSizeView{N,T}` element access); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.) Also restored as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`).
+Any nesting of lists, structs and maps is read, to any depth, by one recursive reader that mirrors the writer.
+
+| Parquet | Returned as | Access |
+|---|---|---|
+| `List<T>`, `List<List<T>>`, … | `Arrow.List` | `col[i]` is a zero-copy view of the row's items |
+| struct | `StructColumn` | `col[i]` is a `NamedTuple`; `col.field` is the whole member column, zero-copy |
+| `List<Struct>`, at any list depth, with any members | `ListOfStructsColumn` | `col[i]` is the row's structs; `col.field` is that member for every row as a ragged list sharing the offsets (`particles.pt`) |
+| map | `ListOfStructsColumn` with fields `key` and `value` | `col[i]` is the row's `(key, value)` entries; `col.key`, `col.value` |
+| `FixedSizeList<T>` | `FixedSizeListVector{N,T}` | `col[i]` is a zero-copy `FixedSizeView{N,T}` into one flat vector |
+
+Named access composes through structs and lists: `tbl.event.vertex.x`, `tbl.s.hits.x`, `tbl.tracks.vertex.x` (one value per track, per row), `tbl.mm.value.key` (the keys of nested maps). Multi-row-group files chain the per-group chunks without copying.
+
+`FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored at top level and as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), and read as a variable-length list elsewhere. Legacy list layouts (2-level lists, bare repeated fields) and maps without values are read as pyarrow reads them.
 
 ### Logical Types
 

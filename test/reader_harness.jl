@@ -1,55 +1,12 @@
-# Regression harness for the recursive reader (tasks/todo.md, Part 4).
+# Reader test support: a corpus of files, the nullability check, and pyarrow comparisons.
 #
-# The oracle compares two readers' results for one file:
-#   - column names, container kinds, values and structure must be equal;
-#   - element types must be equal after stripping `Missing` at every level;
-# and checks nullability on a result by itself: a type should admit `Missing` exactly
-# where a missing occurs (`loose_nodes` lists the places where it admits one needlessly).
-
-"""Element type `T` with `Missing` removed at every level, as a comparable description."""
-function harness_shape(::Type{T}) where T
-    S = Base.nonmissingtype(T)
-    S === Union{} && return :missing
-    S <: NamedTuple && return (:struct, fieldnames(S), map(harness_shape, fieldtypes(S)))
-    S <: Parquet3.FixedSizeView && return (:fixed_size_list, S.parameters[1], harness_shape(eltype(S)))
-    S <: AbstractVector && return (:list, harness_shape(eltype(S)))
-    S
-end
-
-"""What kind of column container `col` is, ignoring element types."""
-harness_container(col) =
-    col isa Parquet3.NestedColumn ? (typeof(col).parameters[1], propertynames(col)) :
-    col isa Parquet3.FixedSizeListVector ? :fixed_size_list :
-    col isa Parquet3.ChainedVector ? (:chained, harness_container(first(col.arrays))) : :array
-
-"""Value equality through lists and structs, without materialising copies."""
-harness_same(a, b) =
-    (a === missing || b === missing) ? (a === missing && b === missing) :
-    (a isa AbstractVector{<:Number} && b isa AbstractVector{<:Number}) ? isequal(a, b) :
-    a isa AbstractVector ? (b isa AbstractVector && length(a) == length(b) && all(harness_same(x, y) for (x, y) in zip(a, b))) :
-    a isa NamedTuple ? (b isa NamedTuple && keys(a) == keys(b) && all(harness_same(x, y) for (x, y) in zip(values(a), values(b)))) :
-    isequal(a, b)
-
-"""Differences between two readers' tables for the same file; empty when they agree."""
-function reader_differences(old, new)
-    names_old, names_new = collect(Tables.columnnames(old)), collect(Tables.columnnames(new))
-    names_old == names_new || return ["column names differ: $names_old vs $names_new"]
-    diffs = String[]
-    for name in names_old
-        a, b = Tables.getcolumn(old, name), Tables.getcolumn(new, name)
-        harness_container(a) == harness_container(b) ||
-            push!(diffs, "$name: container $(harness_container(a)) vs $(harness_container(b))")
-        harness_shape(eltype(a)) == harness_shape(eltype(b)) ||
-            push!(diffs, "$name: element type $(eltype(a)) vs $(eltype(b))")
-        harness_same(a, b) || push!(diffs, "$name: values differ")
-    end
-    diffs
-end
+# While the recursive reader was built (tasks/todo.md, Part 4) this also held the oracle
+# that compared it with the reader it replaced; that comparison ended with the old paths.
 
 """
 Paths in `table` whose type admits `Missing` although no missing occurs there
-(`"col"`, `"col.field"`, `"col[]"` for list elements). The recursive reader must return
-none; the statistics-based reader returns some, and those are where types will tighten.
+(`"col"`, `"col.field"`, `"col[]"` for list elements). The reader must return none: it
+derives nullability from the levels it decodes.
 
 A struct member counts as missing wherever its struct is missing: `col.field` returns the
 member for every row, and shows a missing for those rows. List elements exist only inside
@@ -143,7 +100,7 @@ for name, table in tables.items():
 print('SUCCESS')
 """
 
-"""Shapes written by our own writer that the reader assembles today."""
+"""Nested shapes written by our own writer."""
 function harness_writer_tables()
     M = Missing
     PT = @NamedTuple{pt::Float32, q::Union{M, Int32}}
@@ -191,42 +148,6 @@ function harness_corpus(dir::String)
     corpus
 end
 
-"""
-Run `read_new` against `read_old` over the corpus. Returns, per file, the differences the
-oracle found and the loose nodes of each reader's result.
-"""
-function run_reader_harness(read_old, read_new, corpus)
-    map(corpus) do (label, path)
-        old, new = read_old(path), read_new(path)
-        (label = label, differences = reader_differences(old, new), loose_old = loose_nodes(old), loose_new = loose_nodes(new))
-    end
-end
-
-"""
-Top-level columns of `path` the recursive reader assembles at step R3: any nesting of
-lists and structs, as long as no struct sits inside a list (that comes with R4/R5).
-"""
-function harness_r3_columns(path::String)
-    pf = open_parquet(path)
-    plan = Parquet3.plan_read_tree(Parquet3.build_schema_tree(pf.metadata.schema))
-    close(pf)
-    struct_in_list(node, in_list = false) = (node.kind == :struct && in_list) ||
-        any(c -> struct_in_list(c, in_list || node.kind == :list), node.children)
-    [node.name for node in plan if !struct_in_list(node)]
-end
-
-"""
-Top-level columns of `path` that the old reader assembles (it flattens the rest): the R3
-set plus LIST groups whose element is a struct of plain leaves.
-"""
-function harness_r4_columns(path::String)
-    pf = open_parquet(path)
-    plan = Parquet3.plan_read_tree(Parquet3.build_schema_tree(pf.metadata.schema))
-    close(pf)
-    flat_struct_list(node) = node.kind == :list && node.schema.element.converted_type == Parquet3.CT_LIST &&
-        only(node.children).kind == :struct && all(c -> c.kind == :leaf, only(node.children).children)
-    union(harness_r3_columns(path), [node.name for node in plan if flat_struct_list(node)])
-end
 
 # pyarrow compares its own reading of each original with its reading of our rewrite of it.
 # Maps come back from pyarrow as (key, value) tuples and from our rewrite as key/value

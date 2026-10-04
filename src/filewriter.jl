@@ -162,8 +162,8 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
 end
 
 """
-The `null_count` statistic as pyarrow writes it, which readers (ours included) use to
-decide whether a column can hold nulls. Measured on pyarrow 23, not specified anywhere:
+The `null_count` statistic as pyarrow writes it, which some readers use to decide whether
+a column can hold nulls (ours reads the levels instead). Measured on pyarrow 23, not specified anywhere:
 a leaf that is itself a list's element counts every level entry without a value, null
 and empty lists included. A leaf below a struct inside a list counts only the list's
 existing slots (`def >= rep_def`), so null and empty lists are left out. Outside lists
