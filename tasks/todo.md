@@ -22,7 +22,12 @@ Nested writing is driven by element type, so reader outputs round-trip:
       `ListOfStructsColumn`, `FixedSizeListVector` written as plain LIST)
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
 
-Open: FixedSizeList fidelity (needs ARROW:schema metadata on write) — in or out?
+- [ ] N1.5 — FixedSizeList fidelity (REQUIRED for v0.2.0, decided 2026-10-03): written as a
+      plain LIST plus `ARROW:schema` key-value metadata so it reads back as
+      `FixedSizeListVector`. Spike first: get the schema message from Arrow.jl (serialize
+      the table schema, take the first IPC message) rather than hand-building FlatBuffers;
+      confirm our reader and pyarrow both restore fixed_size_list.
+
 Open: compression — in v0.2.0 or v0.3?
 
 ## Deferred to v0.3 — multi-RG, Date/DateTime, min/max stats
