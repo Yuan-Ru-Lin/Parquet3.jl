@@ -202,10 +202,15 @@ function run_reader_harness(read_old, read_new, corpus)
     end
 end
 
-"""Top-level columns of `path` that contain no list, which is what the recursive reader assembles at step R2."""
-function harness_list_free_columns(path::String)
+"""
+Top-level columns of `path` the recursive reader assembles at step R3: any nesting of
+lists and structs, as long as no struct sits inside a list (that comes with R4/R5).
+"""
+function harness_r3_columns(path::String)
     pf = open_parquet(path)
     plan = Parquet3.plan_read_tree(Parquet3.build_schema_tree(pf.metadata.schema))
     close(pf)
-    [node.name for node in plan if all(leaf -> leaf.rep_level == 0, Parquet3.read_leaves(node))]
+    struct_in_list(node, in_list = false) = (node.kind == :struct && in_list) ||
+        any(c -> struct_in_list(c, in_list || node.kind == :list), node.children)
+    [node.name for node in plan if !struct_in_list(node)]
 end

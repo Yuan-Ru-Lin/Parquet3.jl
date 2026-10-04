@@ -141,37 +141,154 @@ end
 # A slot is null at a node when `def < node.def_level`, whatever the reason: the node
 # itself is null, or an ancestor is. A struct member is therefore missing wherever its
 # struct is, which is what `col.member` shows for those rows.
+#
+# Lists of structs get their wrapper and field access in a later step (R4).
 
 """Buffers of one plan node for one row group (stage 1)."""
 struct RawNode
-    values::Any                 # leaf: decoded and converted values, one per slot; otherwise `nothing`
+    values::Any                 # leaf: values, one per slot; fixed-size list: its flat vector; otherwise `nothing`
     nulls::BitVector            # per slot: null at this node
+    offsets::Vector{Int32}      # list: start of each slot's items in the child, plus the end; otherwise empty
     children::Vector{RawNode}
 end
 
 """
-Stage 1 for `node` in row group `rg` (`nothing` for a file without row groups). Returns
-the node's buffers and, when `want_defs`, the definition level of every slot, taken from
-the node's leftmost leaf: one leaf's levels give the validity of all its ancestors.
+The definition and repetition levels of a node's leftmost leaf. All leaves under a node
+carry the same structure above it, so one leaf's levels give the offsets and validity of
+every ancestor. `rep === nothing` means one entry per row: the leaf is outside every list
+(or is a fixed-size list, which reports one entry per row for itself).
 """
-function _read_buffers(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, node::ReadNode, want_defs::Bool)
+struct Levels
+    rep::Union{Vector{Int}, Nothing}
+    def::Vector{Int}
+end
+
+# Per-file context for stage 1
+const ReadContext = @NamedTuple{data::Vector{UInt8}, fsl::Dict{String, Int}}
+
+"""
+Stage 1 for `node` in row group `rg` (`nothing` for a file without row groups).
+
+A node has one slot per item of the nearest enclosing list, or one per row outside lists.
+`slot_rep` and `slot_def` describe that list: a level entry starts a slot when
+`rep <= slot_rep && def >= slot_def` (both 0 outside lists, where every row is a slot).
+
+Returns the node's buffers and, when `want_levels`, its leftmost leaf's levels.
+"""
+function _read_buffers(ctx::ReadContext, rg::Union{RowGroup, Nothing}, node::ReadNode,
+                       slot_rep::Int, slot_def::Int, want_levels::Bool)
     if node.kind == :leaf
-        pages = _read_pages_for_rg(data, rg, node.path, node.schema)
-        elem = node.schema.element
-        values, nulls = assemble_flat_column(pages, node.def_level)
-        converted = convert_primitive_values(values, elem.type, leaf_annotation(elem))
-        return (RawNode(converted, nulls, RawNode[]), want_defs ? _page_defs(pages, node.def_level) : nothing)
+        return _read_leaf(ctx, rg, node, slot_rep, slot_def, want_levels)
     elseif node.kind == :struct
-        # A struct that can never be null (def_level 0) needs no levels of its own
-        need_defs = want_defs || node.def_level > 0
-        results = fetch.([Threads.@spawn _read_buffers(data, rg, child, need_defs && j == 1)
+        # A struct that cannot be null at its slots (def_level == slot_def) needs no levels of its own
+        need = want_levels || node.def_level > slot_def
+        results = fetch.([Threads.@spawn _read_buffers(ctx, rg, child, slot_rep, slot_def, need && j == 1)
                           for (j, child) in enumerate(node.children)])
         children = RawNode[first(r) for r in results]
-        defs = results[1][2]
-        nulls = need_defs ? defs .< node.def_level : falses(length(first(children).nulls))
-        return (RawNode(nothing, nulls, children), defs)
+        levels = results[1][2]
+        nulls = need ? _slot_nulls(levels, slot_rep, slot_def, node.def_level) : falses(length(first(children).nulls))
+        return (RawNode(nothing, nulls, Int32[], children), levels)
     end
-    error("the recursive reader does not assemble lists yet (column $(node.key))")
+    # A list that ARROW:schema declares fixed-size, with a primitive element and outside other lists
+    child = only(node.children)
+    if slot_rep == 0 && child.kind == :leaf && haskey(ctx.fsl, node.key)
+        return _read_fixed_size_list(ctx, rg, node, child, ctx.fsl[node.key], want_levels)
+    end
+    raw_child, levels = _read_buffers(ctx, rg, child, node.rep_level, node.item_def, true)
+    offsets, nulls = _list_structure(levels, slot_rep, slot_def, node)
+    (RawNode(nothing, nulls, offsets, RawNode[raw_child]), levels)
+end
+
+function _read_leaf(ctx::ReadContext, rg, node::ReadNode, slot_rep::Int, slot_def::Int, want_levels::Bool)
+    pages = _read_pages_for_rg(ctx.data, rg, node.path, node.schema)
+    elem = node.schema.element
+    if node.rep_level == 0
+        values, nulls = assemble_flat_column(pages, node.def_level)
+        converted = convert_primitive_values(values, elem.type, leaf_annotation(elem))
+        return (RawNode(converted, nulls, Int32[], RawNode[]),
+                want_levels ? Levels(nothing, _page_defs(pages, node.def_level)) : nothing)
+    end
+    rep, def, raw = collect_page_data(pages, node.def_level)
+    converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
+    values, nulls = _scatter_leaf(converted, def, slot_def, node.def_level)
+    (RawNode(values, nulls, Int32[], RawNode[]), want_levels ? Levels(rep, def) : nothing)
+end
+
+"""
+Place a list leaf's values in its slots. Every level entry belongs to this leaf's
+innermost list, so an entry is a slot exactly when `def >= slot_def`; it holds a value
+when `def == max_def`. Without null elements the values already are the slots.
+"""
+function _scatter_leaf(values::AbstractVector{T}, def::Vector{Int}, slot_def::Int, max_def::Int) where T
+    nslots = count(>=(slot_def), def)
+    nslots == length(values) && return (values, falses(nslots))
+    out = Vector{T}(undef, nslots)
+    nulls = falses(nslots)
+    slot = value = 0
+    @inbounds for d in def
+        d >= slot_def || continue
+        slot += 1
+        if d == max_def
+            out[slot] = values[value += 1]
+        else
+            nulls[slot] = true      # the slot's value is never read
+        end
+    end
+    (out, nulls)
+end
+
+"""Null bits of a node at its slots: `def < def_level`."""
+function _slot_nulls(levels::Levels, slot_rep::Int, slot_def::Int, def_level::Int)
+    rep, def = levels.rep, levels.def
+    rep === nothing && return def .< def_level
+    nulls = BitVector()
+    @inbounds for i in eachindex(def)
+        rep[i] <= slot_rep && def[i] >= slot_def && push!(nulls, def[i] < def_level)
+    end
+    nulls
+end
+
+"""
+Offsets and null bits of list `node` from its leftmost leaf's levels, in one pass: an
+entry that starts a slot of the list records where its items begin; an entry with
+`rep <= node.rep_level && def >= node.item_def` is one item.
+"""
+function _list_structure(levels::Levels, slot_rep::Int, slot_def::Int, node::ReadNode)
+    rep, def = levels.rep, levels.def
+    offsets, nulls = Int32[], BitVector()
+    items = Int32(0)
+    @inbounds for i in eachindex(def)
+        r, d = rep[i], def[i]
+        if r <= slot_rep && d >= slot_def
+            push!(offsets, items)
+            push!(nulls, d < node.def_level)
+        end
+        r <= node.rep_level && d >= node.item_def && (items += Int32(1))
+    end
+    push!(offsets, items)
+    (offsets, nulls)
+end
+
+"""
+A fixed-size list, read into one flat vector. Without nulls the page values are copied
+straight in (the dense path); otherwise they are scattered by level. It reports one level
+entry per row, since nothing above it needs to look inside.
+"""
+function _read_fixed_size_list(ctx::ReadContext, rg, node::ReadNode, leaf::ReadNode, size::Int, want_levels::Bool)
+    pages = _read_pages_for_rg(ctx.data, rg, leaf.path, leaf.schema)
+    elem = leaf.schema.element
+    max_def = leaf.def_level
+    if _fsl_no_nulls(pages, max_def)
+        column = _assemble_fsl_dense(pages, elem.type, elem, size)
+        defs = want_levels ? fill(max_def, length(column)) : nothing
+    else
+        rep, def, raw = collect_page_data(pages, max_def)
+        converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
+        column = assemble_fsl_direct(rep, def, converted, max_def, size, elem, [node.item_def];
+                                     record_null_def = node.def_level)
+        defs = want_levels ? _record_defs(rep, def) : nothing
+    end
+    (RawNode(column, column.nulls, Int32[], RawNode[]), want_levels ? Levels(nothing, defs) : nothing)
 end
 
 """
@@ -184,18 +301,30 @@ function _wrap_buffers(node::ReadNode, chunks::Vector{RawNode}, meta)
         elem = node.schema.element
         annotation = leaf_annotation(elem)
         return [_build_leaf_array(chunk.values, chunk.nulls, elem.type, annotation; nullable, meta) for chunk in chunks]
+    elseif node.kind == :struct
+        members = [_wrap_buffers(child, RawNode[chunk.children[j] for chunk in chunks], nothing)
+                   for (j, child) in enumerate(node.children)]
+        fnames = Tuple(Symbol(child.name) for child in node.children)
+        return [_make_struct(Tuple(member[i] for member in members), fnames, chunk.nulls, nullable, meta)
+                for (i, chunk) in enumerate(chunks)]
+    elseif first(chunks).values isa FixedSizeListVector
+        return [_fixed_size_list(chunk.values, nullable) for chunk in chunks]
     end
-    members = [_wrap_buffers(child, RawNode[chunk.children[j] for chunk in chunks], nothing)
-               for (j, child) in enumerate(node.children)]
-    fnames = Tuple(Symbol(child.name) for child in node.children)
-    [_make_struct(Tuple(member[i] for member in members), fnames, chunk.nulls, nullable, meta)
+    elements = _wrap_buffers(only(node.children), RawNode[only(chunk.children) for chunk in chunks], nothing)
+    [_make_list(elements[i], _validity(chunk.nulls), chunk.offsets, length(chunk.nulls), nullable, meta)
      for (i, chunk) in enumerate(chunks)]
 end
 
+"""The same fixed-size list buffers with the element type the whole column agreed on."""
+function _fixed_size_list(column::FixedSizeListVector{N, T}, nullable::Bool) where {N, T}
+    ET = nullable ? Union{Missing, FixedSizeView{N, T}} : FixedSizeView{N, T}
+    FixedSizeListVector{N, T, ET}(column.data, column.nulls, column.len)
+end
+
 """Read one top-level column of the plan: stage 1 per row group, then stage 2."""
-function _read_column(data::Vector{UInt8}, row_groups::Vector{RowGroup}, node::ReadNode, field_meta)
+function _read_column(ctx::ReadContext, row_groups::Vector{RowGroup}, node::ReadNode, field_meta)
     rgs = isempty(row_groups) ? [nothing] : row_groups
-    chunks = RawNode[first(fetch(task)) for task in [Threads.@spawn _read_buffers(data, rg, node, false) for rg in rgs]]
+    chunks = RawNode[first(fetch(task)) for task in [Threads.@spawn _read_buffers(ctx, rg, node, 0, 0, false) for rg in rgs]]
     arrays = _wrap_buffers(node, chunks, get(field_meta, node.name, nothing))
     column = length(arrays) == 1 ? only(arrays) : ChainedVector(arrays)
     node.kind == :struct ? StructColumn(column, Tuple(Symbol(child.name) for child in node.children)) : column
@@ -206,11 +335,12 @@ The recursive reader's entry point. Internal until it replaces `read_parquet`'s 
 paths (tasks/todo.md, Part 4, R7); until then it exists for the regression harness.
 """
 function _read_parquet_recursive(pf::ParquetFile; columns::Union{AbstractVector{<:AbstractString}, Nothing} = nothing)
-    (; schema, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
+    (; schema, fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
     plan = plan_read_tree(build_schema_tree(pf.metadata.schema))
     columns === nothing || (plan = prune_read_plan(plan, columns))
 
-    tasks = [Threads.@spawn _read_column(pf.data, pf.metadata.row_groups, node, field_meta) for node in plan]
+    ctx = (data = pf.data, fsl = fsl)
+    tasks = [Threads.@spawn _read_column(ctx, pf.metadata.row_groups, node, field_meta) for node in plan]
     vectors = AbstractVector[try fetch(task) catch e; throw(ColumnReadError(node.name, _root_cause(e))) end
                              for (node, task) in zip(plan, tasks)]
 

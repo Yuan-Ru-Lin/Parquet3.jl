@@ -354,9 +354,17 @@ entry point.
       Original wording: two-stage assembly for leaves and structs without lists; nullability from
       levels. Harness on flat columns, structs, struct-of-struct, zero-row files,
       multi-row-group files with nulls in only some groups.
-- [ ] R3 — lists: `list<prim>`, `list<list>`, struct with list members, FixedSizeList (top
-      level and member, dense path). Harness; benchmark on `part-0.parquet`. A regression on
-      the waveform columns blocks the step.
+- [x] R3 (DONE, awaiting review) — lists at any depth, struct members that are lists,
+      FixedSizeList at top level and as struct member (dense path kept). 74 corpus files,
+      423 columns: 0 loose nodes; 1 difference, an old-reader bug (an empty required list
+      read as `missing`; the new reader and pyarrow give `[]`).
+      Benchmark on part-0 (local, best of 22 interleaved, 8 threads), old → new:
+      all columns 199.8 → 196.5 ms; `waveform_windowed` 154.8 → 142.3 ms;
+      `waveform_presummed` 108.2 → 110.1 ms; `tracelist` 4.6 → 3.8 ms. No regression.
+      `waveform_windowed.t0` alone, pruned: 4.4 ms.
+      Deviation from the plan text: structure is computed per node from the leftmost leaf's
+      levels (one pass per list or struct), not in one pass for all ancestors. Simpler, and
+      the benchmark did not ask for more.
 - [ ] R4 — `list<struct>` with flat members: harness, wrapper and field projection included.
 - [ ] R5 — the new shapes and MAP; wrapper generalisation. Tests: write → read equals input
       across a shape matrix, and pyarrow-written files against pyarrow's values. Tests that

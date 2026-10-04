@@ -24,8 +24,8 @@ include("filereader.jl")
 include("pagereader.jl")
 include("arrow_schema.jl")
 include("filewriter.jl")
-include("reader.jl")
 include("api.jl")
+include("reader.jl")
 
 export
     read_parquet,

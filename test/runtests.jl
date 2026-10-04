@@ -2010,12 +2010,17 @@ end
 end
 
 
-@testset "Recursive reader: leaves and structs (R2)" begin
+@testset "Recursive reader: leaves, structs, lists (R2, R3)" begin
+    # Where the two readers are known to differ, and why. Each is checked against pyarrow below.
+    old_reader_bugs = Dict(
+        # A required list (bare repeated field) that is empty: the old reader returns `missing`
+        "parquet-testing:repeated_primitive_no_list.parquet" => ["Int32_list: values differ"],
+    )
     mktempdir() do dir
-        # At this step the new reader assembles columns without lists; compare exactly those.
-        corpus = [(label, path, harness_list_free_columns(path)) for (label, path) in harness_corpus(dir)]
+        # At this step the new reader assembles every column in which no struct sits inside a list
+        corpus = [(label, path, harness_r3_columns(path)) for (label, path) in harness_corpus(dir)]
         corpus = filter(c -> !isempty(c[3]), corpus)
-        @test length(corpus) > 40
+        @test length(corpus) > 60
         results = map(corpus) do (label, path, cols)
             old = read_parquet(path; columns = cols)
             new = Parquet3._read_parquet_recursive(path; columns = cols)
@@ -2023,13 +2028,49 @@ end
              loose_old = loose_nodes(old), loose_new = loose_nodes(new))
         end
         @testset "$(r.label)" for r in results
-            @test isempty(r.differences)      # names, containers, values, element types up to Missing
+            @test r.differences == get(old_reader_bugs, r.label, String[])   # names, containers, values, element types up to Missing
             @test isempty(r.loose_new)        # Missing only where a missing occurs
         end
         tightened = [(r.label, setdiff(r.loose_old, r.loose_new)) for r in results if !isempty(setdiff(r.loose_old, r.loose_new))]
-        @info "Recursive reader (R2): $(length(corpus)) files, $(sum(r.columns for r in results)) list-free columns; " *
+        @info "Recursive reader (R3): $(length(corpus)) files, $(sum(r.columns for r in results)) columns; " *
               "element types tighten in $(length(tightened)):\n" *
               join(("  $label: $(join(nodes, ", "))" for (label, nodes) in tightened), "\n")
+    end
+
+    if HAS_PARQUET_TESTING
+        # The one known difference: pyarrow reads the empty required list as [], as the new reader does
+        path = joinpath(PARQUET_TESTING_DIR, "repeated_primitive_no_list.parquet")
+        new = Parquet3._read_parquet_recursive(path; columns = ["Int32_list"])
+        @test collect.(new.Int32_list) == [[0, 1, 2, 3], Int32[], [4], [5, 6, 7, 8]]
+        @test any(ismissing, read_parquet(path; columns = ["Int32_list"]).Int32_list)     # the old reader's answer
+        result = _run_pyarrow("import pyarrow.parquet as pq; print(pq.read_table('$(path)').column('Int32_list').to_pylist())")
+        result === nothing || @test result == "[[0, 1, 2, 3], [], [4], [5, 6, 7, 8]]"
+    end
+
+    # Lists, fixed-size lists and selection inside structs
+    mktempdir() do dir
+        path = joinpath(dir, "l.parquet")
+        V = Parquet3.FixedSizeView{2, Int32}
+        fsv(a, b) = V(Int32[a, b], 0)
+        WF = @NamedTuple{t0::Float64, values::V, tags::Union{Missing, Vector{Union{Missing, String}}}}
+        write_parquet(path, (
+            wf   = Union{Missing, WF}[(t0 = 0.5, values = fsv(1, 2), tags = ["a", missing]), missing,
+                                      (t0 = 1.5, values = fsv(3, 4), tags = missing), (t0 = 2.5, values = fsv(5, 6), tags = [])],
+            fsl  = [fsv(1, 2), fsv(3, 4), fsv(5, 6), fsv(7, 8)],
+            ll   = [[[1, 2], Int[]], Vector{Int}[], [[3]], [[4], [5, 6]]],
+        ))
+        t = Parquet3._read_parquet_recursive(path)
+        @test t.fsl isa Parquet3.FixedSizeListVector{2, Int32} && collect.(t.fsl) == [[1, 2], [3, 4], [5, 6], [7, 8]]
+        @test eltype(t.wf.values) == Union{Missing, V} && ismissing(t.wf.values[2]) && t.wf.values[3] == [3, 4]
+        @test isequal(collect.(skipmissing(t.wf.tags)), [["a", missing], String[]]) && ismissing(t.wf[2]) && ismissing(t.wf[3].tags)
+        @test collect(map(l -> collect.(l), t.ll)) == [[[1, 2], Int[]], Vector{Int}[], [[3]], [[4], [5, 6]]]
+        @test !(Missing <: eltype(t.ll)) && !(Missing <: eltype(first(t.ll))) && eltype(first(first(t.ll))) == Int64
+        # Selecting one member reads only that leaf; the struct's validity then comes from it
+        sel = Parquet3._read_parquet_recursive(path; columns = ["wf.tags", "ll"])
+        @test collect(propertynames(sel)) == [:wf, :ll] && propertynames(sel.wf) == (:tags,)
+        @test ismissing(sel.wf[2]) && ismissing(sel.wf[3].tags) && isequal(collect(sel.wf[1].tags), ["a", missing])
+        only_fsl = Parquet3._read_parquet_recursive(path; columns = ["wf.values"])
+        @test only_fsl.wf.values isa Parquet3.FixedSizeListVector && ismissing(only_fsl.wf[2]) && only_fsl.wf[4].values == [5, 6]
     end
 
     # Field metadata, member access and selection behave as with the current reader
