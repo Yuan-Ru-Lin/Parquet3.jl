@@ -1,4 +1,4 @@
-# Parquet file writer (flat, List<primitive>, and flat-struct columns; PLAIN, uncompressed, one row group)
+# Parquet file writer (flat, list, and struct columns, arbitrarily nested; PLAIN, uncompressed, one row group)
 
 const CREATED_BY = "Parquet3.jl"
 
@@ -20,85 +20,84 @@ end
 
 # Vector{UInt8} is a byte string; any other vector element type is a list
 _is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && T !== Vector{UInt8}
+_is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple
 
 """
-Shred one column into its schema elements and leaves. Each leaf is one column chunk:
-its path, repetition/definition levels (`rep === nothing` when not repeated), and
-non-null values.
-"""
-function _shred(name::String, col::AbstractVector)
-    T = Base.nonmissingtype(eltype(col))
-    T !== Union{} && T <: NamedTuple && return _shred_struct(name, col, T)
-    _is_list_type(T) ? _shred_list(name, col, Base.nonmissingtype(eltype(T))) : _shred_flat(name, col, T)
-end
+Plan the schema subtree for a value of type `FT` named `name`, driven by element type:
+`NamedTuple` → group (struct), `AbstractVector` → standard 3-level LIST, anything else →
+primitive leaf. Every node is OPTIONAL. `path`, `max_rep`, `max_def` describe the parent.
 
-function _shred_flat(name::String, col::AbstractVector, ::Type{T}) where T
-    ptype, ctype = writer_parquet_type(T)
-    (elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype)],
-     leaves = [(path = [name], ptype = ptype, max_rep = 0, max_def = 1,
-                rep = nothing, def = Int[ismissing(v) ? 0 : 1 for v in col],
-                values = collect(skipmissing(col)))])
-end
-
+Returns a node with its `kind`, depth-first `elements` (schema), and all `leaves` below
+it. A leaf is one column chunk: path, max levels, and the rep/def levels and non-null
+values that `_shred!` appends to.
 """
-List<primitive> in the standard 3-level layout
-`optional group name (LIST) { repeated group list { optional T element } }`.
-Definition levels: 0 = null list, 1 = empty list, 2 = null element, 3 = value.
-"""
-function _shred_list(name::String, col::AbstractVector, ::Type{E}) where E
-    _is_list_type(E) && error("write_parquet: nested lists are not yet supported (column $name)")
-    ptype, ctype = writer_parquet_type(E)
-    rep, def, values = Int[], Int[], E[]
-    for list in col
-        if ismissing(list) || isempty(list)
-            push!(rep, 0)
-            push!(def, ismissing(list) ? 0 : 1)
-            continue
-        end
-        for (j, v) in enumerate(list)
-            push!(rep, j == 1 ? 0 : 1)
-            push!(def, ismissing(v) ? 2 : 3)
-            ismissing(v) || push!(values, v)
-        end
-    end
-    (elements = [SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(1), converted_type = CT_LIST),
-                 SchemaElement(repetition_type = REPEATED, name = "list", num_children = Int32(1)),
-                 SchemaElement(type = ptype, repetition_type = OPTIONAL, name = "element", converted_type = ctype)],
-     leaves = [(path = [name, "list", "element"], ptype = ptype, max_rep = 1, max_def = 3,
-                rep = rep, def = def, values = values)])
-end
-
-"""
-Struct of flat fields: `optional group name { optional T1 f1; optional T2 f2; ... }`,
-one leaf per member. Definition levels: 0 = null struct, 1 = null member, 2 = value.
-"""
-function _shred_struct(name::String, col::AbstractVector, ::Type{NT}) where NT <: NamedTuple
-    isconcretetype(NT) && fieldcount(NT) > 0 ||
-        error("write_parquet: struct column $name needs a concrete, non-empty NamedTuple eltype, got $NT " *
-              "(rows of differing field types need a typed vector, e.g. @NamedTuple{a::Union{Missing, Int64}}[...])")
-    members = map(fieldnames(NT), fieldtypes(NT)) do f, FT
-        T = Base.nonmissingtype(FT)
-        (_is_list_type(T) || (T !== Union{} && T <: NamedTuple)) &&
-            error("write_parquet: nested members are not yet supported (column $name, field $f)")
+function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int, max_def::Int) where FT
+    T = Base.nonmissingtype(FT)
+    path = [path; name]
+    max_def += 1
+    if _is_struct_type(T)
+        isconcretetype(T) && fieldcount(T) > 0 ||
+            error("write_parquet: struct $(join(path, '.')) needs a concrete, non-empty NamedTuple type, got $T " *
+                  "(rows of differing field types need a typed vector, e.g. @NamedTuple{a::Union{Missing, Int64}}[...])")
+        children = [_plan_node(String(f), ft, path, max_rep, max_def) for (f, ft) in zip(fieldnames(T), fieldtypes(T))]
+        group = SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(length(children)))
+        (kind = :struct, rep_level = max_rep, children = children,
+         elements = [group; reduce(vcat, [c.elements for c in children])],
+         leaves = reduce(vcat, [c.leaves for c in children]))
+    elseif _is_list_type(T)
+        # optional group name (LIST) { repeated group list { optional <element> } }
+        child = _plan_node("element", eltype(T), [path; "list"], max_rep + 1, max_def + 1)
+        (kind = :list, rep_level = max_rep + 1, children = [child],
+         elements = [SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(1), converted_type = CT_LIST);
+                     SchemaElement(repetition_type = REPEATED, name = "list", num_children = Int32(1));
+                     child.elements],
+         leaves = child.leaves)
+    else
         ptype, ctype = writer_parquet_type(T)
-        member = [ismissing(row) ? missing : row[f] for row in col]
-        (element = SchemaElement(type = ptype, repetition_type = OPTIONAL, name = String(f), converted_type = ctype),
-         leaf = (path = [name, String(f)], ptype = ptype, max_rep = 0, max_def = 2, rep = nothing,
-                 def = Int[ismissing(row) ? 0 : ismissing(v) ? 1 : 2 for (row, v) in zip(col, member)],
-                 values = collect(T, skipmissing(member))))
+        leaf = (path = path, ptype = ptype, max_rep = max_rep, max_def = max_def,
+                rep = Int[], def = Int[], values = T[])
+        (kind = :leaf, rep_level = max_rep, children = (),
+         elements = [SchemaElement(type = ptype, repetition_type = OPTIONAL, name = name, converted_type = ctype)],
+         leaves = [leaf])
     end
-    group = SchemaElement(repetition_type = OPTIONAL, name = name, num_children = Int32(length(members)))
-    (elements = [group; [m.element for m in members]], leaves = [m.leaf for m in members])
 end
+
+"""
+Shred value `v` into the leaves under `node` (Dremel). `rep` is the repetition level of
+this value; `def` counts the optional/repeated ancestors known to be present. A null
+or empty value is recorded in every leaf below, at the level where the path stopped.
+"""
+function _shred!(node, v, rep::Int, def::Int)
+    ismissing(v) && return _shred_stop!(node, rep, def)
+    def += 1
+    if node.kind == :leaf
+        leaf = only(node.leaves)
+        push!(leaf.rep, rep); push!(leaf.def, def); push!(leaf.values, v)
+    elseif node.kind == :struct
+        foreach((child, field) -> _shred!(child, field, rep, def), node.children, values(v))
+    elseif isempty(v)
+        _shred_stop!(node, rep, def)
+    else
+        # First item inherits rep; later items continue this list
+        child = only(node.children)
+        for (j, item) in enumerate(v)
+            _shred!(child, item, j == 1 ? rep : node.rep_level, def + 1)
+        end
+    end
+    nothing
+end
+
+_shred_stop!(node, rep::Int, def::Int) =
+    foreach(leaf -> (push!(leaf.rep, rep); push!(leaf.def, def)), node.leaves)
 
 """
     write_parquet(path::String, tbl) -> path
 
 Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
-Int32, Int64, Float32, Float64, Bool, String, Vector{UInt8}, vectors of those
-(written as LIST), NamedTuples of those (written as a struct group), and `Missing`
-unions at either level. Columns are written as OPTIONAL fields with PLAIN encoding,
-uncompressed, in a single row group.
+Int32, Int64, Float32, Float64, Bool, String, Vector{UInt8}; vectors (written as
+LIST) and NamedTuples (written as a struct group) of supported types, nested to any
+depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
+with PLAIN encoding, uncompressed, in a single row group.
 """
 function write_parquet(path::String, tbl)
     cols = Tables.columns(tbl)
@@ -116,10 +115,11 @@ function write_parquet(path::String, tbl)
         total_bytes = 0
 
         for (name, col) in zip(names, vectors)
-            shredded = _shred(String(name), col)
-            append!(schema, shredded.elements)
+            node = _plan_node(String(name), eltype(col), String[], 0, 0)
+            foreach(v -> _shred!(node, v, 0, 0), col)
+            append!(schema, node.elements)
 
-            for leaf in shredded.leaves
+            for leaf in node.leaves
                 offset = position(io)
                 page = _data_page(leaf)
                 write(io, page)
@@ -154,8 +154,8 @@ end
 
 """
 Build one DataPage (v1) for a shredded leaf: thrift PageHeader followed by the
-length-prefixed RLE repetition levels (repeated columns only) and definition
-levels, then the PLAIN-encoded values.
+length-prefixed RLE repetition levels (only under a list) and definition levels,
+then the PLAIN-encoded values.
 """
 function _data_page(leaf)
     body = IOBuffer()

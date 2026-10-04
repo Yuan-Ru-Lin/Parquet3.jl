@@ -18,8 +18,9 @@ Nested writing is driven by element type, so reader outputs round-trip:
       on branch `writer-w1`, rebased onto main)
 - [x] N2 — struct of flat fields: one group, several leaves, def levels only (DONE,
       awaiting review; `_shred` now returns several leaves per column)
-- [ ] N3 — composition: struct{list}, struct-of-struct, list<struct>, list<list>
-      (recursive shredder over the schema tree; N1/N2 become its base cases)
+- [x] N3 — composition: struct{list}, struct-of-struct, list<struct>, list<list>
+      (recursive shredder over the schema tree; N1/N2 become its base cases) (DONE, awaiting
+      review; `_plan_node` + `_shred!` replace the per-shape shredders)
 - [ ] N4 — read→write round-trip of reader containers (`Arrow.List`, `StructColumn`,
       `ListOfStructsColumn`, `FixedSizeListVector` written as plain LIST)
 - [ ] Release: commit, clean untracked files, bump to 0.2.0, tag, push
@@ -31,6 +32,9 @@ Nested writing is driven by element type, so reader outputs round-trip:
       confirm our reader and pyarrow both restore fixed_size_list.
 
 Open: compression — in v0.2.0 or v0.3?
+
+Deferred (edge case, decided 2026-10-03): infer struct member types from rows when the
+`NamedTuple` eltype is not concrete (`[(a = missing,), (a = 2,)]`); currently a clear error.
 
 ## Deferred to v0.3 — multi-RG, Date/DateTime, min/max stats
 

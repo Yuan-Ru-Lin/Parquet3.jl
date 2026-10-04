@@ -1,6 +1,6 @@
 # Parquet3.jl
 
-An alternative Parquet implementation in Julia, focused on nested data — a suitable representation for data typical of physics experiments, like waveform data and observables of multiple physics objects in an event. Reading returns `Arrow.Table` (Tables.jl-compatible) with memory-mapped IO and per-RowGroup parallelism; basic writing of flat, list, and struct columns is supported.
+An alternative Parquet implementation in Julia, focused on nested data — a suitable representation for data typical of physics experiments, like waveform data and observables of multiple physics objects in an event. Reading returns `Arrow.Table` (Tables.jl-compatible) with memory-mapped IO and per-RowGroup parallelism; writing of flat, list, and struct columns (nested to any depth) is supported.
 
 ## Demo
 
@@ -86,7 +86,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int32/Int64/Float32/Float64/Bool/String/`Vector{UInt8}`, lists of those (`Vector{Vector{T}}`, written as `List<T>`), structs of those (a vector of `NamedTuple`s, written as a group), and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression, multiple row groups, and nested combinations (lists of lists, lists or structs inside structs, lists of structs) are not yet written.
+`write_parquet(path, table)` writes flat columns of Int32/Int64/Float32/Float64/Bool/String/`Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression and multiple row groups are not yet written. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
 
 ### Encodings
 

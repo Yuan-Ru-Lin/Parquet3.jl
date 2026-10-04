@@ -832,8 +832,6 @@ print(t.column('c').to_pylist())""")
             @test all(ismissing, t.b) && length(t.b) == 2
             @test all(isempty, t.c) && length(t.c) == 2
 
-            @test_throws Exception write_parquet(f, (nested = [[[1]], [[2, 3]]],))
-
             write_parquet(f, (l = [Int32[1, 2], missing, Int32[], [missing, Int32(5)]], s = [["x"], ["y", "z"], String[], missing]))
             result = _run_pyarrow("""
 import pyarrow.parquet as pq
@@ -883,9 +881,7 @@ print(t.column('s').to_pylist())""")
             write_parquet(f, (s = Union{Missing, P}[missing, missing], id = [1, 2]))
             @test all(ismissing, read_parquet(f).s)
 
-            # nested members wait for N3; untyped rows are rejected
-            @test_throws Exception write_parquet(f, (bad = [(a = [1, 2],)],))
-            @test_throws Exception write_parquet(f, (bad = [(a = (b = 1,),)],))
+            # untyped rows are rejected
             @test_throws Exception write_parquet(f, (bad = Any[(a = 1,)],))
             @test_throws Exception write_parquet(f, (bad = [(a = missing,), (a = 2,)],))
 
@@ -902,6 +898,63 @@ print(t.column('s').to_pylist())""")
                 @test lines[2] == "[{'a': 1, 'b': 'x'}, None, {'a': None, 'b': 'z'}]"
             else
                 @warn "Skipping pyarrow cross-check of written structs: uv/pyarrow not available"
+            end
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "Nested composition round-trip (N3)" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        WF = @NamedTuple{t0::Float64, values::Union{Missing, Vector{Union{Missing, Int32}}}}
+        PT = @NamedTuple{pt::Float32, q::Union{Missing, Int32}}
+        OLL = Union{Missing, Vector{Union{Missing, Vector{Union{Missing, Int64}}}}}
+        tbl = (
+            # struct{list}: null struct, null list, empty list, null element
+            wf    = Union{Missing, WF}[(t0 = 0.5, values = [1, missing]), missing,
+                                       (t0 = 1.5, values = missing), (t0 = 2.5, values = [])],
+            # struct-of-struct
+            ev    = [(id = i, vertex = (x = 0.1i, tag = "v$i")) for i in 1:4],
+            # list<struct>
+            parts = Union{Missing, Vector{PT}}[[(pt = 1f0, q = 1), (pt = 2f0, q = missing)], PT[], missing, [(pt = 3f0, q = -1)]],
+            # list<list>, with a row after an empty outer list
+            ll    = [[[1, 2], [3]], Vector{Int}[], [[4]], [Int[], [5]]],
+            oll   = OLL[[[1, missing], missing, []], missing, [], [[2]]],
+            lll   = [[[[1.5], Float64[]]], [[[2.5, 3.5]], Vector{Float64}[]], Vector{Vector{Float64}}[], [[[4.5]]]],
+        )
+        f = wfile("test_n3_nested.parquet")
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            @test collect(Tables.columnnames(t)) == collect(keys(tbl))
+            for k in keys(tbl)
+                @test isequal(plain(Tables.getcolumn(t, k)), plain(tbl[k]))
+            end
+            @test t.wf isa Parquet3.StructColumn && t.parts isa Parquet3.ListOfStructsColumn
+            @test t.ev.vertex.tag == ["v1", "v2", "v3", "v4"]
+
+            # Shapes our reader does not assemble yet: check them with pyarrow
+            E = @NamedTuple{a::Int32, v::Vector{Int32}}
+            write_parquet(f, (
+                los = [[(a = Int32(1), v = Int32[1, 2]), (a = Int32(2), v = Int32[])], E[], [(a = Int32(3), v = Int32[3])]],
+                sl  = Union{Missing, @NamedTuple{hits::Vector{@NamedTuple{x::Int32}}}}[
+                          (hits = [(x = Int32(1),), (x = Int32(2),)],), missing, (hits = [],)],
+            ))
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(t.schema.field('los').type)
+print(t.column('los').to_pylist())
+print(t.schema.field('sl').type)
+print(t.column('sl').to_pylist())""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "list<element: struct<a: int32, v: list<element: int32>>>"
+                @test lines[2] == "[[{'a': 1, 'v': [1, 2]}, {'a': 2, 'v': []}], [], [{'a': 3, 'v': [3]}]]"
+                @test lines[3] == "struct<hits: list<element: struct<x: int32>>>"
+                @test lines[4] == "[{'hits': [{'x': 1}, {'x': 2}]}, None, {'hits': []}]"
+            else
+                @warn "Skipping pyarrow cross-check of nested writes: uv/pyarrow not available"
             end
         finally
             rm(f, force=true)

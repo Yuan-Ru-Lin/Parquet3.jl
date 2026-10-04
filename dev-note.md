@@ -85,16 +85,19 @@ assembles pages (length-prefixed RLE def levels + PLAIN values), column chunks, 
 the footer. All columns are written OPTIONAL with null-count statistics so the
 reader's statistics-based eltype derivation works on our own files.
 
-Each column is shredded (`_shred`) into schema elements and one or more leaves (a leaf
-path, rep/def levels, and non-null values); `_data_page` then writes any leaf. Flat columns
-have no repetition levels and def 0/1. A struct of flat fields (`NamedTuple` elements) is
-a group with one leaf per member: def 0 = null struct, 1 = null member, 2 = value. The
-`NamedTuple` eltype must be concrete, since member types are read from it. `List<primitive>` uses the standard 3-level layout with
+Nested writing is one recursion over the column's element type. `_plan_node` builds the
+schema subtree — `NamedTuple` → group, `AbstractVector` → 3-level LIST, otherwise a
+primitive leaf, every node OPTIONAL — and gives each node the list of leaves below it.
+`_shred!` then walks each row (Dremel shredding): `def` goes up by one for every present
+optional node and once more on entering a list's items; an item's `rep` is its list's
+depth, except the first item, which inherits the enclosing one. A null or empty value is
+recorded in every leaf below the node where the path stopped. `_data_page` writes any
+leaf. `NamedTuple` types must be concrete, since member types are read from the type. For example `List<primitive>` has
 def 0 = null list, 1 = empty list, 2 = null element, 3 = value. `Vector{UInt8}` elements
 are byte strings, not lists. `null_count` counts every level entry without a value
 (including empty lists), matching pyarrow.
 
-Current writer scope: flat, `List<primitive>`, and flat-struct columns (Int32/Int64/Float32/Float64/
+Current writer scope: flat, list, and struct columns nested to any depth (Int32/Int64/Float32/Float64/
 Bool/String/bytes + Missing unions), PLAIN, uncompressed, one row group. Next steps are
 in `tasks/todo.md`.
 
