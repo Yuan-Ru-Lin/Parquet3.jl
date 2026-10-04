@@ -19,13 +19,28 @@ struct DecodedPage{T, V<:AbstractVector{T}}
     num_values::Int
 end
 
-function read_page_header(data::Vector{UInt8}, offset::Int)::Tuple{PageHeader, Int}
-    slice = data[offset+1 : min(offset+1024, length(data))]
-    t = TMemoryTransport(slice)
-    p = TCompactProtocol(t)
-    header = read_thrift(p, PageHeader, PAGE_HEADER_FIELDS)
-    bytes_consumed = position(t.buff)
-    (header, bytes_consumed)
+"""
+Parse the page header at `offset`; returns it with the number of bytes it occupies.
+
+A header's size is unknown until it is parsed, and it has no upper bound: min/max
+statistics hold whole values. Thrift needs a contiguous buffer, so the header is parsed
+from a window that doubles until it fits, up to `limit` (the end of the column chunk).
+"""
+function read_page_header(data::Vector{UInt8}, offset::Int, limit::Int = length(data))::Tuple{PageHeader, Int}
+    limit = min(limit, length(data))
+    window = 1024
+    while true
+        stop = min(offset + window, limit)
+        t = TMemoryTransport(data[offset+1 : stop])
+        try
+            header = read_thrift(TCompactProtocol(t), PageHeader, PAGE_HEADER_FIELDS)
+            return (header, position(t.buff))
+        catch e
+            # Ran off the end of the window: retry with a larger one, unless there is no more
+            (e isa EOFError && stop < limit) || rethrow()
+            window *= 2
+        end
+    end
 end
 
 function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, encoding::Encoding)
@@ -69,7 +84,7 @@ function read_page(reader::ColumnReader)
     chunk_end = something(meta.dictionary_page_offset, meta.data_page_offset) + meta.total_compressed_size
     reader.offset >= chunk_end && return nothing
 
-    header, bytes_consumed = read_page_header(reader.data, reader.offset)
+    header, bytes_consumed = read_page_header(reader.data, reader.offset, Int(chunk_end))
     reader.offset += bytes_consumed
     page_range = reader.offset+1 : reader.offset+header.compressed_page_size
     reader.offset += header.compressed_page_size

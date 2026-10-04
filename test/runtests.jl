@@ -483,6 +483,27 @@ table = pa.table({'s': pa.array(rows, type=t)})
     end
 end
 
+@testset "Page headers larger than 1 KB" begin
+    # pyarrow stores min/max statistics in the page header, so long values make long headers
+    _with_pyarrow_file("long page headers", "test_long_header.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+st = pa.struct([('label', pa.string()), ('n', pa.int32())])
+table = pa.table({
+    's':    ['a' * 1500, 'b' * 1500, 'c' * 1500],
+    'huge': ['x' * 100000, 'y' * 100000, None],
+    'l':    pa.array([['p' * 3000, 'q'], [], ['r' * 3000]], type=pa.list_(pa.string())),
+    'st':   pa.array([{'label': 'm' * 5000, 'n': 1}, None, {'label': 'z' * 5000, 'n': 3}], type=st),
+    'id':   [1, 2, 3],
+})""") do tbl
+        @test collect(propertynames(tbl)) == [:s, :huge, :l, :st, :id]
+        @test collect(tbl.s) == ["a"^1500, "b"^1500, "c"^1500]
+        @test isequal(collect(tbl.huge), ["x"^100000, "y"^100000, missing])
+        @test collect.(tbl.l) == [["p"^3000, "q"], String[], ["r"^3000]]
+        @test tbl.st[1] == (label = "m"^5000, n = Int32(1)) && ismissing(tbl.st[2]) && tbl.st.label[3] == "z"^5000
+        @test collect(tbl.id) == [1, 2, 3]
+    end
+end
+
 @testset "Struct Columns" begin
     _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
