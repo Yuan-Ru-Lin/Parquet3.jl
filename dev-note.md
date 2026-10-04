@@ -127,6 +127,7 @@ in `tasks/todo.md`.
 
 ## Known Limitations
 
+- The first `write_parquet` call for each new table schema that contains a FixedSizeList (top-level, or nested in structs or lists) takes 5–20 s. The `ARROW:schema` entry is produced by Arrow.jl's generic writer, which Julia compiles per table type. Tables without a FixedSizeList skip that path, and later writes of the same schema in the same session are fast. Hand-building the schema message would avoid it; that was decided against for v0.2.0.
 - A written `DateTime` column is shown by pyarrow as `timestamp[ms, tz=UTC]`, not as a naive timestamp: the converted type TIMESTAMP_MILLIS means UTC-adjusted, and we do not write a `logicalType` that could say otherwise. The instants are unchanged. This holds with or without the `ARROW:schema` entry (checked 2026-10-03 with a FixedSizeList column present).
 - `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
 - Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
