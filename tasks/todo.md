@@ -85,14 +85,18 @@ handling, and logical types on members. Bugs below are in priority order; one at
       - `struct<x: int8>` rows `[{x:-5}, None, {x:None}]` → `InexactError`, flaky
       - any `uint32` ≥ 2^31 / `uint64` ≥ 2^63, even without nulls → deterministic
         (`convert(UInt32, -294967296)`; needs reinterpret, not convert)
-- [ ] R2 `list<string>` / binary / large_string / FLBA / decimal member with a null element
+- [x] R2 (fixed: null element slot left uninitialized, no placeholder value) `list<string>` / binary / large_string / FLBA / decimal member with a null element
       (src/api.jl:660, placeholder push ~:645, in `_to_arrow_nested`).
       - `struct<x: list<string>>` rows `[{x:['hé', None]}, None, {x:None}]`
 
 ### B. Wrong or missing result
-- [ ] R3 Null inner list in a `list<list<T>>` member reads as empty (src/api.jl:670;
+- [x] R3 (fixed: per-level validity from def thresholds) Null inner list in a `list<list<T>>` member reads as empty (src/api.jl:670;
       intermediate levels hard-coded all-valid).
       - `[[1,2], [], None, [None,3]]` → `[[1,2], [], [], [None,3]]`
+- [x] R8 (found while fixing R3) In `list<list<T>>`, a row after an empty or null outer list
+      read the wrong inner lists: `[[[1,2],[3]], [], [[4]]]` → third row `[[]]`. The loop pushed
+      an inner offset per record even when the record had no inner list. Fixed by rewriting
+      the `_to_arrow_nested` loop to push a start offset when a list opens.
 - [ ] R4 `columns=["s.a"]` / `["s.b.c"]` silently returns no columns, no warning
       (src/api.jl:123-127). Old flattened reader returned the dotted column.
 - [ ] R5 Zero-row file: `column_names` lists columns but `read_parquet` returns none
@@ -105,7 +109,7 @@ handling, and logical types on members. Bugs below are in priority order; one at
 
 ### D. Tests to add (alongside the fix they cover)
 - [x] narrow + unsigned int members with nulls (R1)
-- [ ] `list<string>` member with null element (R2)
+- [x] `list<string>` member with null element (R2); null/empty lists at every level (R3, R8)
 - [ ] required struct and required members; all-null struct; zero-row file (R5)
 - [ ] `write_statistics=False` with multiple row groups; multi-RG struct with a list member
 - [ ] `columns=["s.a"]` (R4)
@@ -116,6 +120,8 @@ handling, and logical types on members. Bugs below are in priority order; one at
 - [ ] `is_struct_group` docstring omits nested structs
 - [ ] `_plan_struct` fills dummy `leaf`/`path`/`thresholds` for `:struct` members
 - [ ] `_page_defs` re-walks levels `assemble_flat_column` already scanned
+- [ ] `assemble_column` / `assemble_nested*` in src/pagereader.jl are reached only from unit
+      tests, not the read path; `_assemble_nested_general` likely has the R8 offset bug. Delete or fix.
 - [ ] `snulls` loop is just `record_defs .< own_def`
 
 ## Part 4 (future, if needed) — full closure: list<struct{list}>, list<struct{struct}>, maps

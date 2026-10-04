@@ -377,6 +377,33 @@ table = pa.table({
     end
 end
 
+@testset "Null and empty lists at every level" begin
+    _with_pyarrow_file("nested list nulls", "test_list_nulls.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+st = pa.struct([('x', pa.list_(pa.string())), ('vv', pa.list_(pa.list_(pa.int64())))])
+table = pa.table({
+    'll': pa.array([[[1, 2], [3]], [], [[4]], None, [[5], None, [], [None, 6]]],
+                   type=pa.list_(pa.list_(pa.int64()))),
+    'ls': pa.array([['a', None], None, [], ['b'], [None]], type=pa.list_(pa.string())),
+    's':  pa.array([{'x': ['hé', None], 'vv': [[1, 2], [], None, [None, 3]]}, None,
+                    {'x': None, 'vv': None}, {'x': [], 'vv': []}, {'x': [None], 'vv': [None]}], type=st),
+})""") do tbl
+        # Arrow lists → plain nested vectors, keeping missings at every level
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
+
+        # Rows after an empty/null outer list must stay aligned with their inner lists
+        @test isequal(plain(tbl.ll), Any[Any[Any[1, 2], Any[3]], Any[], Any[Any[4]], missing,
+                                         Any[Any[5], missing, Any[], Any[missing, 6]]])
+        @test isequal(plain(tbl.ls), Any[Any["a", missing], missing, Any[], Any["b"], Any[missing]])
+
+        @test :s in propertynames(tbl)
+        @test ismissing(tbl.s[2])
+        @test isequal(plain(tbl.s.x), Any[Any["hé", missing], missing, missing, Any[], Any[missing]])
+        @test isequal(plain(tbl.s.vv), Any[Any[Any[1, 2], Any[], missing, Any[missing, 3]], missing,
+                                           missing, Any[], Any[missing]])
+    end
+end
+
 @testset "Struct Columns" begin
     _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq

@@ -576,84 +576,53 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
     # Innermost threshold: min def_level for a leaf element to exist
     inner_threshold = length(def_thresholds) >= max_rep ? def_thresholds[max_rep] : max_rep
 
-    # Offset arrays for each nesting depth (1-indexed, k=1 is outermost list)
-    offsets = [Int32[0] for _ in 1:max_rep]
+    # Per nesting depth k (1 = outermost list): start offsets into the level's child
+    # array, the running child count, and nulls of the level-k lists (k = 1: records)
+    offsets = [Int32[] for _ in 1:max_rep]
     child_count = zeros(Int32, max_rep)
-
-    # Record-level nulls (top level)
-    num_records = count(==(0), all_rep)
-    record_nulls = falses(num_records)
+    level_nulls = [BitVector() for _ in 1:max_rep]
 
     # Flat leaf data
     leaf_values = T[]
     leaf_nulls = BitVector()
-
-    record_idx = 0
     value_idx = 1
 
     for i in eachindex(all_rep)
         rep = all_rep[i]
         def = all_def[i]
 
-        # Finalization: when rep = j, push offsets at levels j+1 .. max_rep
-        # For rep=0, this means all levels 1..max_rep get finalized
-        if rep == 0
-            # Finalize all levels for previous record
-            if record_idx > 0
-                for k in max_rep:-1:1
-                    push!(offsets[k], child_count[k])
-                end
+        # rep = r continues the level-r list, so new lists open at levels r+1..max_rep,
+        # each as an item of its parent — as long as that parent item exists.
+        for k in (rep + 1):max_rep
+            if k == 1
+                # Null record: for top-level list columns def == 0; for a list member
+                # inside a struct, any def below the list group's own def level.
+                push!(level_nulls[1], def < record_null_def)
+            else
+                def >= def_thresholds[k - 1] || break
+                child_count[k - 1] += 1
+                # The level-k list group sits one def level below its repeated node
+                push!(level_nulls[k], def < def_thresholds[k] - 1)
             end
-            record_idx += 1
-
-            # Null record: def below the record-null threshold. For top-level list
-            # columns that is def == 0; for a list member inside a struct, any def
-            # below the list group's own def level (struct null or list null).
-            if def < record_null_def
-                record_nulls[record_idx] = true
-                # Still need to push offset entries for this null record at the end
-                # (handled by the finalization on next rep=0 or after loop)
-                # Increment child counts for levels that get empty slices: none
-                continue
-            end
-        else
-            # Finalize levels from max_rep down to rep+1
-            for k in max_rep:-1:(rep + 1)
-                push!(offsets[k], child_count[k])
-            end
-        end
-
-        # Item creation: new items at levels max(1,rep)..max_rep
-        # Level k item exists when def >= def_thresholds[k]
-        for k in max(1, rep):max_rep
-            if k <= length(def_thresholds) && def >= def_thresholds[k]
-                if k < max_rep
-                    child_count[k] += 1
-                end
-            end
-        end
-        # The innermost level (max_rep) always gets a child count bump from the leaf push below
-
-        # Leaf handling
-        if def == max_def
-            push!(leaf_values, values[value_idx])
-            push!(leaf_nulls, false)
-            child_count[max_rep] += 1
-            value_idx += 1
-        elseif def >= inner_threshold
-            # Leaf element exists but value is null — push placeholder
-            push!(leaf_values, value_idx <= length(values) ? values[1] : zero(T))
-            push!(leaf_nulls, true)
-            child_count[max_rep] += 1
-        end
-        # def < inner_threshold: intermediate empty list, no leaf push
-    end
-
-    # Final finalization for last record
-    if record_idx > 0
-        for k in max_rep:-1:1
             push!(offsets[k], child_count[k])
         end
+
+        # Leaf handling
+        if def >= inner_threshold
+            if def == max_def
+                push!(leaf_values, values[value_idx])
+                value_idx += 1
+            else
+                # Null element: slot is never read, leave it uninitialized
+                resize!(leaf_values, length(leaf_values) + 1)
+            end
+            push!(leaf_nulls, def < max_def)
+            child_count[max_rep] += 1
+        end
+    end
+
+    for k in 1:max_rep
+        push!(offsets[k], child_count[k])
     end
 
     # Build bottom-up: leaf array → wrap with List at each level
@@ -661,14 +630,9 @@ function _to_arrow_nested(all_rep, all_def, values::AbstractVector{T}, max_def, 
 
     for k in max_rep:-1:1
         n = length(offsets[k]) - 1
-        if k == 1
-            # Top level: apply record nulls and field metadata
-            v = _validity(record_nulls)
-            child = _make_list(child, v, offsets[k], n, v.nc > 0 || nullable, meta)
-        else
-            # Intermediate levels: all-valid
-            child = _make_list(child, Arrow.ValidityBitmap(UInt8[], 1, n, 0), offsets[k], n, false)
-        end
+        v = _validity(level_nulls[k])
+        # Field metadata belongs to the top level only
+        child = _make_list(child, v, offsets[k], n, v.nc > 0 || nullable, k == 1 ? meta : nothing)
     end
 
     child
