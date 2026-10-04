@@ -87,7 +87,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (single row group, null-count statistics). `DateTime` is written as a naive millisecond timestamp and `Arrow.Timestamp{unit, tz}` with its unit and UTC flag, so timestamp columns from `read_parquet` write back unchanged (a named time zone becomes UTC, since Parquet only stores a UTC flag). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written.
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (single row group, null-count statistics). `DateTime` is written as a naive millisecond timestamp and `Arrow.Timestamp{unit, tz}` with its unit and UTC flag, so timestamp columns from `read_parquet` write back unchanged (a named time zone becomes UTC, since Parquet only stores a UTC flag). Pages are compressed with Snappy by default; pass `compression = :gzip`, `:brotli`, `:zstd`, `:lz4`, or `:uncompressed` to change it. Output is readable by pyarrow. Multiple row groups are not yet written.
 
 Values are PLAIN-encoded by default. `encoding = :byte_stream_split` uses BYTE_STREAM_SPLIT for every Float32/Float64 column (others stay PLAIN). A `Dict` chooses per column, keyed by the path used to reach the data: `encoding = Dict("x" => :byte_stream_split, "wf.values" => :plain, "particles.pt" => :byte_stream_split)`. A key naming a struct or list covers everything under it; in a `Dict`, an encoding that does not fit the column's type, or a key matching no column, is an error. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
 
@@ -97,13 +97,16 @@ Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Bin
 
 ### Compression
 
-| Codec | Implementation |
-|-------|---------------|
-| Snappy | Snappy.jl (libsnappy) |
-| Gzip | CodecZlib.jl |
-| Zstd | CodecZstd.jl |
-| LZ4 (raw) | CodecLz4.jl (liblz4) |
-| LZ4 (Hadoop) | Custom framing + liblz4 for block decompression |
+All codecs go through [ChunkCodecs.jl](https://github.com/JuliaIO/ChunkCodecs.jl).
+
+| Codec | Read | Write (`compression =`) | Implementation |
+|-------|------|-------------------------|----------------|
+| Snappy | yes | `:snappy` (default) | ChunkCodecLibSnappy |
+| Gzip | yes | `:gzip` | ChunkCodecLibZlib |
+| Brotli | yes | `:brotli` | ChunkCodecLibBrotli |
+| Zstd | yes | `:zstd` | ChunkCodecLibZstd |
+| LZ4 (raw) | yes | `:lz4` | ChunkCodecLibLz4 |
+| LZ4 (Hadoop, deprecated) | yes | no | Custom framing around ChunkCodecLibLz4 blocks |
 
 ### Nested Types
 

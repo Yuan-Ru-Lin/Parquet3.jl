@@ -142,7 +142,9 @@ using Dates
 
     @testset "Snappy Decompression" begin
         compressed = UInt8[0x05, 0x10, 0x68, 0x65, 0x6c, 0x6c, 0x6f]
-        @test String(Parquet3.decompress_snappy(compressed, 5)) == "hello"
+        @test String(Parquet3.decompress(compressed, Parquet3.SNAPPY, 5)) == "hello"
+        # The declared size bounds the output: a page claiming less than it holds is rejected
+        @test_throws Exception Parquet3.decompress(compressed, Parquet3.SNAPPY, 4)
     end
 
 end
@@ -280,7 +282,7 @@ table = pa.table({
         @test collect(tbl.value) == [1.5, 2.5, 3.5, 4.5, 5.5]
     end
 
-    for codec in ["none", "snappy", "gzip", "zstd", "lz4"]
+    for codec in ["none", "snappy", "gzip", "brotli", "zstd", "lz4"]
         @testset "$codec" begin
             _with_pyarrow_file("compression=$codec", "test_$codec.parquet",
                 pyscript * "\nwrite_kwargs = {'compression': '$codec'}") do tbl
@@ -1142,7 +1144,7 @@ print(b.schema.field('wf').type)""")
         try
             write_parquet(f, tbl; compression = :uncompressed)
             raw_size = filesize(f)
-            for (codec, pyname) in ((:snappy, "SNAPPY"), (:gzip, "GZIP"), (:zstd, "ZSTD"), (:lz4, "LZ4"))
+            for (codec, pyname) in ((:snappy, "SNAPPY"), (:gzip, "GZIP"), (:brotli, "BROTLI"), (:zstd, "ZSTD"), (:lz4, "LZ4"))
                 write_parquet(f, tbl; compression = codec)
                 @test filesize(f) < raw_size ÷ 2
                 t = read_parquet(f)
@@ -1171,7 +1173,7 @@ print(t.column('id').to_pylist() == list(range(1, $(n) + 1)), t.column('hits').t
             close(pf)
             write_parquet(f, (a = Int32[], l = Vector{Float64}[]); compression = "zstd")
             @test length(read_parquet(f).a) == 0
-            @test_throws Exception write_parquet(f, tbl; compression = :brotli)
+            @test_throws "unknown compression" write_parquet(f, tbl; compression = :lzo)
         finally
             rm(f, force=true)
         end

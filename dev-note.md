@@ -122,7 +122,16 @@ Current writer scope: flat, list, and struct columns nested to any depth (Int8â€
 Float32/Float64, Bool, String, Date, DateTime, bytes + Missing unions), one row group. Each v1 data page
 body (levels + values) is compressed as a whole by `compress`, the inverse of `decompress`
 in `src/compression.jl`; Snappy is the default, as in pyarrow, whose codec names we follow
-(`:lz4` means LZ4_RAW; the deprecated Hadoop-framed LZ4 is not written). Next steps are
+(`:lz4` means LZ4_RAW; the deprecated Hadoop-framed LZ4 is not written).
+
+Compression is a lookup (`CHUNK_CODECS`: Parquet codec â†’ ChunkCodecs decoder and encoder)
+plus `encode` / `decode`. `decode` is given the page header's declared uncompressed size
+as `max_size`, so a corrupt file cannot force a larger allocation; a page that expands
+beyond its declared size is an error. ChunkCodecs releases native contexts itself, which
+is what the earlier zstd leak (unclosed TranscodingStream) got wrong. The Hadoop LZ4
+framing stays our own code, since ChunkCodecs has only the block codec. ChunkCodecLibSnappy
+1.0.0 does not declare `is_thread_safe` (it defaults to `false`); its codec is a stateless
+singleton over snappy's one-shot functions, and we share it across reader tasks. Next steps are
 in `tasks/todo.md`.
 
 ## Writer Encodings

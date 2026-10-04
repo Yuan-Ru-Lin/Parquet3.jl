@@ -4,7 +4,7 @@ const CREATED_BY = "Parquet3.jl"
 
 # Names follow pyarrow; its "lz4" is the LZ4_RAW codec
 const WRITER_CODECS = Dict(:uncompressed => UNCOMPRESSED, :none => UNCOMPRESSED, :snappy => SNAPPY,
-                           :gzip => GZIP, :zstd => ZSTD, :lz4 => LZ4_RAW)
+                           :gzip => GZIP, :brotli => BROTLI, :zstd => ZSTD, :lz4 => LZ4_RAW)
 
 """Map a Julia element type to (ParquetType, ConvertedType or nothing)."""
 function writer_parquet_type(::Type{T}) where T
@@ -220,8 +220,8 @@ in a single row group.
 its unit (milli-, micro-, or nanoseconds) and is written as UTC-adjusted unless `TZ`
 is `nothing`, so a timestamp column from `read_parquet` writes back unchanged.
 
-`compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:zstd`, `:lz4`, or
-`:uncompressed`; a string is accepted too.
+`compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:brotli`, `:zstd`, `:lz4`,
+or `:uncompressed`; a string is accepted too.
 
 `encoding` selects the value encoding: `:plain` (default) or `:byte_stream_split`
 (Float32/Float64). A single name applies to the whole table, falling back to PLAIN for

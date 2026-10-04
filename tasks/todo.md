@@ -68,6 +68,12 @@ Nested writing is driven by element type, so reader outputs round-trip:
 Deferred (edge case, decided 2026-10-03): infer struct member types from rows when the
 `NamedTuple` eltype is not concrete (`[(a = missing,), (a = 2,)]`); currently a clear error.
 
+## Codecs (v0.2.0, decided 2026-10-04 via the planning session)
+- [x] Replace CodecZlib/CodecZstd/CodecLz4/Snappy/TranscodingStreams with ChunkCodecs.jl
+      (DONE, awaiting review): `src/compression.jl` 117 → 64 lines; declared page size bounds
+      the output; leak check from 6ab762e still flat for every codec.
+- [x] Brotli read and write (`compression = :brotli`), checked both ways against pyarrow.
+
 ## Writer encodings (v0.2.0, decided 2026-10-04 via the planning session)
 Goal: write every value encoding the reader decodes. One step at a time, each reported for approval.
 - [x] E1 — BYTE_STREAM_SPLIT for Float32/Float64, the `encoding` keyword (one name for the
