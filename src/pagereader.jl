@@ -72,9 +72,9 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
         decode_delta_length_byte_array(data, count)
     elseif encoding == BYTE_STREAM_SPLIT
-        ptype == FLOAT ? decode_byte_stream_split(Float32, data, count) :
-        ptype == DOUBLE ? decode_byte_stream_split(Float64, data, count) :
-        error("BYTE_STREAM_SPLIT is decoded for FLOAT and DOUBLE only, not $ptype")
+        ptype in (FLOAT, DOUBLE, INT32, INT64) ||
+            error("BYTE_STREAM_SPLIT is decoded for FLOAT, DOUBLE, INT32 and INT64 only, not $ptype")
+        decode_byte_stream_split(PLAIN_FIXED_TYPES[ptype], data, count)
     elseif encoding == RLE && ptype == BOOLEAN
         decode_rle_boolean(data, count)
     else

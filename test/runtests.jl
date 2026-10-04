@@ -1742,8 +1742,7 @@ const HAS_PARQUET_TESTING = isdir(PARQUET_TESTING_DIR)
 # file => columns that cannot be read yet (see Known Limitations in dev-note.md).
 # read_parquet throws for these; every other column, and every other file, must read.
 const PARQUET_TESTING_KNOWN_GAPS = Dict(
-    "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split", "int64_byte_stream_split",
-                                                  "flba5_byte_stream_split", "decimal_byte_stream_split"],
+    "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "flba5_byte_stream_split", "decimal_byte_stream_split"],
     "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
                                    "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],
     "delta_encoding_optional_column.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name",
@@ -2039,13 +2038,17 @@ if HAS_PARQUET_TESTING
 
     @testset "parquet-testing: Byte Stream Split cross-check" begin
         path = joinpath(PARQUET_TESTING_DIR, "byte_stream_split_extended.gzip.parquet")
-        # BYTE_STREAM_SPLIT is decoded for FLOAT and DOUBLE only; the other four columns are an error
+        # BYTE_STREAM_SPLIT is decoded for FLOAT, DOUBLE, INT32 and INT64; the three fixed-length columns are an error
         err = try read_parquet(path); nothing catch e; e end
         @test err isa Parquet3.ColumnReadError && err.column == "float16_byte_stream_split"
         @test occursin("pass `columns=` without it", sprint(showerror, err))
-        t = read_parquet(path; columns = ["float_plain", "float_byte_stream_split", "double_plain", "double_byte_stream_split"])
+        t = read_parquet(path; columns = ["float_plain", "float_byte_stream_split", "double_plain", "double_byte_stream_split",
+                                           "int32_plain", "int32_byte_stream_split", "int64_plain", "int64_byte_stream_split"])
         @test Tables.getcolumn(t, :float_plain) ≈ Tables.getcolumn(t, :float_byte_stream_split)
         @test Tables.getcolumn(t, :double_plain) ≈ Tables.getcolumn(t, :double_byte_stream_split)
+        # Integers: the same values and the same type as their PLAIN twins (an INT64 column used to come back as Float64)
+        @test t.int32_byte_stream_split == t.int32_plain && eltype(t.int32_byte_stream_split) == eltype(t.int32_plain)
+        @test t.int64_byte_stream_split == t.int64_plain && eltype(t.int64_byte_stream_split) == eltype(t.int64_plain)
     end
 
     @testset "parquet-testing: every file reads fully or is a known gap" begin

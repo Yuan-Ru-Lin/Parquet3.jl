@@ -423,7 +423,7 @@ Decode byte stream split encoding: byte 1 of every value, then byte 2 of every v
 so on. Read as a `count`×K matrix whose columns are those streams, the values' bytes are
 its rows. Inverse of `encode_byte_stream_split`.
 """
-decode_byte_stream_split(::Type{T}, data::AbstractVector{UInt8}, count::Int) where {T <: Union{Float32, Float64}} =
+decode_byte_stream_split(::Type{T}, data::AbstractVector{UInt8}, count::Int) where {T <: Union{Float32, Float64, Int32, Int64}} =
     reinterpret(T, vec(permutedims(reshape(@view(data[1:sizeof(T) * count]), count, sizeof(T)))))
 
 # ═══════════════════════════════════════════════════════════════════════════

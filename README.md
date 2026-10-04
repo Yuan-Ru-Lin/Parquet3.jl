@@ -113,7 +113,7 @@ A single name applies to the whole table: it is used for every column whose type
 
 ### Encodings
 
-Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Binary Packed, Delta Length Byte Array, Byte Stream Split.
+Read: Plain, RLE/Bit-Packed (levels, dictionary indices, booleans), Dictionary (Plain Dictionary + RLE Dictionary), Delta Binary Packed, Delta Length Byte Array, Byte Stream Split (float, double, int32, int64). Not read yet: Delta Byte Array, and Byte Stream Split for fixed-length byte arrays.
 
 ### Compression
 
