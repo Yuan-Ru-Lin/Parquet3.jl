@@ -82,10 +82,15 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
       columns that throw are listed in dev-note Known Limitations and pinned by a test
 - [x] D — Arrow compat restricted to the 2.8 series (`~2.8.1`)
 - [x] E — dead code deleted (199 source lines); none of it was exported
-- [ ] Found by C, not fixed (were silently dropped before): empty v2 data page,
-      `dictionary_page_offset = 0`, PLAIN fixed-length byte arrays, deprecated LZ4 codec (both
-      framings), `rle_boolean_encoding`, >2 GB string column. Not implemented: DELTA_BYTE_ARRAY,
-      BYTE_STREAM_SPLIT beyond float/double, RLE booleans.
+- [x] Read failures found by C, fixed 2026-10-04 (one commit each, on writer-w1 after the
+      recursive reader was merged in): `dictionary_page_offset = 0` (and its mirror,
+      `data_page_offset = 0` for a zero-row chunk); an empty v2 data section; v2 level bytes
+      stored for a column without such levels; RLE-encoded booleans.
+- [x] `fixed_length_byte_array.parquet` reclassified: the file is malformed and pyarrow
+      rejects it too; PLAIN fixed-length byte arrays are read from other files.
+- [ ] Still failing (9 of 64 parquet-testing files). Not implemented: DELTA_BYTE_ARRAY,
+      BYTE_STREAM_SPLIT beyond float/double. Not investigated: deprecated LZ4 codec (three
+      files; left alone by decision). Limit: >2 GB of strings in one chunk.
 
 ## Writer encodings (v0.2.0, decided 2026-10-04 via the planning session)
 Goal: write every value encoding the reader decodes. One step at a time, each reported for approval.

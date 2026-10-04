@@ -1622,6 +1622,7 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
                                                  "c_preferred_cust_flag", "c_birth_country", "c_email_address", "c_last_review_date"],
     "delta_encoding_required_column.parquet" => ["c_customer_id:", "c_salutation:", "c_first_name:", "c_last_name:",
                                                  "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
+    # malformed (a required column whose pages contain nulls); pyarrow rejects it as well
     "fixed_length_byte_array.parquet" => ["flba_field"],
     "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
     "hadoop_lz4_compressed_larger.parquet" => ["a"],
@@ -1863,6 +1864,17 @@ if HAS_PARQUET_TESTING
             @test collect(t.d) == [true, true, true, false, true] && collect(t.b) == [1, 2, 3, 4, 5]
             @test isequal(collect(t.a), ["abc", "abc", "abc", missing, "abc"]) && collect(t.c) == [2.0, 3.0, 4.0, 5.0, 2.0]
             @test isequal([ismissing(l) ? missing : collect(l) for l in t.e], [[1, 2, 3], missing, missing, [1, 2, 3], [1, 2]])
+        end
+
+        @testset "PLAIN fixed-length byte arrays" begin
+            # fixed_length_byte_array.parquet is malformed, so the encoding is checked on files that are not
+            path = joinpath(PARQUET_TESTING_DIR, "byte_stream_split_extended.gzip.parquet")
+            t = read_parquet(path; columns = ["flba5_plain"])
+            @test length(t.flba5_plain) == 200 && all(v -> length(v) == 5, t.flba5_plain)
+            result = _run_pyarrow("import pyarrow.parquet as pq; print(','.join(v.hex() for v in pq.read_table('$(path)', columns=['flba5_plain']).column(0).to_pylist()))")
+            result === nothing || @test result == join((bytes2hex(collect(v)) for v in t.flba5_plain), ",")
+            @test length(read_parquet(joinpath(PARQUET_TESTING_DIR, "fixed_length_decimal.parquet")).value) == 24
+            @test_throws Parquet3.ColumnReadError read_parquet(joinpath(PARQUET_TESTING_DIR, "fixed_length_byte_array.parquet"))
         end
 
         @testset "overflow_i16_page_cnt" begin
