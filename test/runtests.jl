@@ -1624,7 +1624,6 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
                                                  "c_preferred_cust_flag", "c_birth_country", "c_email_address", "c_last_review_date"],
     "delta_encoding_required_column.parquet" => ["c_customer_id:", "c_salutation:", "c_first_name:", "c_last_name:",
                                                  "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
-    "dict-page-offset-zero.parquet" => ["l_partkey"],
     "fixed_length_byte_array.parquet" => ["flba_field"],
     "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
     "hadoop_lz4_compressed_larger.parquet" => ["a"],
@@ -1832,6 +1831,15 @@ if HAS_PARQUET_TESTING
                 @test length(Tables.columnnames(t)) == 2
                 @test length(Tables.getcolumn(t, first(Tables.columnnames(t)))) == 1000
             end
+        end
+
+        @testset "dict-page-offset-zero" begin
+            # dictionary_page_offset = 0 means "no dictionary page", not "pages start at byte 0"
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "dict-page-offset-zero.parquet"))
+            @test length(t.l_partkey) == 39 && all(==(1552), t.l_partkey)     # as pyarrow reads it
+            # The mirror case: a zero-row chunk with only a dictionary page stores data_page_offset = 0
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "column_chunk_key_value_metadata.parquet"))
+            @test collect(propertynames(t)) == [:column1, :column2] && length(t.column1) == 0
         end
 
         @testset "overflow_i16_page_cnt" begin

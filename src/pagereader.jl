@@ -79,9 +79,21 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
     end
 end
 
+"""
+Byte offset of a column chunk's first page: the dictionary page if there is one, else the
+first data page. No page can start at byte 0, where the file's magic bytes are, and some
+writers store 0 for "absent": `dictionary_page_offset = 0` when there is no dictionary,
+`data_page_offset = 0` when a zero-row chunk has only a dictionary page. So the first
+page is at the smaller of the two offsets that are positive.
+"""
+function _first_page_offset(meta::ColumnMetaData)
+    dict, data = something(meta.dictionary_page_offset, 0), meta.data_page_offset
+    dict > 0 && (data <= 0 || dict < data) ? dict : data
+end
+
 function read_page(reader::ColumnReader)
     meta = reader.meta
-    chunk_end = something(meta.dictionary_page_offset, meta.data_page_offset) + meta.total_compressed_size
+    chunk_end = _first_page_offset(meta) + meta.total_compressed_size
     reader.offset >= chunk_end && return nothing
 
     header, bytes_consumed = read_page_header(reader.data, reader.offset, Int(chunk_end))
@@ -163,7 +175,7 @@ function read_page(reader::ColumnReader)
 end
 
 function read_all_pages(reader::ColumnReader)
-    reader.offset = something(reader.meta.dictionary_page_offset, reader.meta.data_page_offset)
+    reader.offset = _first_page_offset(reader.meta)
 
     pages = DecodedPage[]
     while true
