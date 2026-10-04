@@ -55,25 +55,19 @@ end
 # Gzip Decompression
 =============================================================================#
 
+# `transcode` initializes and finalizes the codec around the call. Reading from a
+# TranscodingStream that is never closed leaves the native context allocated: ZSTD's is
+# not garbage-collected, which leaked ~95 KB per page.
+
 """Decompress Gzip-compressed data."""
-function decompress_gzip(data::Vector{UInt8})::Vector{UInt8}
-    io = IOBuffer(data)
-    decompressor = GzipDecompressor()
-    decompressed = read(TranscodingStream(decompressor, io))
-    decompressed
-end
+decompress_gzip(data::Vector{UInt8})::Vector{UInt8} = transcode(GzipDecompressor, data)
 
 #=============================================================================
 # Zstd Decompression
 =============================================================================#
 
 """Decompress Zstd-compressed data."""
-function decompress_zstd(data::Vector{UInt8})::Vector{UInt8}
-    io = IOBuffer(data)
-    decompressor = ZstdDecompressor()
-    decompressed = read(TranscodingStream(decompressor, io))
-    decompressed
-end
+decompress_zstd(data::Vector{UInt8})::Vector{UInt8} = transcode(ZstdDecompressor, data)
 
 #=============================================================================
 # LZ4 Decompression (via CodecLz4 / liblz4)
@@ -120,5 +114,4 @@ function decompress_lz4(data::Vector{UInt8}, uncompressed_size::Int, is_raw::Boo
     result
 end
 
-# Re-export TranscodingStreams for gzip/zstd
-using TranscodingStreams: TranscodingStream, transcode
+using TranscodingStreams: transcode
