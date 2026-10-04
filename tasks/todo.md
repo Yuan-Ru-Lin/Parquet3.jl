@@ -210,7 +210,7 @@ handling, and logical types on members. Bugs below are in priority order; one at
       `parse_page_header`. Their four level-array unit tests now drive the live `_to_arrow_nested`.
 - [x] `snulls` loop is just `record_defs .< own_def`
 
-## Part 4 — one recursive reader (PLAN, revision 2, awaiting approval; no reader code written yet)
+## Part 4 — one recursive reader (plan revision 2; go-ahead relayed 2026-10-04; branch `recursive-reader`)
 
 Requested 2026-10-04 via the planning session; revised the same day for two questions from
 the user (member selection through `columns=`; nullability from decoded levels). Goal:
@@ -253,9 +253,9 @@ decoded, so `columns=["wf.t0"]` does not touch the waveform values.
   `pt`; a key naming a struct or list selects everything under it; overlapping keys union.
 - Keys are the short dotted paths the writer's `encoding` keyword uses: no `list`/`element`
   segments, and for a MAP no `key_value` segment (`"m.key"`, `"m.value"`).
-- This replaces today's matching by Parquet path or by bare leaf name. An unmatched key
-  keeps today's behaviour (a warning naming it). I would prefer an error, as the writer's
-  `encoding` mapping does, but that is a separate decision and not part of this plan.
+- This replaces today's matching by Parquet path or by bare leaf name. An unmatched key is
+  an error naming the key(s) (decided by the user 2026-10-04; replaces today's warning once
+  the new reader becomes the default at R7).
 - Nothing makes this harder than pruning. It also shrinks breaking change 5 below: dotted
   selection keeps working, and returns a pruned nested column instead of a flat one.
 
@@ -327,13 +327,19 @@ report, so the deliberate change is visible, not inferred.
 ### Staging — each step ends with a report and waits for approval
 Old paths stay the default until R6; the new reader runs beside them behind an internal
 entry point.
-- [ ] R0 — regression harness (oracle above) and baseline, no reader change. Corpus: every
+- [x] R0 (DONE, awaiting review) — regression harness (oracle above) and baseline, no reader change.
+      `test/reader_harness.jl`; 80 files locally (26 pyarrow, 2 writer, 51 parquet-testing,
+      part-0 local only), 79 in the committed suite. Old reader vs itself: 0 differences;
+      its types are loose in 26 files (the preview of what tightens). Corpus: every
       pyarrow fixture in the suite, the parquet-testing files that read, `part-0.parquet`,
       and a writer-produced shape matrix.
       Baseline benchmark (min of 7, 8 threads, 2026-10-04, commit 8614d23):
       all columns 182.6 ms / 1317 MiB; `waveform_windowed` 181.2 ms / 712 MiB;
       `waveform_presummed` 146.3 ms / 539 MiB; `tracelist` 5.0 ms / 12 MiB.
-- [ ] R1 — plan tree from the schema (kinds, levels, user paths) and the pruning function.
+- [x] R1 (DONE, awaiting review) — `src/reader.jl`: `plan_read_tree`, `prune_read_plan` (unmatched key
+      throws). Not used by `read_parquet` yet. All 64 parquet-testing schemas plan, and agree
+      with the current reader's leaves, levels and list thresholds.
+      Original wording: plan tree from the schema (kinds, levels, user paths) and the pruning function.
       Pure functions with unit tests, including legacy 2-level lists, MAP, bare repeated
       fields, and selections (leaf, group, overlapping, unmatched). No assembly.
 - [ ] R2 — two-stage assembly for leaves and structs without lists; nullability from
@@ -350,7 +356,9 @@ entry point.
       `read_table(columns=…)` for the same keys; a check that unselected leaves are not
       decoded; benchmark of `waveform_windowed.t0` alone against the full column.
 - [ ] R7 — switch the default; delete the old paths, the classification helpers and the
-      statistics-based nullability; docs; final benchmark.
+      statistics-based nullability; docs; final benchmark. Re-run the parquet-testing files
+      with known read failures (task C list) against the new reader and report which still
+      fail and which went away; they are deliberately not fixed before the rewrite.
 
 ### Constraints carried from the brief
 - Structure and values of everything that assembles today are unchanged.

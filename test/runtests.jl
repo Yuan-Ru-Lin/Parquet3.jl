@@ -1595,6 +1595,28 @@ end
 const PARQUET_TESTING_DIR = joinpath(@__DIR__, "parquet-testing", "data")
 const HAS_PARQUET_TESTING = isdir(PARQUET_TESTING_DIR)
 
+# file => columns that cannot be read yet (see Known Limitations in dev-note.md).
+# read_parquet throws for these; every other column, and every other file, must read.
+const PARQUET_TESTING_KNOWN_GAPS = Dict(
+    "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split",
+                                                  "flba5_byte_stream_split", "decimal_byte_stream_split"],
+    "datapage_v2.snappy.parquet" => ["d"],
+    "datapage_v2_empty_datapage.snappy.parquet" => ["value"],
+    "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
+                                   "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],
+    "delta_encoding_optional_column.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name",
+                                                 "c_preferred_cust_flag", "c_birth_country", "c_email_address", "c_last_review_date"],
+    "delta_encoding_required_column.parquet" => ["c_customer_id:", "c_salutation:", "c_first_name:", "c_last_name:",
+                                                 "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
+    "dict-page-offset-zero.parquet" => ["l_partkey"],
+    "fixed_length_byte_array.parquet" => ["flba_field"],
+    "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
+    "hadoop_lz4_compressed_larger.parquet" => ["a"],
+    "large_string_map.brotli.parquet" => ["arr.key_value.key"],
+    "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
+    "rle_boolean_encoding.parquet" => ["datatype_boolean"],
+)
+
 if HAS_PARQUET_TESTING
     @info "Running parquet-testing suite"
 
@@ -1840,34 +1862,13 @@ if HAS_PARQUET_TESTING
     end
 
     @testset "parquet-testing: every file reads fully or is a known gap" begin
-        # file => columns that cannot be read yet (see Known Limitations in dev-note.md).
-        # read_parquet throws for these; every other column, and every other file, must read.
-        known_gaps = Dict(
-            "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split",
-                                                          "flba5_byte_stream_split", "decimal_byte_stream_split"],
-            "datapage_v2.snappy.parquet" => ["d"],
-            "datapage_v2_empty_datapage.snappy.parquet" => ["value"],
-            "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
-                                           "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],
-            "delta_encoding_optional_column.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name",
-                                                         "c_preferred_cust_flag", "c_birth_country", "c_email_address", "c_last_review_date"],
-            "delta_encoding_required_column.parquet" => ["c_customer_id:", "c_salutation:", "c_first_name:", "c_last_name:",
-                                                         "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
-            "dict-page-offset-zero.parquet" => ["l_partkey"],
-            "fixed_length_byte_array.parquet" => ["flba_field"],
-            "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
-            "hadoop_lz4_compressed_larger.parquet" => ["a"],
-            "large_string_map.brotli.parquet" => ["arr.key_value.key"],
-            "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
-            "rle_boolean_encoding.parquet" => ["datatype_boolean"],
-        )
         for f in filter(endswith(".parquet"), readdir(PARQUET_TESTING_DIR))
             path = joinpath(PARQUET_TESTING_DIR, f)
             failing = filter(column_names(open_parquet(path))) do name
                 try read_parquet(path; columns = [name]); false catch e; e isa Parquet3.ColumnReadError || rethrow(); true end
             end
             @testset "$f" begin
-                @test failing == get(known_gaps, f, String[])
+                @test failing == get(PARQUET_TESTING_KNOWN_GAPS, f, String[])
                 isempty(failing) ? @test(read_parquet(path) isa Arrow.Table) :
                                    @test_throws(Parquet3.ColumnReadError, read_parquet(path))
             end
@@ -1876,4 +1877,132 @@ if HAS_PARQUET_TESTING
 
 else
     @warn "Skipping parquet-testing suite: submodule not found at $PARQUET_TESTING_DIR"
+end
+
+# =============================================================================
+# Recursive reader (Part 4)
+# =============================================================================
+
+include("reader_harness.jl")
+
+@testset "Reader harness (R0)" begin
+    @testset "oracle" begin
+        NT = @NamedTuple{a::Union{Missing, Int64}, v::Union{Missing, Vector{Union{Missing, Int32}}}}
+        @test harness_shape(Union{Missing, NT}) == (:struct, (:a, :v), (Int64, (:list, Int32)))
+        @test harness_shape(Union{Missing, NT}) == harness_shape(@NamedTuple{a::Int64, v::Vector{Int32}})
+        @test harness_shape(Parquet3.FixedSizeView{3, Int32}) == (:fixed_size_list, 3, Int32)
+        @test harness_shape(Vector{Int64}) != harness_shape(Vector{Int32})
+
+        tight = (a = [1, 2], l = [[1], Int[]], s = [(x = 1,), (x = 2,)], o = [1, missing])
+        @test isempty(loose_nodes(tight))
+        loose = (a = Union{Missing, Int}[1, 2], l = Union{Missing, Vector{Union{Missing, Int}}}[[1], [2]],
+                 s = Union{Missing, @NamedTuple{x::Union{Missing, Int}}}[(x = 1,), (x = 2,)],
+                 m = Union{Missing, @NamedTuple{x::Union{Missing, Int}}}[(x = missing,), missing])
+        @test loose_nodes(loose) == ["a", "l", "l[]", "s", "s.x"]
+
+        same = (a = [1, 2], l = [[1.5], Float64[]], s = [(x = "a", v = [1]), (x = "b", v = Int[])])
+        @test isempty(reader_differences(same, same))
+        @test isempty(reader_differences(same, merge(same, (a = Union{Missing, Int}[1, 2],))))   # Missing is stripped
+        @test reader_differences(same, merge(same, (a = [1, 3],))) == ["a: values differ"]
+        @test reader_differences(same, merge(same, (a = Int32[1, 2],))) == ["a: element type Int64 vs Int32"]
+        @test reader_differences(same, merge(same, (l = [[1.5], missing],))) == ["l: values differ"]
+        @test only(reader_differences(same, (a = same.a, l = same.l))) |> startswith("column names differ")
+    end
+
+    mktempdir() do dir
+        corpus = harness_corpus(dir)
+        @test length(corpus) > 20
+        # Until the new reader exists, the old reader is compared with itself: this checks the
+        # corpus reads and the oracle is stable, and records where today's types are loose.
+        results = run_reader_harness(read_parquet, read_parquet, corpus)
+        @test all(r -> isempty(r.differences), results)
+        loose = [(r.label, r.loose_old) for r in results if !isempty(r.loose_old)]
+        @info "Reader harness: $(length(corpus)) files; statistics-based types are loose in $(length(loose)):\n" *
+              join(("  $label: $(join(nodes, ", "))" for (label, nodes) in loose), "\n")
+    end
+end
+
+@testset "Reader plan and pruning (R1)" begin
+    P = Parquet3
+    plan_of(path) = (pf = open_parquet(path); tree = P.build_schema_tree(pf.metadata.schema); close(pf);
+                     (P.plan_read_tree(tree), tree))
+    strings(plan) = map(P.read_plan_string, plan)
+
+    mktempdir() do dir
+        path = joinpath(dir, "shapes.parquet")
+        write_parquet(path, (
+            id    = [1, 2],
+            wf    = [(t0 = 0.5, values = Int32[1, 2]), (t0 = 1.5, values = Int32[])],
+            ev    = [(id = 1, vertex = (x = 0.1, y = 0.2)), (id = 2, vertex = (x = 0.3, y = 0.4))],
+            parts = [[(pt = 1f0, q = Int32(1))], [(pt = 2f0, q = Int32(-1))]],
+            ll    = [[[1, 2], [3]], [[4]]],
+            deep  = [[(a = 1, v = [1, 2]), (a = 2, v = Int[])], [(a = 3, v = [3])]],
+        ))
+        plan, _ = plan_of(path)
+        @test strings(plan) == [
+            "id: leaf@1",
+            "wf: struct@1{t0: leaf@2, values: list@2/3<leaf@4>}",
+            "ev: struct@1{id: leaf@2, vertex: struct@2{x: leaf@3, y: leaf@3}}",
+            "parts: list@1/2<struct@3{pt: leaf@4, q: leaf@4}>",
+            "ll: list@1/2<list@3/4<leaf@5>>",
+            "deep: list@1/2<struct@3{a: leaf@4, v: list@4/5<leaf@6>}>",
+        ]
+        # User keys carry no list/element segments, as in the writer's `encoding` keyword
+        @test [l.key for n in plan for l in P.read_leaves(n)] ==
+              ["id", "wf.t0", "wf.values", "ev.id", "ev.vertex.x", "ev.vertex.y", "parts.pt", "parts.q", "ll", "deep.a", "deep.v"]
+        @test [join(l.path, ".") for l in P.read_leaves(plan[4])] == ["parts.list.element.pt", "parts.list.element.q"]
+        @test [n.rep_level for n in (plan[5], only(plan[5].children), only(only(plan[5].children).children))] == [1, 2, 2]
+
+        # Pruning: a member keeps its ancestors; a group keeps everything; keys union; schema order
+        pruned(keys) = strings(P.prune_read_plan(plan, keys))
+        @test pruned(["wf.t0"]) == ["wf: struct@1{t0: leaf@2}"]
+        @test pruned(["parts.pt", "id"]) == ["id: leaf@1", "parts: list@1/2<struct@3{pt: leaf@4}>"]
+        @test pruned(["ev.vertex"]) == ["ev: struct@1{vertex: struct@2{x: leaf@3, y: leaf@3}}"]
+        @test pruned(["ev.vertex.y", "ev.id"]) == ["ev: struct@1{id: leaf@2, vertex: struct@2{y: leaf@3}}"]
+        @test pruned(["wf", "wf.t0"]) == ["wf: struct@1{t0: leaf@2, values: list@2/3<leaf@4>}"]
+        @test pruned(["deep.v", "ll"]) == ["ll: list@1/2<list@3/4<leaf@5>>", "deep: list@1/2<struct@3{v: list@4/5<leaf@6>}>"]
+        @test pruned([n.name for n in plan]) == strings(plan)
+        # Unselected leaves are gone from the plan, so they cannot be decoded
+        @test [l.key for n in P.prune_read_plan(plan, ["wf.t0", "parts.q"]) for l in P.read_leaves(n)] == ["wf.t0", "parts.q"]
+
+        # A key matching nothing is an error naming it (Parquet paths and bare member names are not keys)
+        @test_throws "no column matches \"nope\", \"wf.list\"" P.prune_read_plan(plan, ["id", "nope", "wf.list"])
+        @test_throws "no column matches \"parts.list.element.pt\"" P.prune_read_plan(plan, ["parts.list.element.pt"])
+        @test_throws "no column matches \"t0\"" P.prune_read_plan(plan, ["t0"])
+        @test_throws ArgumentError P.prune_read_plan(plan, ["w"])      # a prefix of a name is not a match
+    end
+
+    if HAS_PARQUET_TESTING
+        ptfile(f) = joinpath(PARQUET_TESTING_DIR, f)
+        # Legacy and unusual layouts, per the format's backward-compatibility rules
+        @test strings(first(plan_of(ptfile("old_list_structure.parquet")))) == ["a: list@0/1<list@1/2<leaf@2>>"]
+        @test strings(first(plan_of(ptfile("repeated_primitive_no_list.parquet")))) == [
+            "Int32_list: list@0/1<leaf@1>", "String_list: list@0/1<leaf@1>",
+            "group_of_lists: struct@0{Int32_list_in_group: list@0/1<leaf@1>, String_list_in_group: list@0/1<leaf@1>}"]
+        @test strings(first(plan_of(ptfile("repeated_no_annotation.parquet")))) == [
+            "id: leaf@0", "phoneNumbers: struct@1{phone: list@1/2<struct@2{number: leaf@2, kind: leaf@3}>}"]
+        @test strings(first(plan_of(ptfile("map_no_value.parquet")))) == [
+            "my_map: list@0/1<struct@1{key: leaf@1, value: leaf@2}>", "my_map_no_v: list@0/1<struct@1{key: leaf@1}>",
+            "my_list: list@0/1<leaf@1>"]
+        nested_maps, _ = plan_of(ptfile("nested_maps.snappy.parquet"))
+        @test strings(nested_maps)[1] == "a: list@1/2<struct@2{key: leaf@2, value: list@3/4<struct@4{key: leaf@4, value: leaf@4}>}>"
+        @test [l.key for l in P.read_leaves(nested_maps[1])] == ["a.key", "a.value.key", "a.value.value"]
+        @test strings(first(plan_of(ptfile("nested_lists.snappy.parquet"))))[1] == "a: list@1/2<list@3/4<list@5/6<leaf@7>>>"
+
+        # Every schema plans, and the plan agrees with the schema tree the current reader uses:
+        # same leaves in the same order, same levels, and the lists enclosing a leaf have the
+        # item levels the current reader computes as thresholds.
+        items(node, acc = Int[]) = node.kind == :leaf ? [(node.path, acc)] :
+            reduce(vcat, [items(c, node.kind == :list ? [acc; node.item_def] : acc) for c in node.children])
+        for f in filter(endswith(".parquet"), readdir(PARQUET_TESTING_DIR))
+            plan, tree = plan_of(ptfile(f))
+            leaves, columns = [l for n in plan for l in P.read_leaves(n)], P.get_leaf_columns(tree)
+            @testset "$f" begin
+                @test [l.path for l in leaves] == first.(columns)
+                @test all(l.def_level == c.max_def_level && l.rep_level == c.max_rep_level for (l, (_, c)) in zip(leaves, columns))
+                @test all(acc == P.compute_def_thresholds(tree, path) && length(acc) == length(P.compute_def_thresholds(tree, path))
+                          for n in plan for (path, acc) in items(n))
+            end
+        end
+    end
 end
