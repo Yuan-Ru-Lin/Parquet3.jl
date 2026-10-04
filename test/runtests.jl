@@ -438,6 +438,48 @@ table = pa.table({'id': [1, 2], 's': pa.array([{'a': 1}, {'a': 2}], type=pa.stru
     end
 end
 
+@testset "Struct edge cases" begin
+    plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
+
+    _with_pyarrow_file("required struct and members", "test_struct_required.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+req = pa.struct([pa.field('a', pa.int64(), nullable=False), pa.field('b', pa.int64()),
+                 pa.field('v', pa.list_(pa.int64()), nullable=False)])
+opt = pa.struct([pa.field('a', pa.int64(), nullable=False),
+                 pa.field('v', pa.list_(pa.int64()), nullable=False)])
+schema = pa.schema([pa.field('req', req, nullable=False), pa.field('opt', opt), pa.field('allnull', opt)])
+table = pa.table({
+    'req': pa.array([{'a': 1, 'b': None, 'v': []}, {'a': 2, 'b': 20, 'v': [None, 5]}], type=req),
+    'opt': pa.array([None, {'a': 3, 'v': [7]}], type=opt),
+    'allnull': pa.array([None, None], type=opt),
+}, schema=schema)""") do tbl
+        @test !(Missing <: eltype(tbl.req))
+        @test tbl.req.a == [1, 2]
+        @test isequal(tbl.req.b, [missing, 20])
+        @test isequal(plain(tbl.req.v), Any[Any[], Any[missing, 5]])
+        @test ismissing(tbl.opt[1]) && tbl.opt[2].a == 3 && tbl.opt[2].v == [7]
+        @test all(ismissing, tbl.allnull) && length(tbl.allnull) == 2
+    end
+
+    # Nulls only in the last row group; struct null, member null, and empty list all present
+    rows = """
+import pyarrow as pa, pyarrow.parquet as pq
+t = pa.struct([('a', pa.int64()), ('v', pa.list_(pa.int64()))])
+rows = [{'a': i, 'v': [i, i + 1]} for i in range(20)] + [None, {'a': None, 'v': None}, {'a': 22, 'v': []}]
+table = pa.table({'s': pa.array(rows, type=t)})
+"""
+    for (label, kwargs) in (("multi-RG struct with list member", "{'row_group_size': 10}"),
+                            ("multi-RG struct without statistics", "{'row_group_size': 10, 'write_statistics': False}"))
+        _with_pyarrow_file(label, "test_struct_multirg.parquet", rows * "write_kwargs = $kwargs") do tbl
+            @test length(tbl.s) == 23
+            @test isequal(tbl.s.a, [0:19; missing; missing; 22])
+            @test all(i -> tbl.s[i].v == [i - 1, i], 1:20)
+            @test ismissing(tbl.s[21]) && !ismissing(tbl.s[22]) && ismissing(tbl.s[22].v)
+            @test isempty(tbl.s[23].v) && ismissing(tbl.s.v[21]) && ismissing(tbl.s.v[22])
+        end
+    end
+end
+
 @testset "Struct Columns" begin
     _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq

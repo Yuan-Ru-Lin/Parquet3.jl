@@ -50,7 +50,7 @@ Open: compression — in v0.2.0 or v0.3?
 - [x] `struct_member_kind` / `_single_leaf_chain`; `is_flat_struct_group` → `is_struct_group` (src/filereader.jl)
 - [x] `_to_arrow_nested` gains `record_null_def` threshold (default preserves old top-level behavior)
 - [x] `_read_struct_column` / `_assemble_struct_chunk` handle :flat and :list members;
-      `_struct_nulls_at_records` for structs with no flat member
+      `_record_defs` for structs with no flat member
 - [x] Tests: 4-layer null attribution (struct/list/empty/element), all-list struct, unit test
 - [x] Verified on real data `part-0.parquet` (12355 rows, waveform structs) — values match pyarrow exactly
 - [x] Full suite green; README + dev-note updated
@@ -97,32 +97,33 @@ handling, and logical types on members. Bugs below are in priority order; one at
       read the wrong inner lists: `[[[1,2],[3]], [], [[4]]]` → third row `[[]]`. The loop pushed
       an inner offset per record even when the record had no inner list. Fixed by rewriting
       the `_to_arrow_nested` loop to push a start offset when a list opens.
-- [ ] R4 `columns=["s.a"]` / `["s.b.c"]` silently returns no columns, no warning
+- [x] R4 (fixed: `@warn` listing unmatched names; member projection not implemented) `columns=["s.a"]` / `["s.b.c"]` silently returns no columns, no warning
       (src/api.jl:123-127). Old flattened reader returned the dotted column.
-- [ ] R5 Zero-row file: `column_names` lists columns but `read_parquet` returns none
+- [x] R5 (fixed: `_empty_pages` gives typed empty columns) Zero-row file: `column_names` lists columns but `read_parquet` returns none
       (src/api.jl:507, no row groups). All column kinds, not only structs.
 
 ### C. Suspected, not reproduced
-- [ ] R6 LIST group annotated only with `logicalType` (no `converted_type`) would be read
+- [ ] R6 (left open: no file reproduces it; documented under Known Limitations) LIST group annotated only with `logicalType` (no `converted_type`) would be read
       as a struct with one member `list` (src/filereader.jl:53-61; `logicalType` never parsed).
-- [ ] R7 Row group with zero rows: `first(pages)` in `assemble_flat_column` looks fragile.
+- [x] R7 Row group with zero rows: confirmed (current pyarrow writes one empty row group for an
+      empty table) and fixed together with R5.
 
 ### D. Tests to add (alongside the fix they cover)
 - [x] narrow + unsigned int members with nulls (R1)
 - [x] `list<string>` member with null element (R2); null/empty lists at every level (R3, R8)
-- [ ] required struct and required members; all-null struct; zero-row file (R5)
-- [ ] `write_statistics=False` with multiple row groups; multi-RG struct with a list member
-- [ ] `columns=["s.a"]` (R4)
+- [x] required struct and required members; all-null struct; zero-row file (R5)
+- [x] `write_statistics=False` with multiple row groups; multi-RG struct with a list member
+- [x] `columns=["s.a"]` (R4)
 
 ### E. Docs / tidy (last)
-- [ ] dev-note says validity comes from "a flat member if any"; code uses member 1 whatever its kind
-- [ ] this file names `_struct_nulls_at_records`; the code is `_record_defs`
-- [ ] `is_struct_group` docstring omits nested structs
+- [x] dev-note says validity comes from "a flat member if any"; code uses member 1 whatever its kind
+- [x] this file names `_struct_nulls_at_records`; the code is `_record_defs`
+- [x] `is_struct_group` docstring omits nested structs
 - [ ] `_plan_struct` fills dummy `leaf`/`path`/`thresholds` for `:struct` members
 - [ ] `_page_defs` re-walks levels `assemble_flat_column` already scanned
 - [ ] `assemble_column` / `assemble_nested*` in src/pagereader.jl are reached only from unit
       tests, not the read path; `_assemble_nested_general` likely has the R8 offset bug. Delete or fix.
-- [ ] `snulls` loop is just `record_defs .< own_def`
+- [x] `snulls` loop is just `record_defs .< own_def`
 
 ## Part 4 (future, if needed) — full closure: list<struct{list}>, list<struct{struct}>, maps
 

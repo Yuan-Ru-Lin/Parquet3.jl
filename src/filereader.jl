@@ -95,7 +95,7 @@ end
     is_struct_group(node::SchemaNode) -> Bool
 
 A struct group assemblable into `Arrow.Struct`: a non-repeated, non-LIST/MAP group
-whose children are all flat leaves or single-leaf list fields.
+whose children are all flat leaves, single-leaf list fields, or nested struct groups.
 """
 function is_struct_group(node::SchemaNode)
     isempty(node.children) && return false

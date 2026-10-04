@@ -321,12 +321,7 @@ function _assemble_struct_chunk(data::Vector{UInt8}, rg::Union{RowGroup, Nothing
     children = Tuple(first(r) for r in results)
     record_defs = results[1][2]
     n = length(first(children))
-    snulls = falses(n)
-    if plan.own_def > 0
-        @inbounds for i in 1:n
-            snulls[i] = record_defs[i] < plan.own_def
-        end
-    end
+    snulls = plan.own_def > 0 ? record_defs .< plan.own_def : falses(n)
     (_make_struct(children, plan.fnames, snulls, plan.nullable, meta), record_defs)
 end
 

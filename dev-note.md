@@ -38,9 +38,9 @@ per field for multi-RowGroup files. `Arrow.write` serializes it as a native stru
 Null attribution comes from raw definition levels. For
 `optional wf { optional t0; optional values (LIST) { repeated list { optional element }}}`
 (max_def = 4 on the `values` leaf): def 0 = struct null, 1 = list null, 2 = empty list,
-3 = element null, 4 = value. Struct validity is derived from a flat member's def levels
-(`def <` the group's own def level), or from record starts (rep == 0) of a list member when
-the struct has no flat fields. List members reuse `_to_arrow_nested` with a
+3 = element null, 4 = value. Struct validity is derived from the first member's def levels
+(`def <` the group's own def level), taken at record starts (rep == 0) when that member is
+a list. List members reuse `_to_arrow_nested` with a
 `record_null_def` threshold: below it the record is a null list (for top-level list columns
 the threshold is 1, preserving the old `def == 0` behavior).
 
@@ -62,9 +62,23 @@ Unsupported shapes (`List<Struct{List}>`, maps) fall back to flattened dotted co
 repeated leaf claims the bare top-level column name only when it is the sole leaf under that
 top, so multi-leaf fallbacks can no longer silently collide on one name.
 
+## Nested List Assembly
+
+`_to_arrow_nested` turns rep/def levels into nested `Arrow.List`s in one pass. An entry
+with rep = r continues the level-r list, so new lists open at levels r+1..max_rep; each
+opening pushes a start offset and a validity bit for that level, provided its parent item
+exists (`def >=` the parent's repeated-node threshold). A level-k list is null when def is
+below its own group's def level, i.e. `def < thresholds[k] - 1`. Null leaf elements take a
+slot in the child array that is never read.
+
+A column chunk with no pages (zero-row file or row group) is given one empty page of the
+leaf's physical type (`_empty_pages`), so every column kind assembles to a typed empty column.
+
 ## Known Limitations
 
 - Read-only. No write support.
+- Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
+- `logicalType` annotations are not parsed, only `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both).
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
 - LZ4 Hadoop framing (used by older Spark/Hadoop writers) is implemented but not tested end-to-end — only the standard LZ4 raw/frame format is covered by the test suite.
 - `open_parquet` / `read_parquet` on a non-existent path gives "File too small" instead of "File not found" (Mmap.mmap silently creates an empty file). Needs a guard in the public API.
