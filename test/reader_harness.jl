@@ -227,3 +227,49 @@ function harness_r4_columns(path::String)
         only(node.children).kind == :struct && all(c -> c.kind == :leaf, only(node.children).children)
     union(harness_r3_columns(path), [node.name for node in plan if flat_struct_list(node)])
 end
+
+# pyarrow compares its own reading of each original with its reading of our rewrite of it.
+# Maps come back from pyarrow as (key, value) tuples and from our rewrite as key/value
+# structs, so both are normalised to dicts. Arguments: original=rewrite pairs.
+const HARNESS_COMPARE_VALUES = """
+import pyarrow.parquet as pq, sys
+def norm(v):
+    if isinstance(v, tuple): return {'key': norm(v[0]), 'value': norm(v[1])}
+    if isinstance(v, list): return [norm(x) for x in v]
+    if isinstance(v, dict): return {k: norm(x) for k, x in v.items()}
+    return v
+def compare(orig, ours):
+    a, b = pq.read_table(orig), pq.read_table(ours)
+    if a.column_names != b.column_names: return 'column names differ'
+    bad = [n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.column(n).to_pylist())]
+    return 'equal' if not bad else 'DIFFER in ' + ', '.join(bad)
+print(';'.join(compare(*pair.split('=')) for pair in ARGS))
+"""
+
+"""Run `HARNESS_COMPARE_VALUES` over `(original, rewrite)` path pairs; one verdict per pair, or `nothing` without pyarrow."""
+function harness_pyarrow_compare(pairs)
+    args = join(("'$(a)=$(b)'" for (a, b) in pairs), ", ")
+    result = _run_pyarrow("ARGS = [$args]\n" * HARNESS_COMPARE_VALUES)
+    result === nothing ? nothing : split(result, ';')
+end
+
+# Shapes the old reader flattens, written by pyarrow: structs holding lists inside lists,
+# structs holding structs inside lists, a struct with a list<struct> member, lists of
+# lists of structs, and maps (plain, nested, and as a struct member).
+const HARNESS_NEW_SHAPES = """
+import pyarrow as pa, pyarrow.parquet as pq
+i32, i64, f32, s = pa.int32(), pa.int64(), pa.float32(), pa.string()
+hit = pa.struct([('x', f32), ('adc', pa.list_(i32))])
+trk = pa.struct([('id', i32), ('vertex', pa.struct([('x', f32), ('tag', s)]))])
+n = 9
+table = pa.table({
+    'lsl': pa.array([None if i % 5 == 4 else [] if i % 5 == 3 else [None if j == 2 else {'x': 0.5 * j, 'adc': None if j == 1 else [None if k == 1 else k for k in range(j + i % 3)]} for j in range(i % 4)] for i in range(n)], type=pa.list_(hit)),
+    'lss': pa.array([[{'id': j, 'vertex': None if j == 1 else {'x': 1.5 * j, 'tag': None if i % 2 else 't%d' % j}} for j in range(i % 3)] for i in range(n)], type=pa.list_(trk)),
+    'sls': pa.array([None if i % 4 == 3 else {'run': i, 'hits': None if i % 3 == 2 else [{'x': 0.25 * j, 'adc': [j]} for j in range(i % 3)]} for i in range(n)], type=pa.struct([('run', i64), ('hits', pa.list_(hit))])),
+    'lls': pa.array([[[{'id': k, 'vertex': {'x': 1.0, 'tag': 'a'}} for k in range(j)] for j in range(i % 3)] if i % 4 != 3 else None for i in range(n)], type=pa.list_(pa.list_(trk))),
+    'm':   pa.array([None if i % 4 == 3 else [('k%d' % j, None if j == 1 else j * i) for j in range(i % 3)] for i in range(n)], type=pa.map_(s, i32)),
+    'mm':  pa.array([[('a', [('x', i), ('y', None)]), ('b', None), ('c', [])] if i % 2 else [] for i in range(n)], type=pa.map_(s, pa.map_(s, i64))),
+    'sm':  pa.array([{'tags': [('t', 1.5)], 'n': i} for i in range(n)], type=pa.struct([('tags', pa.map_(s, pa.float64())), ('n', i32)])),
+    'id':  pa.array(range(n), type=i64),
+})
+"""

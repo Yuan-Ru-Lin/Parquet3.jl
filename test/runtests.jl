@@ -1984,7 +1984,7 @@ end
         @test strings(first(plan_of(ptfile("repeated_no_annotation.parquet")))) == [
             "id: leaf@0", "phoneNumbers: struct@1{phone: list@1/2<struct@2{number: leaf@2, kind: leaf@3}>}"]
         @test strings(first(plan_of(ptfile("map_no_value.parquet")))) == [
-            "my_map: list@0/1<struct@1{key: leaf@1, value: leaf@2}>", "my_map_no_v: list@0/1<struct@1{key: leaf@1}>",
+            "my_map: list@0/1<struct@1{key: leaf@1, value: leaf@2}>", "my_map_no_v: list@0/1<leaf@1>",   # as pyarrow: a list of the keys
             "my_list: list@0/1<leaf@1>"]
         nested_maps, _ = plan_of(ptfile("nested_maps.snappy.parquet"))
         @test strings(nested_maps)[1] == "a: list@1/2<struct@2{key: leaf@2, value: list@3/4<struct@4{key: leaf@4, value: leaf@4}>}>"
@@ -2095,5 +2095,111 @@ end
         @test collect(propertynames(only_b)) == [:s] && propertynames(only_b.s) == (:b,)
         @test isequal(collect(only_b.s), [(b = "x",), missing, (b = "z",)])
         @test_throws ArgumentError Parquet3._read_parquet_recursive(path; columns = ["s.c"])
+    end
+end
+
+@testset "Recursive reader: new shapes and maps (R5)" begin
+    P = Parquet3
+    plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+
+    # pyarrow-written files, one row group and several
+    mktempdir() do dir
+        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=4"))
+            path, out = joinpath(dir, name), joinpath(dir, "rw_" * name)
+            _run_pyarrow(HARNESS_NEW_SHAPES * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
+                (@warn "Skipping new-shape pyarrow fixtures: uv/pyarrow not available"; break)
+            t = P._read_parquet_recursive(path)
+            @test collect(propertynames(t)) == [:lsl, :lss, :sls, :lls, :m, :mm, :sm, :id]
+            @test isempty(loose_nodes(t))
+
+            # What each shape reads as
+            @test t.lsl isa P.ListOfStructsColumn && propertynames(t.lsl) == (:x, :adc)
+            @test t.lss isa P.ListOfStructsColumn && t.lls isa P.ListOfStructsColumn && propertynames(t.lls) == (:id, :vertex)
+            @test t.sls isa P.StructColumn && t.sls.hits isa P.ListOfStructsColumn
+            @test t.m isa P.ListOfStructsColumn && propertynames(t.m) == (:key, :value) && t.sm.tags isa P.ListOfStructsColumn
+
+            # Rows
+            @test isequal(plain(t.lsl[2]), Any[(x = 0.0f0, adc = Any[0])]) && ismissing(t.lsl[5]) && isempty(t.lsl[4])
+            @test isequal(plain(t.lsl[3]), Any[(x = 0.0f0, adc = Any[0, missing]), (x = 0.5f0, adc = missing)])
+            @test isequal(plain(t.sls[2]), (run = 1, hits = Any[(x = 0.0f0, adc = Any[0])])) && ismissing(t.sls[4]) && ismissing(t.sls[3].hits)
+            @test isequal(plain(t.m[3]), Any[(key = "k0", value = 0), (key = "k1", value = missing)]) && ismissing(t.m[4])
+            @test isequal(plain(t.mm[2]), Any[(key = "a", value = Any[(key = "x", value = 1), (key = "y", value = missing)]),
+                                              (key = "b", value = missing), (key = "c", value = Any[])])
+
+            # Named fields, through every list level and composed across structs
+            @test plain(t.lsl.x[3]) == Any[0.0f0, 0.5f0] && isequal(plain(t.lsl.adc[3]), Any[Any[0, missing], missing])
+            @test isequal(plain(t.lss.vertex.x[3]), Any[0.0f0, missing]) && isequal(plain(t.lss.vertex.tag[3]), Any["t0", missing])
+            @test isequal(plain(t.sls.hits.x[1:4]), Any[Any[], Any[0.0f0], missing, missing])
+            @test plain(t.lls.id[3]) == Any[Any[], Any[0]] && plain(t.lls.vertex.tag[3]) == Any[Any[], Any["a"]]
+            @test plain(t.m.key[3]) == Any["k0", "k1"] && isequal(plain(t.m.value[3]), Any[0, missing])
+            @test isequal(plain(t.mm.value.key[2]), Any[Any["x", "y"], missing, Any[]])
+            @test plain(t.sm.tags.key[1]) == Any["t"] && plain(t.sm.tags.value[1]) == Any[1.5]
+
+            # Selecting inside the new shapes
+            sel = P._read_parquet_recursive(path; columns = ["lsl.adc", "m.key", "sls.hits.x"])
+            @test collect(propertynames(sel)) == [:lsl, :sls, :m]
+            @test propertynames(sel.lsl) == (:adc,) && propertynames(sel.m) == (:key,) && propertynames(sel.sls) == (:hits,)
+            @test isequal(plain(sel.lsl.adc), plain(t.lsl.adc)) && isequal(plain(sel.m.key), plain(t.m.key))
+            @test isequal(plain(sel.sls.hits.x), plain(t.sls.hits.x))
+
+            # pyarrow reads our rewrite of what we read, and finds the values it wrote
+            write_parquet(out, t)
+            verdict = harness_pyarrow_compare([(path, out)])
+            verdict === nothing || @test verdict == ["equal"]
+        end
+    end
+
+    # Our own writer: write → read gives back the input, for the shapes the old reader flattens
+    mktempdir() do dir
+        M = Missing
+        path = joinpath(dir, "w.parquet")
+        tbl = (
+            lsl = Union{M, Vector{Union{M, @NamedTuple{v::Union{M, Vector{Union{M, Int}}}}}}}[
+                      [(v = [1, missing],), missing, (v = missing,), (v = [],)], missing, [], [(v = [2],)]],
+            lss = [[(a = 1, p = (x = 1.5, y = "a")), (a = 2, p = (x = 2.5, y = "b"))], @NamedTuple{a::Int, p::@NamedTuple{x::Float64, y::String}}[],
+                   [(a = 3, p = (x = 3.5, y = "c"))], [(a = 4, p = (x = 4.5, y = "d"))]],
+            sls = Union{M, @NamedTuple{hits::Union{M, Vector{Union{M, @NamedTuple{x::Union{M, Int}}}}}}}[
+                      (hits = [(x = 1,), missing, (x = missing,)],), missing, (hits = missing,), (hits = [],)],
+            lls = Union{M, Vector{Union{M, Vector{Union{M, @NamedTuple{x::Union{M, Int}}}}}}}[
+                      [[(x = 1,), missing, (x = missing,)], missing, []], missing, [], [[(x = 2,)]]],
+            deep = [[(tracks = [(hits = [1, 2], q = Int32(1)), (hits = Int[], q = Int32(-1))],)], @NamedTuple{tracks::Vector{@NamedTuple{hits::Vector{Int}, q::Int32}}}[],
+                    [(tracks = @NamedTuple{hits::Vector{Int}, q::Int32}[],)], [(tracks = [(hits = [3], q = Int32(1))],)]],
+        )
+        write_parquet(path, tbl)
+        t = P._read_parquet_recursive(path)
+        @test collect(propertynames(t)) == collect(keys(tbl))
+        for k in keys(tbl)
+            @test isequal(plain(getproperty(t, k)), plain(tbl[k]))
+        end
+        @test isempty(loose_nodes(t))
+        @test !(Missing <: eltype(t.lss)) && !(Missing <: eltype(t.deep))      # no nulls written, none in the types
+        @test plain(t.deep.tracks.hits[1]) == Any[Any[Any[1, 2], Any[]]] && plain(t.deep.tracks.q[4]) == Any[Any[1]]
+    end
+
+    if HAS_PARQUET_TESTING
+        mktempdir() do dir
+            # Nested files from other writers: legacy list layouts, maps, bare repeated fields
+            files = ["nested_maps.snappy", "nullable.impala", "nonnullable.impala", "repeated_no_annotation", "map_no_value",
+                     "nested_lists.snappy", "list_columns", "null_list", "old_list_structure", "repeated_primitive_no_list"]
+            pairs = map(files) do f
+                orig, out = joinpath(PARQUET_TESTING_DIR, f * ".parquet"), joinpath(dir, f * ".parquet")
+                write_parquet(out, P._read_parquet_recursive(orig))
+                (orig, out)
+            end
+            verdicts = harness_pyarrow_compare(pairs)
+            verdicts === nothing || @testset "$f" for (f, v) in zip(files, verdicts)
+                @test v == "equal"
+            end
+            # pyarrow rejects this file's schema; it reads here as a map of strings
+            t = P._read_parquet_recursive(joinpath(PARQUET_TESTING_DIR, "incorrect_map_schema.parquet"))
+            @test plain(t.my_map.key) == Any[Any["parent", "name"]] && plain(t.my_map.value) == Any[Any["another", "report"]]
+        end
+    end
+
+    # Nothing in the corpus is left that the new reader cannot read in full, with exact nullability
+    mktempdir() do dir
+        @testset "$label" for (label, path) in harness_corpus(dir)
+            @test isempty(loose_nodes(P._read_parquet_recursive(path)))
+        end
     end
 end

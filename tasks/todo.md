@@ -369,9 +369,16 @@ entry point.
       projects a field through any number of list levels (src/api.jl). 79 corpus files, 441
       columns, every column the current reader assembles: no new differences, no loose
       nodes, and `col.field` equal to the current reader's for every named field.
-- [ ] R5 — the new shapes and MAP; wrapper generalisation. Tests: write → read equals input
-      across a shape matrix, and pyarrow-written files against pyarrow's values. Tests that
-      pin the flattened fallback are rewritten.
+- [x] R5 (DONE, awaiting review) — the new shapes and MAP. No assembly code was needed beyond
+      R3/R4: the recursion and `_wrap_nested` already cover them. One planner fix: a MAP
+      whose `key_value` has only a key reads as a list of keys, as pyarrow does.
+      Verified: pyarrow fixture with `list<struct{list}>`, `list<struct{struct}>`,
+      `struct{list<struct>}`, `list<list<struct>>`, map, map of maps, map in a struct (one and
+      several row groups): pyarrow finds equal values in our rewrite. Writer round-trip for
+      five shapes. Ten parquet-testing nested files equal to pyarrow's values. All 80 corpus
+      files read in full with no loose nodes.
+      Moved to R7: rewriting the tests that pin the flattened fallback. They test
+      `read_parquet`, which keeps the old paths until the switch.
 - [ ] R6 — member selection end to end: `columns=` with dotted paths against pyarrow's
       `read_table(columns=…)` for the same keys; a check that unselected leaves are not
       decoded; benchmark of `waveform_windowed.t0` alone against the full column.

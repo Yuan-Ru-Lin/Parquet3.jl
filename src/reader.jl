@@ -76,12 +76,13 @@ end
 """
 The element of LIST/MAP group `list` with repeated child `rep` (at `path`), following the
 format's backward-compatibility rules: the repeated node is itself the element when it is
-a primitive, has several fields, or carries a legacy name (`array`, `<list>_tuple`), and
-always for a map; otherwise its single child is the element (the standard 3-level layout).
-Structural groups add nothing to the user key.
+a primitive, has several fields (a map's key and value, or a legacy struct element), or
+carries a legacy name (`array`, `<list>_tuple`); otherwise its single child is the element
+(the standard 3-level layout; also a map without values, which pyarrow reads as a list of
+its keys). Structural groups add nothing to the user key.
 """
 function _plan_element(list::SchemaNode, rep::SchemaNode, name::String, key::String, path::Vector{String})
-    legacy = isempty(rep.children) || length(rep.children) > 1 || _is_map(list) ||
+    legacy = isempty(rep.children) || length(rep.children) > 1 ||
              rep.element.name in ("array", list.element.name * "_tuple")
     legacy && return _plan_value(rep, name, key, path)
     element = only(rep.children)
