@@ -334,7 +334,7 @@ end
 # struct is, which is what `col.member` shows for those rows.
 #
 # A column whose elements are structs, directly or through list levels, is returned in a
-# wrapper with named field access (`_wrap_nested` in api.jl).
+# wrapper with named field access (`_wrap_nested` in arrays.jl).
 
 """Buffers of one plan node for one row group (stage 1)."""
 struct RawNode

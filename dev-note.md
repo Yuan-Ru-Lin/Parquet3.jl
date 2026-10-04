@@ -21,6 +21,25 @@ This package uses two structs to circumvent the issue:
 - Composition with other Arrow types (e.g., `List<FixedSizeList<T>>`) falls back to variable-length lists at all levels.
 - If you write the table to an Arrow IPC file with `Arrow.write` and read it back with `Arrow.read`, FixedSizeList columns will come back as Arrow.jl's native `NTuple`-based `FixedSizeList`, not as `FixedSizeListVector`. The data is preserved, but the zero-copy view behavior is lost.
 
+## Source Layout
+
+Files are included in dependency order (`src/Parquet3.jl`); each uses only what the files
+above it define.
+
+| File | Contents |
+|---|---|
+| `types.jl` | enums, metadata structs, schema nodes |
+| `metadata.jl` | Thrift field tables; reading and writing metadata |
+| `typemap.jl` | Parquet type ↔ Julia type, both directions |
+| `encodings.jl` | value and level encodings; each decoder is followed by its encoder |
+| `compression.jl` | page compression |
+| `filereader.jl` | opening a file, footer, schema tree |
+| `pagereader.jl` | the pages of a column chunk |
+| `arrow_schema.jl` | `ARROW:schema` metadata |
+| `arrays.jl` | the array types returned (`FixedSizeListVector`, `MapVector`, the wrappers) and their builders |
+| `reader.jl` | plan, prune, assemble: `read_parquet` |
+| `filewriter.jl` | plan, shred, encode: `write_parquet` |
+
 ## Reader Design
 
 The repetition/definition-level encoding of nested data, and the invariant used below, come
@@ -73,7 +92,7 @@ page values when there are no nulls (the dense path, which is what makes wavefor
 a scatter by level otherwise. It reports one level entry per row to its parent, so
 nothing above it does per-element work.
 
-**Wrappers.** `_wrap_nested` (src/api.jl) gives named field access to any array whose
+**Wrappers.** `_wrap_nested` (src/arrays.jl) gives named field access to any array whose
 elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`); `_member_list` projects a field through every list level,
 sharing each level's offsets and validity. Both are one type, `NestedColumn`.
@@ -104,8 +123,10 @@ with no `Missing` anywhere since no null was seen.
 ## Writer Design
 
 Writing mirrors the table-driven Thrift reading: `write_thrift` in `src/metadata.jl`
-inverts `read_thrift` using Thrift.jl's exported compact-protocol writers, driven by
-write field tables that emit only the fields we produce. Encoders in `src/encodings.jl`
+inverts `read_thrift` using Thrift.jl's exported compact-protocol writers. Each Thrift
+struct has one hand-written field table, `(id, name, type)`, used in both directions; a
+`ThriftType` carries the wire tag and how to read and write a value. Fields that are
+`nothing` are not written. Encoders in `src/encodings.jl`
 are inverses of the decoders beside them (`encode_plain`, `encode_rle_bitpacked` —
 RLE-runs-only, always a valid form of the hybrid encoding). `src/filewriter.jl`
 assembles pages (length-prefixed RLE def levels + PLAIN values), column chunks, and

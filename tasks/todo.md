@@ -118,6 +118,23 @@ Goal: write every value encoding the reader decodes. One step at a time, each re
 - E4 — Dictionary encoding on write: deferred to v0.3 (decided 2026-10-04); see the v0.3 list.
 Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, multiple pages.
 
+## Structure-review items pulled into v0.2.0 (2026-10-04, via the planning session)
+- [x] A missing path is a clear error ("No such file or directory") and no longer creates an
+      empty file (was: "File too small", and `Mmap.mmap` created the file).
+- [x] A1 — one definition each for: level bit width; bool packing (`packed_bits`); PLAIN
+      fixed-width decode (a table instead of five one-liners behind an if-chain); the varint
+      read in `decode_rle_bitpacked`; byte-stream-split decode (one generic method).
+      Found on the way: an INT64 BYTE_STREAM_SPLIT column was decoded as Float64 and returned
+      with the integers' bits reinterpreted, with no error. INT32 and INT64 are now decoded
+      properly (separate commit), checked against their PLAIN twins and pyarrow.
+- [x] A2 — Thrift: one field table per struct for reading and writing (22 tables → 12).
+      Written files are byte-identical to before.
+- [x] A3 — layout, move-only: `typemap.jl`, `arrays.jl`; `api.jl` dissolved; files included
+      in dependency order with the writer last; `encodings.jl` reordered so each decoder is
+      followed by its encoder (same code lines).
+- [ ] B — `Arrow.write` for every column `read_parquet` returns
+- [ ] C — FixedSizeList inside a list (plan first)
+
 ## Deferred to v0.3 (refreshed 2026-10-04)
 - Multiple row groups and multiple pages on write; min/max statistics
 - E4 — Dictionary encoding on write (RLE_DICTIONARY). `:dictionary` is not an accepted

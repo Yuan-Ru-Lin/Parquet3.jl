@@ -1,8 +1,6 @@
-# Parquet encoding implementations
+# Parquet value and level encodings. Within each section a decoder is followed by its encoder.
 
-#=============================================================================
-# Plain Encoding
-=============================================================================#
+# ── PLAIN ───────────────────────────────────────────────────────────────────
 
 # Fixed-width physical types, whose PLAIN encoding is their little-endian bytes
 const PLAIN_FIXED_TYPES = Dict(INT32 => Int32, INT64 => Int64, INT96 => Int96, FLOAT => Float32, DOUBLE => Float64)
@@ -27,17 +25,6 @@ function decode_plain_boolean(data::AbstractVector{UInt8}, count::Int)
     n = min(cld(count, 8), length(data))
     GC.@preserve bv data unsafe_copyto!(Ptr{UInt8}(pointer(bv.chunks)), pointer(data), n)
     bv
-end
-
-"""
-RLE-encoded boolean values: the RLE/bit-packed hybrid at bit width 1, preceded by its
-4-byte length. Unlike levels and dictionary indices, boolean values carry the length
-prefix in both v1 and v2 data pages.
-"""
-function decode_rle_boolean(data::AbstractVector{UInt8}, count::Int)
-    count == 0 && return falses(0)
-    len = Int(ltoh(reinterpret(UInt32, data[1:4])[1]))
-    BitVector(decode_rle_bitpacked(@view(data[5:4+len]), count, 1) .!= 0)
 end
 
 function decode_plain_byte_array(data::AbstractVector{UInt8}, count::Int)
@@ -67,12 +54,76 @@ end
 decode_plain_fixed_byte_array(data::AbstractVector{UInt8}, count::Int, type_length::Int) =
     nestedview(reshape(@view(data[1:type_length*count]), type_length, count))
 
+"""PLAIN-encode fixed-width values (inverse of decode_plain for these types)."""
+encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
+    collect(reinterpret(UInt8, values))
+
+"""PLAIN-encode integer-like values through their physical type (see `physical_ints`)."""
+encode_plain(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32, UInt64, Date, DateTime, Arrow.Timestamp}}) =
+    encode_plain(physical_ints(values))
+
+"""
+The bytes of a bit vector, LSB-first: bit `i` is bit `(i-1) & 7` of byte `(i-1) >> 3`. This
+is how a `BitVector` stores its chunks, and how Parquet (PLAIN booleans) and Arrow (boolean
+arrays) pack booleans.
+"""
+packed_bits(bits::BitVector) = reinterpret(UInt8, bits.chunks)[1:cld(length(bits), 8)]
+
+"""PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
+encode_plain(values::Vector{Bool}) = packed_bits(BitVector(values))
+
+"""PLAIN-encode strings/byte arrays as 4-byte LE length + payload (inverse of decode_plain_byte_array)."""
+function encode_plain(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})
+    out = IOBuffer()
+    for v in values
+        bytes = v isa AbstractString ? codeunits(v) : v
+        write(out, htol(UInt32(length(bytes))))
+        write(out, bytes)
+    end
+    take!(out)
+end
+
+# ── Varints ─────────────────────────────────────────────────────────────────
+
+"""Read a varint from `data` starting at position `pos`, return (value, new_pos)."""
+function _read_varint(data::AbstractVector{UInt8}, pos::Int)
+    val = UInt64(0)
+    shift = 0
+    len = length(data)
+    @inbounds while pos <= len
+        byte = data[pos]
+        pos += 1
+        val |= UInt64(byte & 0x7f) << shift
+        (byte & 0x80) == 0 && break
+        shift += 7
+    end
+    (val, pos)
+end
+
+"""LEB128 varint (inverse of _read_varint)."""
+function _write_varint(io::IO, v::Unsigned)
+    while true
+        b = UInt8(v & 0x7f)
+        v >>= 7
+        v == 0 && return write(io, b)
+        write(io, b | 0x80)
+    end
+end
+
+"""Read a zigzag-encoded varint from `data` starting at `pos`, return (value, new_pos)."""
+function _read_zigzag(data::AbstractVector{UInt8}, pos::Int)
+    n, pos = _read_varint(data, pos)
+    # Logical shift on the unsigned value, so the full Int64 range decodes
+    (reinterpret(Int64, (n >> 1) ⊻ -(n & 0x01)), pos)
+end
+
+"""ZigZag varint (inverse of _read_zigzag)."""
+_write_zigzag(io::IO, v::Integer) = (x = Int64(v); _write_varint(io, reinterpret(UInt64, (x << 1) ⊻ (x >> 63))))
+
+# ── Bit packing ─────────────────────────────────────────────────────────────
+
 """Bits needed to store a repetition or definition level up to `max_level`."""
 level_bit_width(max_level::Integer) = ndigits(max_level, base = 2)
-
-#=============================================================================
-# Bit Unpacking
-=============================================================================#
 
 """
     unpack_bits(data, count, bit_width) -> Vector{UInt32}
@@ -126,9 +177,28 @@ function _unpack_bits_into!(result::Vector{U}, offset::Int, data::AbstractVector
     end
 end
 
-#=============================================================================
-# RLE / Bit-packed Hybrid Encoding
-=============================================================================#
+"""
+Bit-pack `values` LSB-first at `bit_width` bits each (inverse of unpack_bits!),
+zero-padded to `count` values.
+"""
+function pack_bits(values::AbstractVector{<:Unsigned}, bit_width::Int, count::Int = length(values))
+    out = zeros(UInt8, cld(count * bit_width, 8))
+    accum, bits_in_accum, byte_pos = UInt128(0), 0, 1
+    @inbounds for v in values
+        accum |= UInt128(v) << bits_in_accum
+        bits_in_accum += bit_width
+        while bits_in_accum >= 8
+            out[byte_pos] = accum % UInt8
+            byte_pos += 1
+            accum >>= 8
+            bits_in_accum -= 8
+        end
+    end
+    bits_in_accum > 0 && (out[byte_pos] = accum % UInt8)
+    out
+end
+
+# ── RLE / bit-packed hybrid (levels, dictionary indices, booleans) ──────────
 
 """
     decode_rle_bitpacked(data, count, bit_width) -> Vector{UInt32}
@@ -194,9 +264,42 @@ function decode_rle_bitpacked(data::AbstractVector{UInt8}, count::Int, bit_width
     result
 end
 
-#=============================================================================
-# Dictionary Encoding
-=============================================================================#
+"""
+RLE/bit-packed hybrid encoding of levels (inverse of decode_rle_bitpacked).
+Uses RLE runs only — header `run_length << 1` (even) followed by the run value
+in `cld(bit_width, 8)` bytes — which is always a valid form of the hybrid.
+"""
+function encode_rle_bitpacked(levels::AbstractVector{<:Integer}, bit_width::Int)
+    out = IOBuffer()
+    value_bytes = cld(bit_width, 8)
+    i = 1
+    while i <= length(levels)
+        v = levels[i]
+        j = i
+        while j < length(levels) && levels[j + 1] == v
+            j += 1
+        end
+        _write_varint(out, UInt64(j - i + 1) << 1)
+        for b in 0:value_bytes-1
+            write(out, UInt8((v >> (8b)) & 0xff))
+        end
+        i = j + 1
+    end
+    take!(out)
+end
+
+"""
+RLE-encoded boolean values: the RLE/bit-packed hybrid at bit width 1, preceded by its
+4-byte length. Unlike levels and dictionary indices, boolean values carry the length
+prefix in both v1 and v2 data pages.
+"""
+function decode_rle_boolean(data::AbstractVector{UInt8}, count::Int)
+    count == 0 && return falses(0)
+    len = Int(ltoh(reinterpret(UInt32, data[1:4])[1]))
+    BitVector(decode_rle_bitpacked(@view(data[5:4+len]), count, 1) .!= 0)
+end
+
+# ── Dictionary ──────────────────────────────────────────────────────────────
 
 struct DictionaryDecoder{T}
     dictionary::Vector{T}
@@ -223,31 +326,7 @@ function decode_dictionary(decoder::DictionaryDecoder{T}, data::AbstractVector{U
     result
 end
 
-#=============================================================================
-# Delta Binary Packed Encoding
-=============================================================================#
-
-"""Read a varint from `data` starting at position `pos`, return (value, new_pos)."""
-function _read_varint(data::AbstractVector{UInt8}, pos::Int)
-    val = UInt64(0)
-    shift = 0
-    len = length(data)
-    @inbounds while pos <= len
-        byte = data[pos]
-        pos += 1
-        val |= UInt64(byte & 0x7f) << shift
-        (byte & 0x80) == 0 && break
-        shift += 7
-    end
-    (val, pos)
-end
-
-"""Read a zigzag-encoded varint from `data` starting at `pos`, return (value, new_pos)."""
-function _read_zigzag(data::AbstractVector{UInt8}, pos::Int)
-    n, pos = _read_varint(data, pos)
-    # Logical shift on the unsigned value, so the full Int64 range decodes
-    (reinterpret(Int64, (n >> 1) ⊻ -(n & 0x01)), pos)
-end
+# ── DELTA_BINARY_PACKED ─────────────────────────────────────────────────────
 
 """
     decode_delta_binary_packed(data, count) -> (Vector{Int64}, final_pos)
@@ -319,30 +398,6 @@ function decode_delta_binary_packed(data::AbstractVector{UInt8}, count::Int)
     (result, pos)
 end
 
-"""ZigZag varint (inverse of _read_zigzag)."""
-_write_zigzag(io::IO, v::Integer) = (x = Int64(v); _write_varint(io, reinterpret(UInt64, (x << 1) ⊻ (x >> 63))))
-
-"""
-Bit-pack `values` LSB-first at `bit_width` bits each (inverse of unpack_bits!),
-zero-padded to `count` values.
-"""
-function pack_bits(values::AbstractVector{<:Unsigned}, bit_width::Int, count::Int = length(values))
-    out = zeros(UInt8, cld(count * bit_width, 8))
-    accum, bits_in_accum, byte_pos = UInt128(0), 0, 1
-    @inbounds for v in values
-        accum |= UInt128(v) << bits_in_accum
-        bits_in_accum += bit_width
-        while bits_in_accum >= 8
-            out[byte_pos] = accum % UInt8
-            byte_pos += 1
-            accum >>= 8
-            bits_in_accum -= 8
-        end
-    end
-    bits_in_accum > 0 && (out[byte_pos] = accum % UInt8)
-    out
-end
-
 """
     encode_delta_binary_packed(values::Vector{<:Union{Int32, Int64}}) -> Vector{UInt8}
 
@@ -374,9 +429,7 @@ function encode_delta_binary_packed(values::Vector{T}) where {T <: Union{Int32, 
     take!(out)
 end
 
-#=============================================================================
-# Delta Length Byte Array Encoding
-=============================================================================#
+# ── DELTA_LENGTH_BYTE_ARRAY ─────────────────────────────────────────────────
 
 """
     decode_delta_length_byte_array(data, count) -> VectorOfVectors
@@ -412,9 +465,7 @@ function encode_delta_length_byte_array(values::AbstractVector{<:Union{AbstractS
     take!(out)
 end
 
-#=============================================================================
-# Byte Stream Split Encoding
-=============================================================================#
+# ── BYTE_STREAM_SPLIT ───────────────────────────────────────────────────────
 
 """
     decode_byte_stream_split(T, data, count) -> AbstractVector{T}
@@ -426,18 +477,6 @@ its rows. Inverse of `encode_byte_stream_split`.
 decode_byte_stream_split(::Type{T}, data::AbstractVector{UInt8}, count::Int) where {T <: Union{Float32, Float64, Int32, Int64}} =
     reinterpret(T, vec(permutedims(reshape(@view(data[1:sizeof(T) * count]), count, sizeof(T)))))
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Encoders (write side) — mirrors of the decoders above
-# ═══════════════════════════════════════════════════════════════════════════
-
-"""PLAIN-encode fixed-width values (inverse of decode_plain for these types)."""
-encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
-    collect(reinterpret(UInt8, values))
-
-"""PLAIN-encode integer-like values through their physical type (see `physical_ints`)."""
-encode_plain(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32, UInt64, Date, DateTime, Arrow.Timestamp}}) =
-    encode_plain(physical_ints(values))
-
 """
 BYTE_STREAM_SPLIT-encode floats (inverse of decode_byte_stream_split):
 byte 1 of every value, then byte 2 of every value, and so on. With the values' bytes as
@@ -445,58 +484,3 @@ the columns of a K×n matrix, that is its rows laid end to end.
 """
 encode_byte_stream_split(values::Vector{T}) where {T <: Union{Float32, Float64}} =
     vec(permutedims(reshape(reinterpret(UInt8, values), sizeof(T), :)))
-
-"""
-The bytes of a bit vector, LSB-first: bit `i` is bit `(i-1) & 7` of byte `(i-1) >> 3`. This
-is how a `BitVector` stores its chunks, and how Parquet (PLAIN booleans) and Arrow (boolean
-arrays) pack booleans.
-"""
-packed_bits(bits::BitVector) = reinterpret(UInt8, bits.chunks)[1:cld(length(bits), 8)]
-
-"""PLAIN-encode booleans, LSB-first bit-packed (inverse of decode_plain_boolean)."""
-encode_plain(values::Vector{Bool}) = packed_bits(BitVector(values))
-
-"""PLAIN-encode strings/byte arrays as 4-byte LE length + payload (inverse of decode_plain_byte_array)."""
-function encode_plain(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})
-    out = IOBuffer()
-    for v in values
-        bytes = v isa AbstractString ? codeunits(v) : v
-        write(out, htol(UInt32(length(bytes))))
-        write(out, bytes)
-    end
-    take!(out)
-end
-
-"""LEB128 varint (inverse of _read_varint)."""
-function _write_varint(io::IO, v::Unsigned)
-    while true
-        b = UInt8(v & 0x7f)
-        v >>= 7
-        v == 0 && return write(io, b)
-        write(io, b | 0x80)
-    end
-end
-
-"""
-RLE/bit-packed hybrid encoding of levels (inverse of decode_rle_bitpacked).
-Uses RLE runs only — header `run_length << 1` (even) followed by the run value
-in `cld(bit_width, 8)` bytes — which is always a valid form of the hybrid.
-"""
-function encode_rle_bitpacked(levels::AbstractVector{<:Integer}, bit_width::Int)
-    out = IOBuffer()
-    value_bytes = cld(bit_width, 8)
-    i = 1
-    while i <= length(levels)
-        v = levels[i]
-        j = i
-        while j < length(levels) && levels[j + 1] == v
-            j += 1
-        end
-        _write_varint(out, UInt64(j - i + 1) << 1)
-        for b in 0:value_bytes-1
-            write(out, UInt8((v >> (8b)) & 0xff))
-        end
-        i = j + 1
-    end
-    take!(out)
-end
