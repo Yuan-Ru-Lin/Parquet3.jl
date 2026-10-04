@@ -86,7 +86,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression and multiple row groups are not yet written. `FixedSizeListVector` columns keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String and `Vector{UInt8}`, lists (vector elements, written as `List<T>`) and structs (`NamedTuple` elements, written as a group) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression and multiple row groups are not yet written. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. Shapes the reader does not assemble yet (e.g. `list<struct{list}>`) are written correctly but read back as flattened columns.
 
 ### Encodings
 
@@ -108,7 +108,7 @@ Plain, RLE/Bit-Packed, Dictionary (Plain Dictionary + RLE Dictionary), Delta Bin
 - `List<List<T>>` and deeper — arbitrary nesting depth supported via nested `Arrow.List`
 - `Struct` — returned as `StructColumn` (columnar wrapper over `Arrow.Struct`): `col[i]` gives a lazily-built `NamedTuple` row, `col.fieldname` gives the full child column zero-copy (chained across row groups). Members may be primitives, strings, lists (e.g. `waveform: {t0: float, dt: float, values: list<int32>}`), or nested structs — named access composes (`tbl.event.vertex.x`).
 - `List<Struct>` — returned as `ListOfStructsColumn`: `col[i]` gives a lazy vector of `NamedTuple`s, `col.fieldname` gives that field as a ragged list column sharing the parent's offsets (e.g. `particles.pt`). Deeper combinations (`List<Struct{List}>`, maps) are not yet assembled and fall back to distinct flattened columns.
-- `FixedSizeList<T>` — returned as `FixedSizeListVector{N,T}` (flat `Vector{T}` with fixed stride, zero-copy `FixedSizeView{N,T}` element access); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.)
+- `FixedSizeList<T>` — returned as `FixedSizeListVector{N,T}` (flat `Vector{T}` with fixed stride, zero-copy `FixedSizeView{N,T}` element access); requires `ARROW:schema` metadata written by Arrow-based tools (pyarrow, Arrow C++, etc.) Also restored as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`).
 
 ### Logical Types
 

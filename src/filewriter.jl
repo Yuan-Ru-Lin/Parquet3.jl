@@ -97,17 +97,26 @@ end
 _shred_stop!(node, rep::Int, def::Int) =
     foreach(leaf -> (push!(leaf.rep, rep); push!(leaf.def, def)), node.leaves)
 
+"""Whether a FixedSizeList appears in element type `FT`, at any depth of structs and lists."""
+function _has_fsl(::Type{FT}) where FT
+    T = Base.nonmissingtype(FT)
+    T === Union{} && return false
+    T <: FixedSizeView && return true
+    T <: NamedTuple && return isconcretetype(T) && any(_has_fsl, fieldtypes(T))
+    _is_list_type(T) && _has_fsl(eltype(T))
+end
+
 """
 The table's Arrow schema as an `ARROW:schema` key-value entry (base64 of an IPC schema
 message), which lets Arrow-based readers restore types Parquet's own schema cannot
 express, such as FixedSizeList. Arrow.jl derives the schema from the column element
 types, so a zero-row copy of the table is enough; its first stream message is the schema.
 
-Returns `nothing` unless a column is a FixedSizeList: Arrow.jl compiles its schema code
+Returns `nothing` unless a column is or contains a FixedSizeList: Arrow.jl compiles its schema code
 per table type (seconds on a first call), and no other type we write needs the entry.
 """
 function _arrow_schema_kv(names::Vector{Symbol}, vectors::Vector)
-    any(v -> Base.nonmissingtype(eltype(v)) <: FixedSizeView, vectors) || return nothing
+    any(v -> _has_fsl(eltype(v)), vectors) || return nothing
     empties = NamedTuple{Tuple(names)}(Tuple(eltype(v)[] for v in vectors))
     buf = take!(Arrow.tobuffer(empties))
     # Encapsulated message: 0xFFFFFFFF continuation, Int32 metadata length, metadata

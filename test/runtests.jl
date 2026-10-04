@@ -1077,6 +1077,56 @@ print(t.schema.field('l').type, t.schema.field('s').type)""")
         end
     end
 
+    @testset "FixedSizeList inside a struct (N1.6)" begin
+        plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+        src, out = wfile("test_n16_src.parquet"), wfile("test_n16_out.parquet")
+        pytable = """
+import pyarrow as pa, pyarrow.parquet as pq
+wf = pa.struct([('t0', pa.float32()), ('values', pa.list_(pa.int32(), 3))])
+table = pa.table({'wf': pa.array([{'t0': 0.5 * i, 'values': [i, i + 1, i + 2]} for i in range(6)], type=wf),
+                  'id': list(range(6))})
+"""
+        for kwargs in ("{}", "{'row_group_size': 4}")
+            _with_pyarrow_file("struct{fsl} ($kwargs)", "test_n16_src.parquet", pytable * "write_kwargs = $kwargs") do t
+                try
+                    @test eltype(t.wf.values) == Parquet3.FixedSizeView{3, Int32}
+                    @test t.wf[2].values == [1, 2, 3] && collect.(t.wf.values)[6] == [5, 6, 7]
+
+                    write_parquet(out, t)
+                    back = read_parquet(out)
+                    @test back.wf.values isa Parquet3.FixedSizeListVector{3, Int32}
+                    @test isequal(plain(back.wf), plain(t.wf))
+
+                    result = _run_pyarrow("""
+import pyarrow.parquet as pq
+a, b = pq.read_table('$(src)'), pq.read_table('$(out)')
+print(a.schema.field('wf').type == b.schema.field('wf').type, a.column('wf').to_pylist() == b.column('wf').to_pylist())
+print(b.schema.field('wf').type)""")
+                    lines = split(result, '\n')
+                    @test lines[1] == "True True"
+                    @test lines[2] == "struct<t0: float, values: fixed_size_list<element: int32>[3]>"
+                finally
+                    rm(out, force=true)
+                end
+            end
+        end
+
+        # Null struct rows: pyarrow cannot write these, so the fixture comes from our writer
+        V = Parquet3.FixedSizeView{2, Float64}
+        fsv(a, b) = V([a, b], 0)
+        wf = Union{Missing, @NamedTuple{t0::Union{Missing, Float64}, values::V}}[
+            (t0 = 0.5, values = fsv(1.0, 2.0)), missing, (t0 = missing, values = fsv(3.0, 4.0))]
+        try
+            write_parquet(out, (wf = wf,))
+            back = read_parquet(out)
+            @test back.wf.values isa Parquet3.FixedSizeListVector{2, Float64}
+            @test isequal(plain(back.wf), plain(wf))
+            @test ismissing(back.wf[2]) && ismissing(back.wf.values[2]) && ismissing(back.wf[3].t0)
+        finally
+            rm(out, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

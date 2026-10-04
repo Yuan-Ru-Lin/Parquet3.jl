@@ -11,7 +11,8 @@ const _EMPTY_ARROW_SCHEMA = (schema=nothing, fsl=Dict{String,Int}(), field_meta=
 Extract the Arrow schema, FixedSizeList field sizes, and per-field custom_metadata from
 the ARROW:schema Parquet metadata. Returns a named tuple with:
 - `schema::Union{Arrow.Meta.Schema,Nothing}` — the parsed Arrow schema, or nothing
-- `fsl::Dict{String,Int}` — field_name → list_size for FixedSizeList fields
+- `fsl::Dict{String,Int}` — field path → list_size for FixedSizeList fields; a top-level
+  field is keyed by its name, a struct member by its dotted path (`"wf.values"`)
 - `field_meta::Dict{String,ImmutableDict{String,String}}` — field_name → custom metadata
 """
 function parse_arrow_schema(metadata::Union{Vector{KeyValue}, Nothing})
@@ -64,9 +65,18 @@ function _parse_arrow_schema_bytes!(schema_ref, fsl, field_meta, buf)
             end
         end
 
-        # FixedSizeList detection via union type dispatch
-        t = field.type
-        t isa Arrow.Meta.FixedSizeList || continue
-        fsl[name] = Int(t.listSize)
+        _collect_fsl!(fsl, field, name)
+    end
+end
+
+"""Record FixedSizeList fields under `path`, descending through struct members."""
+function _collect_fsl!(fsl::Dict{String,Int}, field, path::String)
+    t = field.type
+    if t isa Arrow.Meta.FixedSizeList
+        fsl[path] = Int(t.listSize)
+    elseif t isa Arrow.Meta.Struct && field.children !== nothing
+        for child in field.children
+            child.name === nothing || _collect_fsl!(fsl, child, string(path, ".", child.name))
+        end
     end
 end

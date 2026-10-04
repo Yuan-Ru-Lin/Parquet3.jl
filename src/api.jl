@@ -154,7 +154,7 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         Threads.@spawn begin
             if spec isa SchemaNode
                 return is_struct_group(spec) ?
-                    _read_struct_column(pf.data, row_groups, spec, field_meta, schema_tree) :
+                    _read_struct_column(pf.data, row_groups, spec, field_meta, schema_tree, fsl) :
                     _read_los_column(pf.data, row_groups, spec, field_meta)
             end
             path, node = spec
@@ -259,13 +259,13 @@ kind (:flat, :list, or :struct), leaf node and full schema path, per-column null
 flag, list thresholds, and — for :struct — a nested plan.
 """
 function _plan_struct(gnode::SchemaNode, base_path::Vector{String},
-                      row_groups::Vector{RowGroup}, schema_tree::SchemaNode)
+                      row_groups::Vector{RowGroup}, schema_tree::SchemaNode, fsl)
     members = map(gnode.children) do c
         kind = struct_member_kind(c)
         if kind == :struct
             (name = Symbol(c.element.name), kind = kind, leaf = c, path = String[],
-             nullable = false, thresholds = Int[], null_def = 0,
-             plan = _plan_struct(c, [base_path; c.element.name], row_groups, schema_tree))
+             nullable = false, thresholds = Int[], null_def = 0, fsl_size = 0,
+             plan = _plan_struct(c, [base_path; c.element.name], row_groups, schema_tree, fsl))
         else
             leaf, names = _single_leaf_chain(c)
             path = [base_path; names]
@@ -275,6 +275,8 @@ function _plan_struct(gnode::SchemaNode, base_path::Vector{String},
              # Min def level for a list member to be present (below it: null).
              # A REQUIRED or REPEATED member field can never itself be null.
              null_def = c.element.repetition_type == OPTIONAL ? c.own_def_level : 0,
+             # List size if ARROW:schema declares this member a FixedSizeList, else 0
+             fsl_size = get(fsl, join([base_path; c.element.name], "."), 0),
              plan = nothing)
         end
     end
@@ -295,9 +297,9 @@ end
 
 """Read a struct group column: one Arrow.Struct chunk per row group."""
 function _read_struct_column(data::Vector{UInt8}, row_groups::Vector{RowGroup},
-                             gnode::SchemaNode, field_meta, schema_tree::SchemaNode)
+                             gnode::SchemaNode, field_meta, schema_tree::SchemaNode, fsl)
     gname = gnode.element.name
-    plan = _plan_struct(gnode, [gname], row_groups, schema_tree)
+    plan = _plan_struct(gnode, [gname], row_groups, schema_tree, fsl)
     meta = get(field_meta, gname, nothing)
     column = _read_column_chunks(rg -> first(_assemble_struct_chunk(data, rg, plan, meta)), row_groups)
     column === nothing && return nothing
@@ -335,6 +337,18 @@ function _assemble_member(data::Vector{UInt8}, rg::Union{RowGroup, Nothing}, m, 
         converted = convert_primitive_values(values, elem.type, elem.converted_type)
         child = _build_leaf_array(converted, nulls, elem.type, elem.converted_type; nullable=m.nullable)
         (child, want_defs ? _page_defs(pages, m.leaf.max_def_level) : nothing)
+    elseif m.fsl_size > 0  # :list declared FixedSizeList — child is a FixedSizeListVector
+        max_def = m.leaf.max_def_level
+        if _fsl_no_nulls(pages, max_def)
+            # Dense fast path; every record is fully defined, so its def level is max_def
+            child = _assemble_fsl_dense(pages, elem.type, elem, m.fsl_size; nullable=m.nullable)
+            return (child, want_defs ? fill(max_def, length(child)) : nothing)
+        end
+        all_rep, all_def, raw = collect_page_data(pages, max_def)
+        converted = convert_primitive_values(raw, elem.type, elem.converted_type)
+        child = assemble_fsl_direct(all_rep, all_def, converted, max_def, m.fsl_size, elem, m.thresholds;
+                                    nullable=m.nullable, record_null_def=m.null_def)
+        (child, want_defs ? _record_defs(all_rep, all_def) : nothing)
     else  # :list — child column is a regular Arrow.List
         all_rep, all_def, raw = collect_page_data(pages, m.leaf.max_def_level)
         converted = convert_primitive_values(raw, elem.type, elem.converted_type)
@@ -726,7 +740,8 @@ in a single pass, bypassing intermediate Vector{Vector{T}} creation.
 """
 function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
                              max_def::Int, list_size::Int, elem::SchemaElement,
-                             def_thresholds::Vector{Int}; nullable::Bool=false) where V
+                             def_thresholds::Vector{Int}; nullable::Bool=false,
+                             record_null_def::Int = max_def > 0 ? 1 : 0) where V
     T = element_julia_type(elem.type, elem.converted_type)
     num_records = count(==(0), all_rep)
     data = Vector{T}(undef, list_size * num_records)
@@ -748,7 +763,9 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
             slot_idx = 0
             base = (record_idx - 1) * list_size
 
-            if def == 0 && max_def > 0
+            # Null record: def == 0 for a top-level column; inside a struct, any def
+            # below the list member's own def level (struct null or list null)
+            if def < record_null_def
                 nulls[record_idx] = true
                 # Zero-fill the null record's slots
                 for j in 1:list_size

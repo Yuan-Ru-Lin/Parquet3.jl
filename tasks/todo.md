@@ -39,16 +39,13 @@ Nested writing is driven by element type, so reader outputs round-trip:
       the table schema, take the first IPC message) rather than hand-building FlatBuffers;
       confirm our reader and pyarrow both restore fixed_size_list.
 
-- [ ] N1.6 — FixedSizeList inside structs (found 2026-10-03; N1.5 covers top-level only).
-      The real data needs it: in `testdata/part-0.parquet`, `waveform_windowed.values` is
-      `fixed_size_list<int32>[1400]` and `waveform_presummed.values` is `[1024]`, both struct
-      members. Today the reader returns them as variable-length `Arrow.List` (values correct,
-      zero-copy views), and `write_parquet` writes them back as plain lists with no
-      `ARROW:schema`, so pyarrow sees `list<int32>`.
-      - reader: walk struct children in `parse_arrow_schema`, build the member as
-        `FixedSizeListVector`
-      - writer: trigger `_arrow_schema_kv` when a `FixedSizeView` appears at any depth
-      - test: pyarrow struct{fsl} fixture, read → write → pyarrow reports fixed_size_list
+- [x] N1.6 — FixedSizeList inside structs (DONE, awaiting review). Found 2026-10-03: in
+      `testdata/part-0.parquet`, `waveform_windowed.values` is `fixed_size_list<int32>[1400]`
+      and `waveform_presummed.values` is `[1024]`, both struct members.
+      - reader: `_collect_fsl!` walks struct children; member assembled as `FixedSizeListVector`
+      - writer: `_has_fsl` triggers `ARROW:schema` at any depth
+      - verified on part-0: read → write → pyarrow reports equal types and values (12355 rows)
+      - not covered: FSL inside a list or list<struct> (still read as variable-length)
 - [ ] Follow-up (if it bothers users): first-write latency for tables with a FixedSizeList
       column (5–20 s, Arrow.jl compilation in `_arrow_schema_kv`). Needs a schema path that
       avoids Arrow.jl's generic writer.

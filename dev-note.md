@@ -17,7 +17,7 @@ This package uses two structs to circumvent the issue:
 
 `FixedSizeListVector` is not an `Arrow.ArrowVector` subtype. It registers `ArrowKind = FixedSizeListKind{N,T}` so `Arrow.write` can serialize it correctly, but:
 
-- Nested FixedSizeList (e.g., `FixedSizeList<FixedSizeList<T>>`) is not supported — only top-level FSL fields are detected from ARROW:schema.
+- FSL fields are detected from ARROW:schema at top level and inside structs (`parse_arrow_schema` keys a struct member by its dotted path, e.g. `"wf.values"`); a struct member is assembled by the same dense/direct FSL paths as a top-level column, with the struct's null threshold. Nested FixedSizeList (e.g., `FixedSizeList<FixedSizeList<T>>`) is not supported.
 - Composition with other Arrow types (e.g., `List<FixedSizeList<T>>`) falls back to variable-length lists at all levels.
 - If you write the table to an Arrow IPC file with `Arrow.write` and read it back with `Arrow.read`, FixedSizeList columns will come back as Arrow.jl's native `NTuple`-based `FixedSizeList`, not as `FixedSizeListVector`. The data is preserved, but the zero-copy view behavior is lost.
 
@@ -108,7 +108,7 @@ A `FixedSizeListVector` is written as a plain LIST, as pyarrow does; the fixed s
 in the `ARROW:schema` key-value entry. `_arrow_schema_kv` gets that entry from Arrow.jl
 instead of building FlatBuffers by hand: it serializes a zero-row copy of the table and
 keeps the first IPC message, which is the schema. The entry is written only when the table
-has a FixedSizeList column: Arrow.jl compiles its schema code for each new set of column
+has a FixedSizeList column, at top level or nested in structs/lists (`_has_fsl`): Arrow.jl compiles its schema code for each new set of column
 types, which adds 5–20 s to a first `write_parquet` call (measured 2026-10-03), and no
 other type we write needs it. Tables with a FixedSizeList column still pay that once per
 session and table shape.
@@ -125,7 +125,7 @@ in `tasks/todo.md`.
 - `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
 - Struct members cannot be selected individually: `columns=["s.a"]` warns and is ignored; select `"s"` and use `tbl.s.a`.
 - `logicalType` annotations are not parsed, only `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both).
-- A `FixedSizeList` inside a struct (e.g. `waveform: struct<t0, dt, values: fixed_size_list<int32>[1400]>`) is read as a variable-length list, and written back as one: values are correct, but the fixed size is lost. Only top-level `FixedSizeList` columns are restored and preserved.
+- A `FixedSizeList` is restored at top level and as a struct member (at any struct depth). Inside a list or a `List<Struct>` (e.g. `list<fixed_size_list>`, `list<struct<…fsl…>>`) it is read as a variable-length list and written back as one: values are correct, but the fixed size is lost.
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
 - LZ4 Hadoop framing (used by older Spark/Hadoop writers) is implemented but not tested end-to-end — only the standard LZ4 raw/frame format is covered by the test suite.
 - `open_parquet` / `read_parquet` on a non-existent path gives "File too small" instead of "File not found" (Mmap.mmap silently creates an empty file). Needs a guard in the public API.
