@@ -1617,7 +1617,6 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
     "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split",
                                                   "flba5_byte_stream_split", "decimal_byte_stream_split"],
     "datapage_v2.snappy.parquet" => ["d"],
-    "datapage_v2_empty_datapage.snappy.parquet" => ["value"],
     "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
                                    "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],
     "delta_encoding_optional_column.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name",
@@ -1840,6 +1839,12 @@ if HAS_PARQUET_TESTING
             # The mirror case: a zero-row chunk with only a dictionary page stores data_page_offset = 0
             t = read_parquet(joinpath(PARQUET_TESTING_DIR, "column_chunk_key_value_metadata.parquet"))
             @test collect(propertynames(t)) == [:column1, :column2] && length(t.column1) == 0
+        end
+
+        @testset "datapage_v2_empty_datapage.snappy" begin
+            # One null value: the v2 page's data section is zero bytes, though flagged as compressed
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "datapage_v2_empty_datapage.snappy.parquet"))
+            @test length(t.value) == 1 && ismissing(t.value[1]) && nonmissingtype(eltype(t.value)) == Float32   # pyarrow: [None], float
         end
 
         @testset "overflow_i16_page_cnt" begin

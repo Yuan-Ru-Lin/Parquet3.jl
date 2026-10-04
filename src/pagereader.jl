@@ -160,7 +160,9 @@ function read_page(reader::ColumnReader)
         end
 
         data_part = @view page_data[pos:end]
-        if dh.is_compressed && meta.codec != UNCOMPRESSED
+        # An empty data section (every value null) is stored as zero bytes, which is not a
+        # compressed stream and must not be passed to the codec
+        if dh.is_compressed && meta.codec != UNCOMPRESSED && !isempty(data_part)
             expected = header.uncompressed_page_size - dh.repetition_levels_byte_length - dh.definition_levels_byte_length
             data_part = decompress(collect(data_part), meta.codec, Int(expected))
         end
