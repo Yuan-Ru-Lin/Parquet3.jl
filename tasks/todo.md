@@ -75,6 +75,16 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
       the output; leak check from 6ab762e still flat for every codec.
 - [x] Brotli read and write (`compression = :brotli`), checked both ways against pyarrow.
 
+## Release blockers from the structure review (2026-10-04, via the planning session)
+- [x] A — page headers over 1024 bytes dropped the column; headers of any size now parse
+- [x] B — Project.toml: julia 1.10 (suite run on 1.10.11, 1.11.9, 1.12.5), ArrowTypes dep, Tables extra removed
+- [x] C — `read_parquet` throws `ColumnReadError` instead of warn-and-skip; the parquet-testing
+      columns that throw are listed in dev-note Known Limitations and pinned by a test
+- [ ] Found by C, not fixed (were silently dropped before): empty v2 data page,
+      `dictionary_page_offset = 0`, PLAIN fixed-length byte arrays, deprecated LZ4 codec (both
+      framings), `rle_boolean_encoding`, >2 GB string column. Not implemented: DELTA_BYTE_ARRAY,
+      BYTE_STREAM_SPLIT beyond float/double, RLE booleans.
+
 ## Writer encodings (v0.2.0, decided 2026-10-04 via the planning session)
 Goal: write every value encoding the reader decodes. One step at a time, each reported for approval.
 - [x] E1 — BYTE_STREAM_SPLIT for Float32/Float64, the `encoding` keyword (one name for the
@@ -204,4 +214,4 @@ handling, and logical types on members. Bugs below are in priority order; one at
   (t0, dt, values); values is `Arrow.List` (zero-copy SubArray views on access).
 - Fallback unchanged for unsupported shapes (nested struct, list<struct>, maps).
 - Pre-existing, unrelated: byte_stream_split_extended int32/float16/flba5/decimal columns
-  warn-and-skip (BSS decode only supports FLOAT/DOUBLE).
+  cannot be read (BSS decode only supports FLOAT/DOUBLE); since 2026-10-04 that is an error, not a skip.

@@ -1900,13 +1900,47 @@ if HAS_PARQUET_TESTING
     end
 
     @testset "parquet-testing: Byte Stream Split cross-check" begin
-        t = read_parquet(joinpath(PARQUET_TESTING_DIR, "byte_stream_split_extended.gzip.parquet"))
-        cn = Tables.columnnames(t)
-        for base in [:float, :double]
-            plain_name = Symbol("$(base)_plain")
-            bss_name = Symbol("$(base)_byte_stream_split")
-            if plain_name in cn && bss_name in cn
-                @test Tables.getcolumn(t, plain_name) ≈ Tables.getcolumn(t, bss_name)
+        path = joinpath(PARQUET_TESTING_DIR, "byte_stream_split_extended.gzip.parquet")
+        # BYTE_STREAM_SPLIT is decoded for FLOAT and DOUBLE only; the other four columns are an error
+        err = try read_parquet(path); nothing catch e; e end
+        @test err isa Parquet3.ColumnReadError && err.column == "float16_byte_stream_split"
+        @test occursin("pass `columns=` without it", sprint(showerror, err))
+        t = read_parquet(path; columns = ["float_plain", "float_byte_stream_split", "double_plain", "double_byte_stream_split"])
+        @test Tables.getcolumn(t, :float_plain) ≈ Tables.getcolumn(t, :float_byte_stream_split)
+        @test Tables.getcolumn(t, :double_plain) ≈ Tables.getcolumn(t, :double_byte_stream_split)
+    end
+
+    @testset "parquet-testing: every file reads fully or is a known gap" begin
+        # file => columns that cannot be read yet (see Known Limitations in dev-note.md).
+        # read_parquet throws for these; every other column, and every other file, must read.
+        known_gaps = Dict(
+            "byte_stream_split_extended.gzip.parquet" => ["float16_byte_stream_split", "int32_byte_stream_split",
+                                                          "flba5_byte_stream_split", "decimal_byte_stream_split"],
+            "datapage_v2.snappy.parquet" => ["d"],
+            "datapage_v2_empty_datapage.snappy.parquet" => ["value"],
+            "delta_byte_array.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name", "c_preferred_cust_flag",
+                                           "c_birth_country", "c_login", "c_email_address", "c_last_review_date"],
+            "delta_encoding_optional_column.parquet" => ["c_customer_id", "c_salutation", "c_first_name", "c_last_name",
+                                                         "c_preferred_cust_flag", "c_birth_country", "c_email_address", "c_last_review_date"],
+            "delta_encoding_required_column.parquet" => ["c_customer_id:", "c_salutation:", "c_first_name:", "c_last_name:",
+                                                         "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
+            "dict-page-offset-zero.parquet" => ["l_partkey"],
+            "fixed_length_byte_array.parquet" => ["flba_field"],
+            "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
+            "hadoop_lz4_compressed_larger.parquet" => ["a"],
+            "large_string_map.brotli.parquet" => ["arr.key_value.key"],
+            "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
+            "rle_boolean_encoding.parquet" => ["datatype_boolean"],
+        )
+        for f in filter(endswith(".parquet"), readdir(PARQUET_TESTING_DIR))
+            path = joinpath(PARQUET_TESTING_DIR, f)
+            failing = filter(column_names(open_parquet(path))) do name
+                try read_parquet(path; columns = [name]); false catch e; e isa Parquet3.ColumnReadError || rethrow(); true end
+            end
+            @testset "$f" begin
+                @test failing == get(known_gaps, f, String[])
+                isempty(failing) ? @test(read_parquet(path) isa Arrow.Table) :
+                                   @test_throws(Parquet3.ColumnReadError, read_parquet(path))
             end
         end
     end

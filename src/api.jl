@@ -97,9 +97,32 @@ _first_chunk(v::AbstractVector) = v
 _first_chunk(cv::ChainedVector) = first(cv.arrays)
 
 """
+    ColumnReadError(column, cause)
+
+Thrown by `read_parquet` when a column cannot be read, for example because it uses an
+encoding or type that is not supported yet. `cause` is the original exception. The other
+columns can still be read by passing `columns=` without the failing one.
+"""
+struct ColumnReadError <: Exception
+    column::String
+    cause::Exception
+end
+
+function Base.showerror(io::IO, e::ColumnReadError)
+    print(io, "ColumnReadError: failed to read column \"", e.column, "\". To read the other columns, ",
+          "pass `columns=` without it. Caused by: ")
+    showerror(io, e.cause)
+end
+
+# Column tasks nest: unwrap to the exception that actually failed
+_root_cause(e) = e isa TaskFailedException ? _root_cause(e.task.exception) : e
+
+"""
     read_parquet(path::String; columns=nothing) -> Arrow.Table
 
-Read a Parquet file and return an Arrow.Table (Tables.jl-compatible).
+Read a Parquet file and return an Arrow.Table (Tables.jl-compatible). `columns` selects
+columns by name. A column that cannot be read throws a [`ColumnReadError`](@ref) naming
+it; nothing is skipped silently.
 """
 function read_parquet(path::String; columns::Union{Vector{String}, Nothing}=nothing)
     pf = open_parquet(path)
@@ -180,8 +203,7 @@ function read_parquet(pf::ParquetFile; columns::Union{Vector{String}, Nothing}=n
         catch e
             spec = specs[i]
             col_name = spec isa SchemaNode ? spec.element.name : join(spec[1], ".")
-            @warn "Failed to read column $col_name" exception=(e, catch_backtrace())
-            nothing
+            throw(ColumnReadError(col_name, _root_cause(e)))
         end
         result === nothing && continue
         push!(col_names, result[1])

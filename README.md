@@ -62,6 +62,8 @@ write_parquet("out.parquet", (id = Int32[1, 2], name = ["a", missing], hits = [[
               compression = :zstd)   # default :snappy
 ```
 
+A column that cannot be read (an encoding or type not supported yet) throws a `Parquet3.ColumnReadError` naming it; nothing is skipped silently. Pass `columns=` without that column to read the rest.
+
 `read_parquet` returns an `Arrow.Table`, which implements the Tables.jl interface:
 
 ```julia
@@ -117,7 +119,7 @@ All codecs go through [ChunkCodecs.jl](https://github.com/JuliaIO/ChunkCodecs.jl
 | Brotli | yes | `:brotli` | ChunkCodecLibBrotli |
 | Zstd | yes | `:zstd` | ChunkCodecLibZstd |
 | LZ4 (raw) | yes | `:lz4` | ChunkCodecLibLz4 |
-| LZ4 (Hadoop, deprecated) | yes | no | Custom framing around ChunkCodecLibLz4 blocks |
+| LZ4 (deprecated codec id) | not working yet (the parquet-testing files fail; see dev-note Known Limitations) | no | Custom Hadoop framing around ChunkCodecLibLz4 blocks |
 
 ### Nested Types
 
