@@ -21,6 +21,8 @@ function read_footer(data::Vector{UInt8})::FileMetaData
 end
 
 function open_parquet(path::String)::ParquetFile
+    # Checked first: Mmap.mmap creates an empty file at a path that does not exist
+    isfile(path) || throw(SystemError("opening file $(repr(path))", Libc.ENOENT))
     data = Mmap.mmap(path)
     ParquetFile(data, path, read_footer(data))
 end

@@ -118,16 +118,20 @@ Goal: write every value encoding the reader decodes. One step at a time, each re
 - E4 — Dictionary encoding on write: deferred to v0.3 (decided 2026-10-04); see the v0.3 list.
 Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, multiple pages.
 
-## Deferred to v0.3
-- Multiple row groups on write; min/max statistics
-- Other logical types (LIST-only annotation, TIME, INT96)
+## Deferred to v0.3 (refreshed 2026-10-04)
+- Multiple row groups and multiple pages on write; min/max statistics
 - E4 — Dictionary encoding on write (RLE_DICTIONARY). `:dictionary` is not an accepted
   `encoding` name today, and the bit-packed run encoder is not written. Needs: dictionary
   page, index page, `dictionary_page_offset`, bit-packed runs in `encode_rle_bitpacked`;
   no size-based fallback to PLAIN (record as a limitation).
-- Candidate: derive element nullability from the definition levels actually decoded
-  instead of the `null_count` statistic, so element types do not depend on which writer
-  produced the file.
+- Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT beyond FLOAT/DOUBLE; the deprecated LZ4
+  codec; string data over 2 GB in one chunk (64-bit offsets)
+- Other logical types: LIST-only annotation without a converted type, TIME, INT96 timestamps
+- First-write latency for tables with a FixedSizeList (build the ARROW:schema message
+  without Arrow.jl's generic writer)
+- Infer struct member types for loosely typed `NamedTuple` / `Dict` literals
+Done since this list was first written, no longer v0.3: nullability from decoded levels
+(shipped with the recursive reader); every nested shape and maps; member selection.
 
 ## Arrow.write of nested columns (do with writer work)
 - [ ] `Arrow.write` does not see `NestedColumn` (StructColumn / ListOfStructsColumn) as an

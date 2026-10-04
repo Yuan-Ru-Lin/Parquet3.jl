@@ -255,4 +255,3 @@ corpus test when present and are not needed for a green run.
 - A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.
 - Selecting only a map's keys or only its values (`columns=["m.key"]`) returns a list of one-member structs, not a map.
 - Without `ARROW:schema` metadata, `FixedSizeList` columns are read as regular variable-length lists since Parquet's schema does not encode the list size.
-- `open_parquet` / `read_parquet` on a non-existent path gives "File too small" instead of "File not found" (Mmap.mmap silently creates an empty file). Needs a guard in the public API.

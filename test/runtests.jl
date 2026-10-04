@@ -159,6 +159,13 @@ table = pa.table({
     end
 end
 
+@testset "Missing file" begin
+    path = joinpath(mktempdir(), "nope.parquet")
+    @test_throws "No such file or directory" read_parquet(path)
+    @test_throws SystemError open_parquet(path)
+    @test !ispath(path)        # and nothing is created there
+end
+
 @testset "column_names matches read_parquet keys" begin
     _with_pyarrow_file("column_names consistency", "test_colnames.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
