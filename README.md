@@ -1,6 +1,6 @@
 # Parquet3.jl
 
-An alternative Parquet implementation in Julia, focused on nested data — a suitable representation for data typical of physics experiments, like waveform data and observables of multiple physics objects in an event. Reading returns `Arrow.Table` (Tables.jl-compatible) with memory-mapped IO and per-RowGroup parallelism; basic writing of flat and list columns is supported.
+An alternative Parquet implementation in Julia, focused on nested data — a suitable representation for data typical of physics experiments, like waveform data and observables of multiple physics objects in an event. Reading returns `Arrow.Table` (Tables.jl-compatible) with memory-mapped IO and per-RowGroup parallelism; basic writing of flat, list, and struct columns is supported.
 
 ## Demo
 
@@ -56,8 +56,9 @@ tbl = read_parquet("data.parquet")
 tbl.column_name          # access a column
 tbl = read_parquet("data.parquet"; columns=["id", "name"])  # read specific columns
 
-# Write any Tables.jl-compatible table (flat and list columns; see Supported Features)
-write_parquet("out.parquet", (id = Int32[1, 2], name = ["a", missing], hits = [[1.5, 2.5], Float64[]]))
+# Write any Tables.jl-compatible table (flat, list, and struct columns; see Supported Features)
+write_parquet("out.parquet", (id = Int32[1, 2], name = ["a", missing], hits = [[1.5, 2.5], Float64[]],
+                             vertex = [(x = 0.1, y = 0.2), (x = 0.3, y = 0.4)]))
 ```
 
 `read_parquet` returns an `Arrow.Table`, which implements the Tables.jl interface:
@@ -85,7 +86,7 @@ close(pf)
 
 ### Writing
 
-`write_parquet(path, table)` writes flat columns of Int32/Int64/Float32/Float64/Bool/String/`Vector{UInt8}`, lists of those (`Vector{Vector{T}}`, written as `List<T>`), and `Missing` unions at list and element level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression, multiple row groups, nested lists, and structs are not yet written.
+`write_parquet(path, table)` writes flat columns of Int32/Int64/Float32/Float64/Bool/String/`Vector{UInt8}`, lists of those (`Vector{Vector{T}}`, written as `List<T>`), structs of those (a vector of `NamedTuple`s, written as a group), and `Missing` unions at every level (PLAIN encoding, uncompressed, single row group, null-count statistics). Output is readable by pyarrow. Compression, multiple row groups, and nested combinations (lists of lists, lists or structs inside structs, lists of structs) are not yet written.
 
 ### Encodings
 

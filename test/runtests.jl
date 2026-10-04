@@ -854,6 +854,60 @@ print(t.column('s').to_pylist())""")
         end
     end
 
+    @testset "Struct of flat fields round-trip (N2)" begin
+        P = @NamedTuple{x::Float64, n::Union{Missing, Int32}, tag::String, ok::Bool}
+        tbl = (
+            # no nulls anywhere
+            pos = [(x = 1.0, y = 2.0), (x = 3.0, y = NaN)],
+            # null structs, null members, and a struct whose members are all null
+            s   = Union{Missing, P}[(x = 1.5, n = Int32(1), tag = "a", ok = true), missing],
+            m   = @NamedTuple{a::Union{Missing, Int64}, b::Union{Missing, String}}[
+                      (a = missing, b = "x"), (a = 2, b = missing), ],
+            id  = [1, 2],
+        )
+        f = wfile("test_n2_structs.parquet")
+        try
+            write_parquet(f, tbl)
+            t = read_parquet(f)
+            @test collect(Tables.columnnames(t)) == collect(keys(tbl))
+            for k in keys(tbl)
+                @test isequal(collect(Tables.getcolumn(t, k)), collect(tbl[k]))
+            end
+            @test t.s isa Parquet3.StructColumn
+            @test t.pos.x == [1.0, 3.0] && isequal(t.s.tag, ["a", missing])
+            @test !(Missing <: eltype(t.pos))
+
+            # zero rows and all-null struct columns
+            write_parquet(f, (s = P[],))
+            @test length(read_parquet(f).s) == 0
+            write_parquet(f, (s = Union{Missing, P}[missing, missing], id = [1, 2]))
+            @test all(ismissing, read_parquet(f).s)
+
+            # nested members wait for N3; untyped rows are rejected
+            @test_throws Exception write_parquet(f, (bad = [(a = [1, 2],)],))
+            @test_throws Exception write_parquet(f, (bad = [(a = (b = 1,),)],))
+            @test_throws Exception write_parquet(f, (bad = Any[(a = 1,)],))
+            @test_throws Exception write_parquet(f, (bad = [(a = missing,), (a = 2,)],))
+
+            write_parquet(f, (s = Union{Missing, @NamedTuple{a::Union{Missing, Int32}, b::String}}[
+                                  (a = Int32(1), b = "x"), missing, (a = missing, b = "z")],))
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+t = pq.read_table('$(f)')
+print(t.schema.field('s').type)
+print(t.column('s').to_pylist())""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "struct<a: int32, b: string>"
+                @test lines[2] == "[{'a': 1, 'b': 'x'}, None, {'a': None, 'b': 'z'}]"
+            else
+                @warn "Skipping pyarrow cross-check of written structs: uv/pyarrow not available"
+            end
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "RLE encoder round-trip (unit)" begin
         for levels in ([0, 0, 1, 1, 1, 0], zeros(Int, 100), ones(Int, 7), [1], Int[])
             enc = Parquet3.encode_rle_bitpacked(levels, 1)

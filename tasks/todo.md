@@ -16,7 +16,8 @@ Nested writing is driven by element type, so reader outputs round-trip:
 - [x] N1 — `List<primitive>`: 3-level LIST schema, rep/def level generation, nulls at
       list and element level; round-trip + pyarrow cross-read (DONE, awaiting review;
       on branch `writer-w1`, rebased onto main)
-- [ ] N2 — struct of flat fields: one group, several leaves, def levels only
+- [x] N2 — struct of flat fields: one group, several leaves, def levels only (DONE,
+      awaiting review; `_shred` now returns several leaves per column)
 - [ ] N3 — composition: struct{list}, struct-of-struct, list<struct>, list<list>
       (recursive shredder over the schema tree; N1/N2 become its base cases)
 - [ ] N4 — read→write round-trip of reader containers (`Arrow.List`, `StructColumn`,
