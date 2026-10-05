@@ -2939,6 +2939,28 @@ print([n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.colu
                               [ismissing(r) ? missing : collect(skipmissing(r isa NamedTuple ? values(r) : r)) for r in getproperty(t, k)])
             end
         end
+        # Fixed-length byte arrays (decimals, Float16, fixed-size binary) inside a struct or a
+        # list: read as byte vectors, written to Arrow as lists of bytes, as at top level
+        flba = joinpath(dir, "flba.parquet")
+        if _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq, decimal
+D = decimal.Decimal; d = pa.decimal128(30, 2)
+table = pa.table({'s': pa.array([{'d': D('1.25'), 'u': b'abcd'}, None, {'d': None, 'u': b'efgh'}], pa.struct([('d', d), ('u', pa.binary(4))])),
+                  'l': pa.array([[D('1.25'), None], [], None], pa.list_(d)),
+                  'f': pa.array([[1.5, 2.5], [3.5], []], pa.list_(pa.float32())).cast(pa.list_(pa.float16())),
+                  'top': pa.array([D('1.25'), None, D('3.00')], d)})
+pq.write_table(table, '$(flba)')
+print('SUCCESS')""") == "SUCCESS"
+            bytes(x) = x isa AbstractVector{UInt8} ? Vector{UInt8}(x) : x isa Union{AbstractVector, Tuple} ? Any[bytes(v) for v in x] : x isa NamedTuple ? map(bytes, x) : x
+            t = read_parquet(flba)
+            @test t.l isa P.ListColumn && t.f isa P.ListColumn
+            out = joinpath(dir, "flba.arrow")
+            Arrow.write(out, t)
+            back = Arrow.Table(out)
+            @test all(isequal(bytes(getproperty(back, k)), bytes(getproperty(t, k))) for k in propertynames(t))
+            @test all(k -> (Arrow.write(out, NamedTuple{(k,)}((getproperty(t, k),))); isequal(bytes(Arrow.Table(out)[1]), bytes(getproperty(t, k)))), propertynames(t))
+        end
+
         t = read_parquet(joinpath(dir, "chunked.parquet"))
         @test t.f isa P.ChainedVector && t.u isa P.ChainedVector
         out = joinpath(dir, "chunked.arrow")

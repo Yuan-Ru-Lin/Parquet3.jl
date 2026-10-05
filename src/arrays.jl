@@ -220,8 +220,8 @@ const ListOfStructsColumn{T, fnames, D} = NestedColumn{:list_of_structs, T, fnam
 every row as ragged lists sharing the map's offsets and validity."""
 const MapColumn{T, fnames, D} = NestedColumn{:map, T, fnames, D}
 
-"""List column whose items Arrow.jl cannot take as they are: fixed-size lists, dates or naive
-timestamps, at any list depth. It behaves as the list it wraps; the wrapper is what lets
+"""List column whose items Arrow.jl cannot take as they are: fixed-size lists, dates, naive
+timestamps or fixed-length byte arrays, at any list depth. It behaves as the list it wraps; the wrapper is what lets
 `Arrow.write` be handed the column in Arrow's own layout."""
 const ListColumn{T, D} = NestedColumn{:list, T, (), D}
 
@@ -274,18 +274,27 @@ _inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
 """
+Element types of our leaf arrays that are not stored as Arrow stores them: Arrow keeps a
+date as 32-bit days and a naive timestamp as milliseconds since 1970, where `Date` and
+`DateTime` are other integers; and a fixed-length byte array (a decimal, a Float16) is a
+vector of byte vectors here. At top level Arrow.jl converts such a column itself; inside
+a struct or a list it is handed over by us, so it is encoded then (a copy).
+"""
+const ArrowEncoded = Union{Dates.Date, Dates.DateTime, Vector{UInt8}}
+
+"""
 Whether `v`, looking through any number of list levels, is an array that has to be
-converted before Arrow.jl can write it: a fixed-size list, or dates / naive timestamps.
+converted before Arrow.jl can write it: a fixed-size list, or a leaf of an `ArrowEncoded` type.
 """
 _needs_arrow_conversion(::FixedSizeListVector) = true
-_needs_arrow_conversion(::Arrow.Primitive{T, Vector{S}}) where {T, S <: Union{Dates.Date, Dates.DateTime}} = true
+_needs_arrow_conversion(::Arrow.Primitive{T, Vector{S}}) where {T, S <: ArrowEncoded} = true
 _needs_arrow_conversion(l::Arrow.List) = _needs_arrow_conversion(l.data)
 _needs_arrow_conversion(::Any) = false
 
 """
 Wrap an array whose elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`), or maps (`MapColumn`), so named access composes (`tbl.a.b.c`).
-A list of fixed-size lists, dates or naive timestamps becomes a `ListColumn`. Other arrays are returned as is.
+A list of fixed-size lists, dates, naive timestamps or fixed-length byte arrays becomes a `ListColumn`. Other arrays are returned as is.
 """
 function _wrap_nested(v::AbstractVector)
     v isa ChainedVector && isempty(v.arrays) && return v
@@ -321,10 +330,7 @@ _arrow_native(c::NestedColumn) = _arrow_native(getfield(c, :_data))
 # Several row groups in one Arrow array: the chunks' buffers have to be joined
 _arrow_native(cv::ChainedVector) = _arrow_concat([_arrow_native(chunk) for chunk in cv.arrays])
 
-# Arrow stores a date as 32-bit days and a naive timestamp as milliseconds since 1970;
-# `Date` and `DateTime` are other integers. At top level Arrow.jl converts such a column
-# itself; inside a struct or a list it is handed over by us, so it is encoded here (a copy).
-_arrow_native(p::Arrow.Primitive{T, Vector{S}}) where {T, S <: Union{Dates.Date, Dates.DateTime}} = Arrow.toarrowvector(collect(p))
+_arrow_native(p::Arrow.Primitive{T, Vector{S}}) where {T, S <: ArrowEncoded} = Arrow.toarrowvector(collect(p))
 
 _arrow_native(l::Arrow.List{T, O, Vector{UInt8}}) where {T, O} = l       # strings and binary
 _arrow_native(l::Arrow.List) = _list_over(l, _arrow_native(l.data))

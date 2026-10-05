@@ -25,6 +25,7 @@ Any nesting of lists, structs and maps is read, to any depth, by one recursive r
 | Parquet | Returned as | Access |
 |---|---|---|
 | `List<T>`, `List<List<T>>`, … | `Arrow.List` | `col[i]` is a zero-copy view of the row's items |
+| `List<T>` at any list depth where `T` is a date, a naive timestamp (`DateTime`) or a fixed-length byte array (decimal, Float16) | `ListColumn`, a wrapper around the `Arrow.List` | the same as for `Arrow.List`; the wrapper is what lets `Arrow.write` convert these element types |
 | struct | `StructColumn` | `col[i]` is a `NamedTuple`; `col.field` is the whole member column, zero-copy |
 | `List<Struct>`, at any list depth, with any members | `ListOfStructsColumn` | `col[i]` is the row's structs; `col.field` is that member for every row as a ragged list sharing the offsets (`particles.pt`) |
 | map | `MapColumn` | `col[i]` is a `MapView`, a zero-copy dictionary view of the row (`col[i]["k"]`, iteration in file order, `Dict(col[i])` for a hashed copy); `col.key` and `col.value` are all keys and all values, per row |

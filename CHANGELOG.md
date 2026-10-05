@@ -40,6 +40,7 @@ Parquet3 now reads every nested shape Parquet can hold and writes Parquet files.
   - A null element reads as `missing`; it used to read as 0.
   - `FixedSizeView` and `FixedSizeListVector` have more type parameters. `x isa FixedSizeView{N, T}` and `col isa FixedSizeListVector{N, T}` still work, but `FixedSizeView{N, T}` is no longer a concrete type, so `eltype(col) == FixedSizeView{N, T}` is now false; use `<:`.
   - A fixed-size list of strings or bytes reads as an ordinary list.
+- **Lists of dates.** A list column whose elements are dates, naive timestamps (`DateTime`) or fixed-length byte arrays is returned as a `ListColumn`, a wrapper that indexes like the `Arrow.List` inside it. Code that tests `col isa Arrow.List` needs to allow for it.
 - **A missing file** is a `SystemError`, and nothing is created at the path.
 
 ### Known limitations
