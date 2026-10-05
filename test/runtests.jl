@@ -53,6 +53,16 @@ end
         @test Parquet3.read_levels(UInt8[0b10110010, 0b10000000], 9, 1, Parquet3.BIT_PACKED) == ([1, 0, 1, 1, 0, 0, 1, 0, 1], 2)
     end
 
+    @testset "The root schema element's repetition does not count" begin
+        E, T = Parquet3.SchemaElement, Parquet3
+        for root_repetition in (nothing, T.REQUIRED, T.OPTIONAL, T.REPEATED)
+            tree = T.build_schema_tree([E(name = "schema", num_children = Int32(2), repetition_type = root_repetition),
+                                        E(name = "a", type = T.INT32, repetition_type = T.REQUIRED),
+                                        E(name = "b", type = T.INT32, repetition_type = T.OPTIONAL)])
+            @test [(c.max_def_level, c.max_rep_level) for c in tree.children] == [(0, 0), (1, 0)]
+        end
+    end
+
     @testset "Nested Column Assembly" begin
         # [[1, 2], [3], [4, 5, 6]]: rep 0 starts a record, 1 continues its list; def 2 = value
         rep, def = [0, 1, 0, 0, 1, 1], [2, 2, 2, 2, 2, 2]
