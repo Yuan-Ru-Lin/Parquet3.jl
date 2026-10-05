@@ -276,7 +276,7 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
     nodes = [_plan_node(String(name), eltype(col), String[], 0, 0) for (name, col) in zip(names, vectors)]
     leaf_encodings = Iterators.Stateful(_leaf_encodings(encoding, reduce(vcat, [node.leaves for node in nodes])))
 
-    open(path, "w") do io
+    _write_whole_file(path) do io
         write(io, PARQUET_MAGIC)
 
         schema = [SchemaElement(name = "schema", num_children = Int32(length(names)))]
@@ -319,6 +319,19 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
         write(io, PARQUET_MAGIC)
     end
     path
+end
+
+"""
+Open `path` for writing and run `f` on it. If `f` throws (a value that cannot be written
+turns up while the columns are shredded, say), the file is removed: no partial file is left.
+"""
+function _write_whole_file(f, path::String)
+    try
+        open(f, path, "w")
+    catch
+        rm(path; force = true)
+        rethrow()
+    end
 end
 
 """

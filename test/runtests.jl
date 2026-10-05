@@ -2948,6 +2948,19 @@ print([n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.colu
     end
 end
 
+@group "write_parquet leaves no partial file" begin
+    mktempdir() do dir
+        path = joinpath(dir, "partial.parquet")
+        # a null map key passes planning (the type allows it) and is only found while writing
+        bad = (id = [1, 2], m = [Dict{Union{Missing, String}, Int}("a" => 1), Dict{Union{Missing, String}, Int}(missing => 2)])
+        @test_throws ErrorException write_parquet(path, bad)
+        @test !isfile(path)
+        # a type error is found before the file is opened
+        @test_throws Exception write_parquet(path, (x = Any[1, "a"],))
+        @test !isfile(path)
+    end
+end
+
 @group "Row group metadata" begin
     # The optional RowGroup fields, as pyarrow reports them (Thrift ids 5 and 6)
     mktempdir() do dir
