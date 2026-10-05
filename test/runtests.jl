@@ -2874,6 +2874,29 @@ print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).
     end
 end
 
+@group "Row group metadata" begin
+    # The optional RowGroup fields, as pyarrow reports them (Thrift ids 5 and 6)
+    mktempdir() do dir
+        path = joinpath(dir, "rg.parquet")
+        expected = _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq
+pq.write_table(pa.table({'a': list(range(10)), 's': ['x%d' % i for i in range(10)]}), '$(path)', row_group_size=4)
+m = pq.ParquetFile('$(path)').metadata
+rgs = [m.row_group(i) for i in range(m.num_row_groups)]
+print(';'.join('%d,%d,%d,%d' % (rg.num_rows, rg.total_byte_size, sum(rg.column(j).total_compressed_size for j in range(rg.num_columns)),
+                                min(rg.column(j).dictionary_page_offset or rg.column(j).data_page_offset for j in range(rg.num_columns))) for rg in rgs))""")
+        if expected === nothing
+            @warn "Skipping row group metadata check: uv/pyarrow not available"
+        else
+            pf = open_parquet(path)
+            ours = join(("$(rg.num_rows),$(rg.total_byte_size),$(rg.total_compressed_size),$(rg.file_offset)" for rg in pf.metadata.row_groups), ';')
+            close(pf)
+            @test ours == expected
+            @test length(split(expected, ';')) == 3
+        end
+    end
+end
+
 @group "Types returned as stored (decimal, Float16, duration)" begin
     mktempdir() do dir
         path = joinpath(dir, "stored.parquet")
