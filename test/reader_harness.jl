@@ -257,3 +257,53 @@ table = pa.table({
     'id':  pa.array(range(6), type=pa.int64()),
 })
 """
+
+# Fixed-size lists of every element type, at top level (`top_*`), as a
+# struct member (`st_*`) and inside a list (`li_*`, with an empty and a null list). Each
+# holds the six values of its kind in order, two per fixed-size list; none is null, which
+# pyarrow cannot write. Kinds our writer can write back go to plain.parquet, the others to
+# other.parquet, INT96 to int96.parquet.
+# Arguments: the output directory.
+const HARNESS_FIXED_SIZE_ELEMENTS = """
+import pyarrow as pa, pyarrow.parquet as pq, datetime as dt, decimal
+D, n = decimal.Decimal, range(1, 7)
+plain = {
+    'str':  (pa.string(), ['s%d' % i for i in n]),
+    'bin':  (pa.binary(), [b'b' * i for i in n]),
+    'bool': (pa.bool_(), [i % 2 == 1 for i in n]),
+    'date': (pa.date32(), [dt.date(2020, 1, i) for i in n]),
+    'tsms': (pa.timestamp('ms'), [dt.datetime(2020, 1, i) for i in n]),
+    'tsus': (pa.timestamp('us', tz='UTC'), [dt.datetime(2020, 1, i) for i in n]),
+    'i8':   (pa.int8(), list(n)),
+    'u16':  (pa.uint16(), list(n)),
+    'u64':  (pa.uint64(), list(n)),
+    'f32':  (pa.float32(), [float(i) for i in n]),
+    'f64':  (pa.float64(), [float(i) for i in n]),
+}
+other = {
+    'flba':  (pa.binary(3), [b'%03d' % i for i in n]),
+    'dec9':  (pa.decimal128(9, 2), [D(i) for i in n]),
+    'dec30': (pa.decimal128(30, 2), [D(i) for i in n]),
+    'f16':   (pa.float16(), [float(i) for i in n]),
+    'dur':   (pa.duration('ms'), list(n)),
+    'time':  (pa.time32('ms'), [dt.time(0, 0, i) for i in n]),
+}
+def table(kinds):
+    cols = {}
+    for k, (t, v) in kinds.items():
+        f = pa.list_(t, 2)
+        g = pa.list_(pa.float32(), 2) if k == 'f16' else f       # float16 needs numpy to build; cast instead
+        rows = [v[0:2], v[2:4], v[4:6]]
+        st, sg = (pa.struct([('a', pa.int64()), ('v', x)]) for x in (f, g))
+        cols['top_' + k] = pa.array(rows + rows[:1], g).cast(f)
+        cols['st_' + k] = pa.array([{'a': i, 'v': r} for i, r in enumerate(rows + rows[:1])], sg).cast(st)
+        cols['li_' + k] = pa.array([rows[:2], [], rows[2:], None], pa.list_(g)).cast(pa.list_(f))
+    return pa.table(cols)
+out = ARGS[0]
+extra = pa.table({'strn': pa.array([['a', 'b'], ['c', None], [None, None], ['e', 'f']], pa.list_(pa.string(), 2))})
+pq.write_table(table(plain), out + '/plain.parquet')
+pq.write_table(table(other).append_column('strn', extra.column('strn')), out + '/other.parquet')
+pq.write_table(pa.table({'top_i96': pa.array([[dt.datetime(2020, 1, 1), dt.datetime(2020, 1, 2)]] * 4, pa.list_(pa.timestamp('ns'), 2))}),
+               out + '/int96.parquet', use_deprecated_int96_timestamps=True)
+print('SUCCESS')
+"""

@@ -2607,3 +2607,57 @@ print(b.schema.field('lf').type, '|', b.schema.field('llf').type)""")
         @test isempty(loose_nodes(t))
     end
 end
+
+@testset "FixedSizeList element types" begin
+    P = Parquet3
+    # A fixed-size list is restored when its element is fixed-width; of anything else it reads as a list
+    fixed_kinds = (:bool, :date, :tsms, :tsus, :i8, :u16, :u64, :f32, :f64, :dur, :time)
+    list_kinds = (:str, :bin, :flba, :dec9, :dec30, :f16)
+    be(i, nbytes) = reverse!(collect(reinterpret(UInt8, [Int128(100i)])))[end - nbytes + 1:end]   # decimal i.00, big-endian
+    expected = Dict{Symbol, Any}(
+        :str => i -> "s$i", :bin => i -> fill(UInt8('b'), i), :bool => isodd, :date => i -> Date(2020, 1, i),
+        :tsms => i -> DateTime(2020, 1, i), :tsus => i -> Dates.value(DateTime(2020, 1, i) - DateTime(1970)) * 1000,
+        :i8 => Int8, :u16 => UInt16, :u64 => UInt64, :f32 => Float32, :f64 => Float64,
+        :flba => i -> Vector{UInt8}(lpad(i, 3, '0')), :dec9 => i -> be(i, 4), :dec30 => i -> be(i, 13),
+        :f16 => i -> collect(reinterpret(UInt8, [Float16(i)])), :dur => Int64, :time => i -> Int32(1000i))
+    plain(x) = x isa Arrow.Timestamp ? x.x : x isa Union{Base.CodeUnits, AbstractVector{UInt8}} ? Vector{UInt8}(x) :
+               x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+    inner(c) = c isa P.NestedColumn ? inner(getfield(c, :_data)) : c isa P.ChainedVector ? inner(first(c.arrays)) : c
+    fixed(a) = a isa P.FixedSizeListVector
+
+    mktempdir() do dir
+        if _run_pyarrow("ARGS = ['$(dir)']\n" * HARNESS_FIXED_SIZE_ELEMENTS) != "SUCCESS"
+            @warn "Skipping fixed-size list element fixtures: uv/pyarrow not available"
+            return
+        end
+        tables = Dict(f => read_parquet(joinpath(dir, f * ".parquet")) for f in ("plain", "other", "int96"))
+        @testset "$kind" for kind in (fixed_kinds..., list_kinds...)
+            t = tables[haskey(tables["plain"], Symbol(:top_, kind)) ? "plain" : "other"]
+            top, st, li = (getproperty(t, Symbol(pos, kind)) for pos in (:top_, :st_, :li_))
+            rows = [Any[plain(expected[kind](i)), plain(expected[kind](i + 1))] for i in (1, 3, 5)]
+            @test plain(top) == Any[rows..., rows[1]]
+            @test plain(st.v) == Any[rows..., rows[1]] && st.a == 0:3
+            @test isequal(plain(li), Any[rows[1:2], Any[], rows[3:3], missing])
+            @test (fixed(inner(top)), fixed(inner(st.v)), fixed(inner(li).data)) == ntuple(_ -> kind in fixed_kinds, 3)
+        end
+        @test all(isempty ∘ loose_nodes, values(tables))
+        # A null string inside what the file declares a fixed-size list; INT96 is fixed-width
+        @test isequal(plain(tables["other"].strn), Any[Any["a", "b"], Any["c", missing], Any[missing, missing], Any["e", "f"]])
+        @test fixed(inner(tables["int96"].top_i96)) && length(tables["int96"].top_i96) == 4
+
+        # write → read gives the same values and types; pyarrow sees the same values, and the
+        # same types except for lists of strings and bytes, which are written as plain lists
+        out = joinpath(dir, "rewrite.parquet")
+        t = tables["plain"]
+        write_parquet(out, t)
+        back = read_parquet(out)
+        @test all(isequal(plain(getproperty(back, k)), plain(getproperty(t, k))) && eltype(getproperty(back, k)) == eltype(getproperty(t, k))
+                  for k in propertynames(t))
+        @test harness_pyarrow_compare([(joinpath(dir, "plain.parquet"), out)]) == ["equal"]
+        changed = _run_pyarrow("""
+import pyarrow.parquet as pq
+a, b = pq.read_schema('$(joinpath(dir, "plain.parquet"))'), pq.read_schema('$(out)')
+print(','.join(sorted(n for n in a.names if a.field(n).type != b.field(n).type)))""")
+        @test changed == join(sort(["$(pos)_$(kind)" for pos in (:top, :st, :li) for kind in (:str, :bin)]), ',')
+    end
+end

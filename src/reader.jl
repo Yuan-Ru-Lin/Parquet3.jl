@@ -282,7 +282,7 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
                 nulls[record_idx] = true
                 # Zero-fill the null record's slots
                 for j in 1:list_size
-                    data[base + j] = zero(T)
+                    data[base + j] = _blank(T)
                 end
                 continue
             end
@@ -293,14 +293,14 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
         if def == max_def
             slot_idx += 1
             if slot_idx <= list_size
-                data[base + slot_idx] = T(values[value_idx])
+                data[base + slot_idx] = convert(T, values[value_idx])
             end
             value_idx += 1
         elseif def >= inner_threshold
             # Null leaf value
             slot_idx += 1
             if slot_idx <= list_size
-                data[base + slot_idx] = zero(T)
+                data[base + slot_idx] = _blank(T)
             end
         end
     end
@@ -309,6 +309,18 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
     ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
     FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
 end
+
+"""
+Whether a fixed-size list of this element is read into a `FixedSizeListVector`, whose
+storage is one flat vector of fixed-width values: numbers, `Bool`, dates and timestamps
+(and INT96). Strings, binary and fixed-length byte arrays (so decimals and Float16, which
+are read as bytes) are not; such a list is read as an ordinary list.
+"""
+_fixed_width_leaf(node::ReadNode) = node.kind == :leaf &&
+    isbitstype(element_julia_type(node.schema.element.type, leaf_annotation(node.schema.element)))
+
+"""The value stored under a null in a fixed-size list's flat vector: all bits zero."""
+_blank(::Type{T}) where T = reinterpret(T, ntuple(_ -> 0x00, sizeof(T)))
 
 """Check if all pages in an FSL column have no nulls (all defs at max or no def levels)."""
 function _fsl_no_nulls(pages::Vector{<:DecodedPage}, max_def::Int)
@@ -352,7 +364,7 @@ function _fsl_dense_copy!(data::Vector{T}, pages::Vector{<:DecodedPage}, ptype, 
             copyto!(data, pos, converted, 1, n)
         else
             @inbounds for i in 1:n
-                data[pos + i - 1] = T(converted[i])
+                data[pos + i - 1] = convert(T, converted[i])
             end
         end
         pos += n
@@ -419,9 +431,9 @@ function _read_buffers(ctx::ReadContext, rg::Union{RowGroup, Nothing}, node::Rea
         nulls = need ? _slot_nulls(levels, slot_rep, slot_def, node.def_level) : falses(length(first(children).nulls))
         return (RawNode(nothing, nulls, Int32[], children), levels)
     end
-    # A list that ARROW:schema declares fixed-size, with a primitive element
+    # A list that ARROW:schema declares fixed-size, with a fixed-width element
     child = only(node.children)
-    if child.kind == :leaf && node.fsl_size > 0
+    if node.fsl_size > 0 && _fixed_width_leaf(child)
         return _read_fixed_size_list(ctx, rg, node, child, slot_rep, slot_def, want_levels)
     end
     raw_child, levels = _read_buffers(ctx, rg, child, node.rep_level, node.item_def, true)
@@ -564,13 +576,13 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
             position = 0
             if d < node.def_level
                 nulls[slot] = true
-                fill!(@view(data[(slot - 1) * size + 1 : slot * size]), zero(T))
+                fill!(@view(data[(slot - 1) * size + 1 : slot * size]), _blank(T))
                 continue
             end
         end
         d >= node.item_def || continue
         position += 1
-        filled = d == max_def ? T(values[value += 1]) : zero(T)
+        filled = d == max_def ? convert(T, values[value += 1]) : _blank(T)
         position <= size && (data[(slot - 1) * size + position] = filled)
     end
     FixedSizeListVector{size, T, FixedSizeView{size, T}}(data, nulls, nslots)
