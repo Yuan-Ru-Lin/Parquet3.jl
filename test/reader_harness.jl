@@ -94,7 +94,8 @@ tables = {
                             ('ll', pa.list_(pa.list_(i64)))]).empty_table(),
 }
 variants = {'': {}, '_rg5': {'row_group_size': 5}, '_rg5_nostats': {'row_group_size': 5, 'write_statistics': False},
-            '_v2_dict': {'data_page_version': '2.0', 'use_dictionary': True}, '_plain_zstd': {'use_dictionary': False, 'compression': 'zstd'}}
+            '_v2_dict': {'data_page_version': '2.0', 'use_dictionary': True}, '_plain_zstd': {'use_dictionary': False, 'compression': 'zstd'},
+            '_v2_plain': {'data_page_version': '2.0', 'use_dictionary': False}}
 for name, table in tables.items():
     for suffix, kwargs in variants.items():
         if name == 'zero_rows' and suffix: continue

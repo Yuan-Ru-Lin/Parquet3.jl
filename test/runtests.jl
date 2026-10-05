@@ -391,7 +391,9 @@ table = pa.table({
 end
 
 @group "Null and empty lists at every level" begin
-    _with_pyarrow_file("nested list nulls", "test_list_nulls.parquet", """
+    # v1 data pages, then v2 pages with plain values (whose headers count nulls differently)
+    for kwargs in ("{}", "{'data_page_version': '2.0', 'use_dictionary': False}")
+    _with_pyarrow_file("nested list nulls ($kwargs)", "test_list_nulls.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 st = pa.struct([('x', pa.list_(pa.string())), ('vv', pa.list_(pa.list_(pa.int64())))])
 table = pa.table({
@@ -400,7 +402,8 @@ table = pa.table({
     'ls': pa.array([['a', None], None, [], ['b'], [None]], type=pa.list_(pa.string())),
     's':  pa.array([{'x': ['hé', None], 'vv': [[1, 2], [], None, [None, 3]]}, None,
                     {'x': None, 'vv': None}, {'x': [], 'vv': []}, {'x': [None], 'vv': [None]}], type=st),
-})""") do tbl
+})
+write_kwargs = $kwargs""") do tbl
         # Arrow lists → plain nested vectors, keeping missings at every level
         plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
 
@@ -414,6 +417,27 @@ table = pa.table({
         @test isequal(plain(tbl.s.x), Any[Any["hé", missing], missing, missing, Any[], Any[missing]])
         @test isequal(plain(tbl.s.vv), Any[Any[Any[1, 2], Any[], missing, Any[missing, 3]], missing,
                                            missing, Any[], Any[missing]])
+    end
+    end
+
+    # A v2 page for a leaf under a struct under a list: pyarrow's header does not count the
+    # entry of an empty or null list as a null, so the number of stored values has to come
+    # from the levels. (With dictionary pages the over-count happens to be harmless.)
+    plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
+    _with_pyarrow_file("v2 pages: empty and null lists above a struct", "test_v2_struct_lists.parquet", """
+import pyarrow as pa, pyarrow.parquet as pq
+st = pa.struct([('a', pa.int64())])
+table = pa.table({
+    'empty': pa.array([[{'a': 1}], [], [{'a': 2}]], pa.list_(st)),
+    'null':  pa.array([[{'a': 1}], None, [{'a': 2}]], pa.list_(st)),
+    'lls':   pa.array([[[{'a': 1}]], [], [[], [{'a': 2}]]], pa.list_(pa.list_(st))),
+    'ms':    pa.array([[('k', {'a': 1})], [], [('j', {'a': 2})]], pa.map_(pa.string(), st)),
+})
+write_kwargs = {'data_page_version': '2.0', 'use_dictionary': False, 'compression': 'none'}""") do tbl
+        @test plain(tbl.empty) == Any[Any[(a = 1,)], Any[], Any[(a = 2,)]]
+        @test isequal(plain(tbl.null), Any[Any[(a = 1,)], missing, Any[(a = 2,)]])
+        @test plain(tbl.lls) == Any[Any[Any[(a = 1,)]], Any[], Any[Any[], Any[(a = 2,)]]]
+        @test plain(tbl.ms) == Any[Dict("k" => (a = 1,)), Dict(), Dict("j" => (a = 2,))]
     end
 end
 
@@ -2275,7 +2299,7 @@ end
 
     # pyarrow-written files, one row group and several
     mktempdir() do dir
-        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=4"))
+        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=4"), ("v2.parquet", ", data_page_version='2.0', use_dictionary=False"))
             path, out = joinpath(dir, name), joinpath(dir, "rw_" * name)
             _run_pyarrow(HARNESS_NEW_SHAPES * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
                 (@warn "Skipping new-shape pyarrow fixtures: uv/pyarrow not available"; break)
@@ -2553,7 +2577,7 @@ end
     fixed(a) = a isa P.FixedSizeListVector
 
     mktempdir() do dir
-        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=4"))
+        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=4"), ("v2.parquet", ", data_page_version='2.0', use_dictionary=False"))
             path = joinpath(dir, name)
             _run_pyarrow(HARNESS_NESTED_FIXED_SIZE * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
                 (@warn "Skipping nested fixed-size list fixtures: uv/pyarrow not available"; break)
@@ -2703,7 +2727,7 @@ end
     n = 8
 
     mktempdir() do dir
-        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=2"))
+        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=2"), ("v2.parquet", ", data_page_version='2.0', use_dictionary=False"))
             path = joinpath(dir, name)
             _run_pyarrow(HARNESS_FIXED_SIZE_NULL_ELEMENT * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
                 (@warn "Skipping null-element fixtures: uv/pyarrow not available"; break)
@@ -2722,7 +2746,7 @@ end
             @test inner(t.li).data isa P.FixedSizeListVector{3, Int32, <:Any, BitVector} && t.li isa P.ListColumn
             @test eltype(t.top) == P.FixedSizeView{3, Union{Missing, Int32}, Int32, BitVector} && eltype(eltype(t.top)) == Union{Missing, Int32}
             @test t.top[6] isa P.FixedSizeView{3, Union{Missing, Int32}} && ismissing(t.top[6][2]) && t.top[6][3] === Int32(7)
-            @test inner(t.top).data isa Vector{Int32} && t.top[6].parent === P._chunks(t.top)[end - (name == "one.parquet" ? 0 : 1)].data
+            @test inner(t.top).data isa Vector{Int32} && t.top[6].parent === P._chunks(t.top)[end - (name == "chunks.parquet" ? 1 : 0)].data
             # A column without a null element keeps the plain types
             @test chunks_are(P.FixedSizeListVector{3, Int32, <:Any, Nothing}, t.ok) && eltype(t.ok) == P.FixedSizeView{3, Int32, Int32, Nothing}
             @test isempty(loose_nodes(t))

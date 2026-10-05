@@ -176,7 +176,10 @@ function read_page(reader::ColumnReader)
             data_part = decompress(collect(data_part), meta.codec, Int(expected))
         end
 
-        non_null = nv - Int(dh.num_nulls)
+        # Count the stored values from the levels, as for a v1 page. The header's num_nulls
+        # cannot be used for that: pyarrow does not count the entry of an empty or null list
+        # above a struct as a null, though no value is stored for it.
+        non_null = def_levels === nothing ? nv - Int(dh.num_nulls) : count(==(max_def), def_levels)
         values = decode_values(data_part, non_null, meta.type, dh.encoding, reader.type_length, reader.dictionary)
 
         return DecodedPage(values, def_levels, rep_levels, nv)
