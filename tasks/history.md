@@ -103,7 +103,7 @@ Deferred (edge case, decided 2026-10-03): infer struct member types from rows wh
       recursive-reader (git filter-branch on that one path; trees otherwise identical;
       origin/main untouched). `papers/` is gitignored; the local copy stays on disk; the
       Dremel paper is linked from dev-note.md. Backup bundle of the old refs:
-      `~/Parquet3.jl-backup-before-pdf-removal-2026-10-04.bundle` (delete once satisfied).
+      `~/Parquet3.jl-backup-before-pdf-removal-2026-10-04.bundle` (deleted by the user on 2026-10-04; it no longer exists).
       Hashes cited in this file were updated; hashes quoted in older commit messages are stale.
 - [x] CI: `.github/workflows/CI.yml` (Julia 1.10 and latest, ubuntu, 4 threads, submodules,
       uv) and `CompatHelper.yml`. Python environment moved into the repo (`test/pyhelper`,
