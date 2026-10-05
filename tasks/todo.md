@@ -125,6 +125,9 @@ What Parquet3 carries only because Arrow.jl lacks it, and what would go once it 
    the two workarounds that present the elements as nullable (`_concrete_view` in the
    writer, `_fixed_size_child` for `Arrow.write`).
 
+## After the v0.2.0 tag: chores
+- [ ] Bump the action versions in `.github/workflows/CI.yml` (and the other workflows): CI warns that they target Node.js 20, which is deprecated. A warning only; left until after the tag so the release path does not change.
+
 ## After v0.2.0: structure (auditor, 2026-10-05, undecided)
 Suggestions from the auditor's reading of e1bfcc1. The user's ruling: they should not keep blocking v0.2; whether and when to do any of them is undecided. Nothing here is started.
 1. A seeded random round-trip test in the suite (the auditor's strongest recommendation): about 50 random nested tables, write_parquet → read_parquet, write_parquet → pyarrow, pyarrow rewrite → read_parquet, values compared through a canonical form. The v2-page bug passed the example tests and was found by such a test within minutes. Cost to watch: each new table schema with a fixed-size list pays the 5–20 s Arrow schema compilation, so keep those few. The auditor has a ~100-line script; ask for it when this is taken up.
