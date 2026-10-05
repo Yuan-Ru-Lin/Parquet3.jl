@@ -178,6 +178,11 @@ const ListOfStructsColumn{T, fnames, D} = NestedColumn{:list_of_structs, T, fnam
 every row as ragged lists sharing the map's offsets and validity."""
 const MapColumn{T, fnames, D} = NestedColumn{:map, T, fnames, D}
 
+"""List column whose items are fixed-size lists, at any list depth. It behaves as the list
+it wraps; the wrapper is what lets `Arrow.write` take the column without re-encoding it."""
+const ListColumn{T, D} = NestedColumn{:list, T, (), D}
+
+ListColumn(data::AbstractVector{T}) where T = NestedColumn{:list, T, (), typeof(data)}(data)
 MapColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
     NestedColumn{:map, T, fnames, typeof(data)}(data)
 StructColumn(data::AbstractVector{T}, fnames::Tuple{Vararg{Symbol}}) where T =
@@ -225,16 +230,21 @@ _inner_struct(l::Arrow.List) = _inner_struct(l.data)
 _inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
+"""Whether `v` is a fixed-size list array, looking through any number of list levels."""
+_fixed_size_items(::FixedSizeListVector) = true
+_fixed_size_items(l::Arrow.List) = _fixed_size_items(l.data)
+_fixed_size_items(::Any) = false
+
 """
 Wrap an array whose elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`), or maps (`MapColumn`), so named access composes (`tbl.a.b.c`).
-Other arrays are returned as is.
+A list of fixed-size lists becomes a `ListColumn`. Other arrays are returned as is.
 """
 function _wrap_nested(v::AbstractVector)
     v isa ChainedVector && isempty(v.arrays) && return v
     chunk = _first_chunk(v)
     s = _inner_struct(chunk)
-    s === nothing && return v
+    s === nothing && return chunk isa Arrow.List && _fixed_size_items(chunk) ? ListColumn(v) : v
     fnames = _struct_fnames(typeof(s))
     chunk isa Arrow.Struct ? StructColumn(v, fnames) :
     chunk isa MapVector ? MapColumn(v, fnames) : ListOfStructsColumn(v, fnames)

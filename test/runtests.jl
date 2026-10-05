@@ -2521,8 +2521,14 @@ end
 @testset "FixedSizeList inside lists" begin
     P = Parquet3
     M = Missing
-    plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa AbstractVector ? Any[plain(v) for v in x] :
+    plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa Union{AbstractVector, Tuple} ? Any[plain(v) for v in x] :
                x isa NamedTuple ? map(plain, x) : x
+    # Through Arrow.write and back; Arrow.jl gives a fixed-size list row as a tuple
+    function arrow_roundtrip(t)
+        io = IOBuffer(); Arrow.write(io, t); seekstart(io)
+        Arrow.Table(io; convert = false)
+    end
+    arrow_equal(t, a) = all(isequal(plain(Tables.getcolumn(t, k)), plain(Tables.getcolumn(a, k))) for k in Tables.columnnames(t))
     # The array under a column, through wrappers and row-group chunks, and what is inside it
     inner(c) = c isa P.NestedColumn ? inner(getfield(c, :_data)) : c isa P.ChainedVector ? inner(first(c.arrays)) : c
     fixed(a) = a isa P.FixedSizeListVector
@@ -2552,6 +2558,13 @@ end
             @test t.mf[4]["c"] == [7, 8, 9] && t.mf[4]["c"] isa P.FixedSizeView{3, Int32} && ismissing(t.mf[3])
             @test plain(t.ff[2]) == Any[Any[1, 2], Any[3, 4], Any[5, 6]] && plain(t.dense[6]) == Any[Any[5, 5, 5], Any[6, 6, 6]]
             @test isempty(loose_nodes(t))
+
+            # Arrow.write takes every shape, with the fixed sizes in the Arrow schema
+            @test t.lf isa P.ListColumn && t.llf isa P.ListColumn && t.ls.values isa P.ListColumn
+            a = arrow_roundtrip(t)
+            @test arrow_equal(t, a)
+            @test eltype(a.top) == NTuple{3, Int32} && eltype(eltype(a.dense)) == NTuple{3, Int32}
+            @test nonmissingtype(eltype(nonmissingtype(eltype(a.lf)))) == NTuple{3, Int32}
 
             # pyarrow reads the same values from the file it wrote. (pyarrow itself gives the
             # map's values back as variable-length lists; the sizes here come from ARROW:schema.)
@@ -2590,6 +2603,7 @@ print(b.schema.field('lf').type, '|', b.schema.field('llf').type)""")
         @test all(isequal(plain(getproperty(t, k)), plain(tbl[k])) for k in keys(tbl))
         @test fixed(inner(t.lf).data) && eltype(inner(t.lf).data) == Union{M, V} && ismissing(t.lf[1][2]) && t.lf[1][3] == [3, 4]
         @test fixed(inner(t.ll).data.data) && eltype(inner(t.ll).data.data) == V      # no nulls seen, none in the type
+        @test arrow_equal(t, arrow_roundtrip(t))
         @test isempty(loose_nodes(t))
     end
 end

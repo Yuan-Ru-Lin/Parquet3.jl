@@ -135,7 +135,7 @@ Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, m
 - [x] B — `Arrow.write` for every column `read_parquet` returns (see the section below)
 - [ ] C — FixedSizeList inside a list: PLAN written 2026-10-04 (section below), awaiting approval; no code
 
-## Part C — FixedSizeList inside a list (PLAN, awaiting approval; no code written)
+## Part C — FixedSizeList inside a list (DONE 2026-10-04; approved plan below, results at its end)
 
 Today a FixedSizeList is restored at top level and as a struct member. Inside a list
 (`list<fixed_size_list>`, `list<struct<…fsl…>>`) it reads as a variable-length list and is
@@ -198,17 +198,38 @@ Known Limitations: the outer fixed size is lost. Also still not restored: a fixe
 list whose elements are not primitives (strings, structs).
 
 ### Steps, each ending with a report
-- [ ] C1 — plan only: the Arrow field passed down `plan_read_tree`, `fsl_size` on the node,
+- [x] C1 — (DONE, 4c5e07d) plan only: the Arrow field passed down `plan_read_tree`, `fsl_size` on the node,
       the path dictionary removed. No behaviour change (still applied only outside lists).
       Suite green; benchmark on part-0 unchanged.
-- [ ] C2 — reading inside lists: slot-based scatter, dense path, reduced levels. Tests
+- [x] C2 — (DONE) reading inside lists: slot-based scatter, dense path, reduced levels. Tests
       against pyarrow: `list<fsl>`, `list<struct<…fsl…>>`, struct with a `list<fsl>` member,
       `list<list<fsl>>`, `map<K, fsl>`, `fsl<fsl>` (inner restored), with null and empty
       lists, one row group and several. Null fixed-size elements come from our own writer,
       since pyarrow cannot write them. Benchmark gate: top-level and struct-member waveform
       reads must not slow down.
-- [ ] C3 — write → read keeps the types; write → pyarrow reports `list<fixed_size_list>`;
+- [x] C3 — (DONE) write → read keeps the types; write → pyarrow reports `list<fixed_size_list>`;
       `Arrow.write` round-trip; README, Known Limitations, dev-note.
+
+### Results
+- Reads as (pyarrow fixtures, one and several row groups; values equal to pyarrow's):
+  `list<fsl>` → `ListColumn` (`Arrow.List` over a `FixedSizeListVector`);
+  `list<struct<…, fsl>>` → `ListOfStructsColumn` with a `FixedSizeListVector` member;
+  struct with a `list<fsl>` member → `StructColumn`; `list<list<fsl>>` → `ListColumn`;
+  `map<K, fsl>` → `MapColumn` with fixed-size values (pyarrow itself reads these values as
+  variable lists); `fsl<fsl>` → list of fixed-size lists (inner restored, outer variable).
+- Null fixed-size lists below a list are tested from our own writer (pyarrow cannot write them).
+- The plan said writing and `Arrow.write` needed no change. Writing did not. `Arrow.write`
+  did: a top-level `Arrow.List` over a `FixedSizeListVector` is taken by Arrow.jl as it is
+  and then fails on the child, so `_wrap_nested` wraps such lists (`ListColumn`), which
+  routes them through `_arrow_native` like the other wrappers.
+- write → read: values and element types equal. write → pyarrow: values equal; types equal
+  except `fsl<fsl>`, which pyarrow sees as `list<fixed_size_list<int32>[2]>` (known gap).
+- Benchmark on part-0 (min of 15, 4 threads, C1 commit and C2 tree run alternately, twice):
+  all columns 210–214 ms → 199–200 ms; waveform_windowed 145–172 → 170–174;
+  waveform_presummed 124–132 → 126–146; tracelist 4.1–4.2 → 4.1–4.5. Within noise.
+  Same comparison for C3 (C1 → C3): all columns 198–204 → 193–205; waveform_windowed
+  146–172 → 170–181; waveform_presummed 138–143 → 115–139; tracelist 4.2–4.4 → 3.8–4.3.
+  The windowed minimum varies between 145 and 172 ms on the unchanged C1 code alone.
 
 ### Risks
 - The reduced level stream is new level arithmetic (the fixed-size list under an empty or

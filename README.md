@@ -111,7 +111,7 @@ Values are PLAIN-encoded by default. `encoding` accepts:
 
 Dictionary-encoded files are read, but dictionary encoding is not yet written (planned for v0.3).
 
-A single name applies to the whole table: it is used for every column whose type allows it, and the others stay PLAIN. A `Dict` chooses per column, keyed by the path used to reach the data: `encoding = Dict("x" => :byte_stream_split, "wf.values" => :plain, "particles.pt" => :byte_stream_split)`. A key naming a struct or list covers everything under it; in a `Dict`, an encoding that does not fit the column's type, or a key matching no column, is an error. `FixedSizeListVector` columns, at top level or as struct members, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Every shape the writer produces reads back with `read_parquet`.
+A single name applies to the whole table: it is used for every column whose type allows it, and the others stay PLAIN. A `Dict` chooses per column, keyed by the path used to reach the data: `encoding = Dict("x" => :byte_stream_split, "wf.values" => :plain, "particles.pt" => :byte_stream_split)`. A key naming a struct or list covers everything under it; in a `Dict`, an encoding that does not fit the column's type, or a key matching no column, is an error. `FixedSizeListVector` columns, at top level or nested in structs, lists and maps, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected). Every shape the writer produces reads back with `read_parquet`.
 
 ### Encodings
 
@@ -141,10 +141,11 @@ Any nesting of lists, structs and maps is read, to any depth, by one recursive r
 | `List<Struct>`, at any list depth, with any members | `ListOfStructsColumn` | `col[i]` is the row's structs; `col.field` is that member for every row as a ragged list sharing the offsets (`particles.pt`) |
 | map | `MapColumn` | `col[i]` is a `MapView`, a zero-copy dictionary view of the row (`col[i]["k"]`, iteration in file order, `Dict(col[i])` for a hashed copy); `col.key` and `col.value` are all keys and all values, per row |
 | `FixedSizeList<T>` | `FixedSizeListVector{N,T}` | `col[i]` is a zero-copy `FixedSizeView{N,T}` into one flat vector |
+| `List<FixedSizeList<T>>`, at any list depth | `ListColumn` | `col[i]` is a zero-copy view of the row's items, each a `FixedSizeView{N,T}` |
 
 Named access composes through structs and lists: `tbl.event.vertex.x`, `tbl.s.hits.x`, `tbl.tracks.vertex.x` (one value per track, per row), `tbl.mm.value.key` (the keys of nested maps). A map nested in a struct, a list or another map presents the same way (`tbl.mm[i]["a"]["x"]`). When a key occurs twice in a row, lookup and `Dict(...)` take the last entry, as the Parquet format specifies; iteration shows both. Multi-row-group files chain the per-group chunks without copying.
 
-`FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored at top level and as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), and read as a variable-length list elsewhere. Legacy list layouts (2-level lists, bare repeated fields) and maps without values are read as pyarrow reads them.
+`FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored wherever it is declared with a primitive element: at top level, as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), inside lists (`list<fixed_size_list>`, `list<struct<…>>`) and as a map value. Of a fixed-size list of fixed-size lists only the inner level is restored; the outer one reads as a variable-length list. Legacy list layouts (2-level lists, bare repeated fields) and maps without values are read as pyarrow reads them.
 
 ### Logical Types
 
