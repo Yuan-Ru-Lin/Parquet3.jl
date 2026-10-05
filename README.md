@@ -162,7 +162,7 @@ Timestamps are read from `logicalType` (falling back to the converted type) and 
 
 `Arrow.Timestamp` wraps the stored `Int64` (`ts.x`), so microsecond and nanosecond values are exact. A file with only the older converted type (TIMESTAMP_MILLIS / TIMESTAMP_MICROS) is UTC-adjusted by definition and reads as `Arrow.Timestamp{…, :UTC}`. The same rule applies inside lists, structs and lists of structs.
 
-Not converted, returned as stored: decimals (the unscaled integer; as pyarrow writes them, a `Vector{UInt8}` holding it big-endian), Float16 (two bytes), other fixed-length byte arrays, durations and times (`Int32`/`Int64` in the file's unit), and INT96 timestamps.
+Not converted, returned as stored (and written back with their values but without the annotation: decimals, Float16 and fixed-length binary as plain binary, times and durations as plain integers; INT96 cannot be written): decimals (the unscaled integer; as pyarrow writes them, a `Vector{UInt8}` holding it big-endian), Float16 (two bytes), other fixed-length byte arrays, durations and times (`Int32`/`Int64` in the file's unit), and INT96 timestamps.
 
 ## Developer Notes
 

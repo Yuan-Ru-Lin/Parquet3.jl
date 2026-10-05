@@ -29,12 +29,14 @@ pyarrow read what we write.
 
 ### Writing (new)
 
-- `write_parquet(path, table)` writes any Tables.jl table: integers of every width, floats,
+- `write_parquet(path, table)` writes any Tables.jl table: integers of 8 to 64 bits, signed and unsigned, floats,
   `Bool`, `String`, bytes, `Date`, `DateTime`, `Arrow.Timestamp`, and lists, structs
   (`NamedTuple`s) and maps (`AbstractDict`s) of those, nested to any depth, with `Missing`
   at any level.
-- What `read_parquet` returns can be written back unchanged, including fixed-size lists,
-  which keep their size for this package and for pyarrow.
+- What `read_parquet` returns can be written back with the same values and, for the types
+  the reader converts, the same types, including fixed-size lists, which keep their size
+  for this package and for pyarrow. The exception is the types returned as stored (see
+  Known limitations): their values are written back, their annotation is not.
 - `compression = :snappy` (default), `:gzip`, `:brotli`, `:zstd`, `:lz4`, `:uncompressed`.
 - `encoding = :plain` (default), `:byte_stream_split`, `:delta_binary_packed`,
   `:delta_length_byte_array`, for the whole table or per column.
@@ -81,7 +83,12 @@ pyarrow read what we write.
 - Not read yet: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for fixed-length byte arrays, the
   deprecated LZ4 codec, and more than 2 GB of strings in one column chunk.
 - Decimals, Float16, durations, times and INT96 timestamps are returned as stored (raw
-  bytes or integers), not converted.
+  bytes or integers), not converted. Written back, they keep their values but lose the
+  annotation: decimals, Float16 and fixed-length binary become plain binary, times and
+  durations plain integers. INT96 columns cannot be written.
+- `Arrow.write` of rows collected out of a fixed-size list of `UInt8`
+  (`collect(tbl.col)`) produces Arrow fixed-size binary; the column as read is written as
+  a fixed-size list.
 - Of a fixed-size list of fixed-size lists only the inner size is restored.
 - The first write of a table that contains a fixed-size list takes 5–20 s (one-time
   compilation per table schema).

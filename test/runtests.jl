@@ -2735,6 +2735,26 @@ end
                    x isa Arrow.Timestamp ? x.x : x isa Union{AbstractVector, Tuple} && !(x isa Union{Base.CodeUnits, AbstractVector{UInt8}}) ? Any[canon(v) for v in x] :
                    x isa NamedTuple ? map(canon, x) : plain(x)
         @test all(isequal(canon(Tables.getcolumn(a, k)), canon(Tables.getcolumn(t, k))) for k in Tables.columnnames(t))
+        # UInt8 again as a map value and with a null element: the size survives write → read,
+        # and pyarrow sees the types it wrote
+        u8_path, u8_out = joinpath(dir, "u8.parquet"), joinpath(dir, "u8_rw.parquet")
+        if _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq
+f = pa.list_(pa.uint8(), 2)
+pq.write_table(pa.table({'mp': pa.array([[('a', [1, 2])], [], None, [('b', [3, 4]), ('c', [5, 6])]], pa.map_(pa.string(), f)),
+                         'un': pa.array([[1, 2], [3, None], [None, None], [7, 8]], f)}), '$(u8_path)')
+print('SUCCESS')""") == "SUCCESS"
+            u = read_parquet(u8_path)
+            @test fixed(inner(u.mp).entries.data.data[2]) && fixed(inner(u.un)) && eltype(eltype(u.un)) == Union{Missing, UInt8}
+            @test isequal(Any[collect(r) for r in u.un], Any[[1, 2], [3, missing], [missing, missing], [7, 8]]) && u.mp[4]["c"] == [5, 6]
+            write_parquet(u8_out, u)
+            back = read_parquet(u8_out)
+            @test eltype(back.mp) == eltype(u.mp) && eltype(back.un) == eltype(u.un)
+            @test harness_pyarrow_compare([(u8_path, u8_out)]) == ["equal"]
+            @test _run_pyarrow("import pyarrow.parquet as pq\na, b = pq.read_schema('$(u8_path)'), pq.read_schema('$(u8_out)')\nprint(a.field('un').type == b.field('un').type, a.field('mp').type == b.field('mp').type, b.field('un').type)") ==
+                  "True True fixed_size_list<element: uint8>[2]"
+        end
+
         # A fixed-size list of UInt8 stays one for pyarrow, in the Parquet file (checked with
         # the other kinds above) and in the Arrow file; Arrow.jl would declare it fixed-size binary
         arrow_file = joinpath(dir, "plain.arrow")
