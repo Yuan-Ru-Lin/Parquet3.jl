@@ -2979,7 +2979,9 @@ end
         # the construction itself: lists of the declared size read as the fixed-size list
         @test read_parquet(with_declared_size(path, [Int32[1, 2, 3], Int32[4, 5, 6]], top)).c isa P.FixedSizeListVector
         # without nulls (the dense path): too short, too long, empty
-        for lists in ([Int32[1, 2, 3], Int32[4, 5], Int32[7, 8, 9]], [Int32[1, 2, 3], Int32[4, 5, 6, 60]], [Int32[1, 2, 3], Int32[]])
+        # ... and two wrong sizes that add up to the right total, which a count alone would miss
+        for lists in ([Int32[1, 2, 3], Int32[4, 5], Int32[7, 8, 9]], [Int32[1, 2, 3], Int32[4, 5, 6, 60]], [Int32[1, 2, 3], Int32[]],
+                      [Int32[1, 2], Int32[3, 4, 5, 6], Int32[7, 8, 9]], [Int32[1, 2, 3, 4], Int32[5, 6], Int32[7, 8, 9]])
             @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, top)), ""))
         end
         # with a null list (the scatter path): the wrong size in the middle and at the end
@@ -2994,6 +2996,12 @@ end
             @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, inside)), ""))
         end
         @test length(read_parquet(with_declared_size(path, [[Int32[1, 2, 3], Int32[4, 5, 6]], Vector{Int32}[]], inside)).c) == 2
+        # inside a list without empty or null lists (the dense path): a multiple of the size is not enough
+        dense_inside = [[fsv(1, 2, 3)], [fsv(4, 5, 6)]]
+        for lists in ([[Int32[1, 2], Int32[3, 4, 5, 6]], [Int32[7, 8, 9]]], [[Int32[1, 2, 3, 4]], [Int32[5, 6]]], [[Int32[1, 2, 3]], [Int32[4, 5]]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, dense_inside)), ""))
+        end
+        @test length(read_parquet(with_declared_size(path, [[Int32[1, 2, 3], Int32[4, 5, 6]], [Int32[7, 8, 9]]], dense_inside)).c) == 2
     end
 end
 
