@@ -322,15 +322,27 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
 end
 
 """
-Open `path` for writing and run `f` on it. If `f` throws (a value that cannot be written
-turns up while the columns are shredded, say), the file is removed: no partial file is left.
+Write a whole file at `path` or nothing: `f` writes to a temporary file in the same
+directory, which replaces `path` only after `f` has returned. If `f` throws (a value that
+cannot be written turns up while the columns are shredded, say), the temporary file is
+removed and whatever was at `path` before is left as it was. Nothing is ever removed that
+this call did not create.
+
+A directory at `path`, or an existing file that is not writable, is an error before
+anything is written, as it would be when opening the file directly. An existing file
+keeps its permissions; a new one gets the usual ones for a created file.
 """
 function _write_whole_file(f, path::String)
+    isdir(path) && throw(SystemError("opening file $(repr(path))", Base.Libc.EISDIR))
+    existing = ispath(path)
+    existing && iszero(uperm(path) & 0x02) && throw(SystemError("opening file $(repr(path))", Base.Libc.EACCES))
+    temporary = tempname(dirname(abspath(path)); cleanup = false)
     try
-        open(f, path, "w")
-    catch
-        rm(path; force = true)
-        rethrow()
+        open(f, temporary, "w")
+        existing && chmod(temporary, filemode(path))
+        mv(temporary, path; force = true)
+    finally
+        rm(temporary; force = true)     # still there only if something above failed
     end
 end
 

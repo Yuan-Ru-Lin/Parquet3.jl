@@ -2997,16 +2997,63 @@ end
     end
 end
 
-@group "write_parquet leaves no partial file" begin
+@group "write_parquet writes a whole file or changes nothing" begin
+    good = (id = [1, 2], name = ["a", "b"])
+    # a null map key passes planning (the type allows it) and is only found while writing
+    bad = (id = [1, 2], m = [Dict{Union{Missing, String}, Int}("a" => 1), Dict{Union{Missing, String}, Int}(missing => 2)])
     mktempdir() do dir
-        path = joinpath(dir, "partial.parquet")
-        # a null map key passes planning (the type allows it) and is only found while writing
-        bad = (id = [1, 2], m = [Dict{Union{Missing, String}, Int}("a" => 1), Dict{Union{Missing, String}, Int}(missing => 2)])
+        path = joinpath(dir, "out.parquet")
+        only_file() = readdir(dir) == ["out.parquet"]
+
+        # a failure while writing: no file, and no temporary file either
         @test_throws ErrorException write_parquet(path, bad)
-        @test !isfile(path)
-        # a type error is found before the file is opened
+        @test isempty(readdir(dir))
+        # a type error is found before anything is touched
         @test_throws Exception write_parquet(path, (x = Any[1, "a"],))
-        @test !isfile(path)
+        @test isempty(readdir(dir))
+
+        # success, then overwriting
+        write_parquet(path, good)
+        @test only_file() && read_parquet(path).id == [1, 2]
+        write_parquet(path, (id = [3],))
+        @test only_file() && read_parquet(path).id == [3]
+        @test filemode(path) & 0o777 == filemode(touch(joinpath(dir, "plain"))) & 0o777     # the usual permissions of a new file
+        rm(joinpath(dir, "plain"))
+
+        # a failure while writing leaves the file that was there as it was
+        before = read(path)
+        @test_throws ErrorException write_parquet(path, bad)
+        @test only_file() && read(path) == before
+
+        # an existing file that is not writable: an error, and the file is still there, unchanged
+        chmod(path, 0o444)
+        @test_throws SystemError write_parquet(path, good)
+        @test only_file() && read(path) == before
+        chmod(path, 0o644)
+        # an existing file keeps its permissions when it is replaced
+        chmod(path, 0o600)
+        write_parquet(path, good)
+        @test filemode(path) & 0o777 == 0o600 && read_parquet(path).id == [1, 2]
+
+        # the path is a directory: an error, and the directory (with its content) is still there
+        sub = mkdir(joinpath(dir, "sub")); touch(joinpath(sub, "keep"))
+        @test_throws SystemError write_parquet(sub, good)
+        @test readdir(sub) == ["keep"]
+        empty_dir = mkdir(joinpath(dir, "empty"))
+        @test_throws SystemError write_parquet(empty_dir, good)
+        @test isdir(empty_dir)
+
+        # a directory that cannot be written to: an error about that, nothing created
+        locked = mkdir(joinpath(dir, "locked")); chmod(locked, 0o555)
+        try
+            @test_throws SystemError write_parquet(joinpath(locked, "x.parquet"), good)
+            @test isempty(readdir(locked))
+        finally
+            chmod(locked, 0o755)
+        end
+        # a directory that does not exist
+        @test_throws Exception write_parquet(joinpath(dir, "nowhere", "x.parquet"), good)
+        @test !ispath(joinpath(dir, "nowhere"))
     end
 end
 
