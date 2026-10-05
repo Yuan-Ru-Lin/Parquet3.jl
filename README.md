@@ -114,3 +114,15 @@ close(pf)
 - [docs/limitations.md](docs/limitations.md): known limitations.
 - [CHANGELOG.md](CHANGELOG.md): what changed in each version, including breaking changes.
 - [dev-note.md](dev-note.md): architecture and design decisions.
+
+## AI disclosure
+
+Most of the code, the tests and the documentation were written by Claude Code working under my direction. Each step of the work was approved by me.
+
+I made the design decisions, including using Arrow.jl's types as the interface, the zero-copy views for fixed-size lists and maps, how nullability is decided, and the `columns=` and `encoding` APIs.
+
+The implementation is tested:
+
+- against pyarrow as the reference: the tests compare what Parquet3 reads with what pyarrow reads, and have pyarrow read what Parquet3 writes;
+- against the Apache parquet-testing files; the few that do not read yet are listed in [docs/limitations.md](docs/limitations.md);
+- with randomly generated nested tables, checked against pyarrow in both directions.
