@@ -74,6 +74,7 @@ the first, so a null element read as 0.
 - Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT for fixed-length byte arrays; string data over 2 GB in one chunk (64-bit offsets). (The deprecated LZ4 codec was fixed on 2026-10-05: the frame header's two sizes were read in the wrong order.)
 - Other logical types: LIST-only annotation without a converted type, TIME, INT96 timestamps,
   DECIMAL (read as the raw unscaled bytes today), Float16 (two raw bytes), duration (Int64)
+- `write_parquet`: shred and encode every column before the file is opened, so that once it is open only an I/O error can occur and a failed table never touches a file that was already there. Cost: peak memory rises from about one column's shredded data plus one page to that plus the whole compressed file. It would also settle three narrow cases left as they are in `_write_whole_file` (2026-10-05): `close` in the failure branch can itself throw (a full disk) before the file is removed; `close` on the success path is outside the `try`; `realpath` is outside the `try`.
 - First-write latency for tables with a FixedSizeList (build the ARROW:schema message
   without Arrow.jl's generic writer)
 - Infer struct member types for loosely typed `NamedTuple` / `Dict` literals

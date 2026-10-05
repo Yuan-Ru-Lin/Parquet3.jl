@@ -3068,6 +3068,14 @@ end
         @test_throws SystemError write_parquet(joinpath(dir, "nowhere", "x.parquet"), good)
         @test !ispath(joinpath(dir, "nowhere"))
 
+        # a device is not a file to clean up: the error is the one from writing, and the device stays
+        if isfile("/dev/null") == false && ispath("/dev/null")
+            @test_throws "map key cannot be missing" write_parquet("/dev/null", bad)
+            @test ispath("/dev/null")
+            write_parquet("/dev/null", good)
+            @test ispath("/dev/null")
+        end
+
         # a symbolic link at the path is written through, not replaced
         if !Sys.iswindows()
             target, link = joinpath(dir, "target.parquet"), joinpath(dir, "link.parquet")

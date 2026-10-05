@@ -331,7 +331,8 @@ turns up while the columns are shredded, say), the file is removed, so that no p
 file is left. If the file cannot be opened, nothing is removed. A file that was already
 at `path` is emptied by opening it, as with any write, and is therefore gone after a
 failed write. What is removed is the file that was written: when `path` is a symbolic
-link, that is the file it points to, and the link itself stays.
+link, that is the file it points to, and the link itself stays. Only a regular file is
+removed: a device or a pipe that was written to (`/dev/null`, say) is left alone.
 """
 function _write_whole_file(f, path::String)
     io = open(path, "w")
@@ -340,7 +341,7 @@ function _write_whole_file(f, path::String)
         f(io)
     catch
         close(io)
-        rm(written; force = true)
+        isfile(written) && rm(written; force = true)     # a regular file only: never a device or a pipe
         rethrow()
     end
     close(io)
