@@ -125,6 +125,16 @@ What Parquet3 carries only because Arrow.jl lacks it, and what would go once it 
    the two workarounds that present the elements as nullable (`_concrete_view` in the
    writer, `_fixed_size_child` for `Arrow.write`).
 
+## After v0.2.0: structure (auditor, 2026-10-05, undecided)
+Suggestions from the auditor's reading of e1bfcc1. The user's ruling: they should not keep blocking v0.2; whether and when to do any of them is undecided. Nothing here is started.
+1. A seeded random round-trip test in the suite (the auditor's strongest recommendation): about 50 random nested tables, write_parquet → read_parquet, write_parquet → pyarrow, pyarrow rewrite → read_parquet, values compared through a canonical form. The v2-page bug passed the example tests and was found by such a test within minutes. Cost to watch: each new table schema with a fixed-size list pays the 5–20 s Arrow schema compilation, so keep those few. The auditor has a ~100-line script; ask for it when this is taken up.
+2. One file for fixed-size lists. The logic is in four places: `assemble_fsl_direct`, `_assemble_fsl_dense`, `_assemble_fsl_slots` in src/reader.jl; the types and Arrow conversion in src/arrays.jl; `_has_fsl` / `_schema_eltype` / `_concrete_view` in src/filewriter.jl; the UInt8 special case in both arrays.jl and filewriter.jl. The auditor's last three findings were all in this code.
+3. Inside the reader's fixed-size path: `RawNode` carries element null bits as a fake child node, detected by `!isempty(chunk.children)`; an explicit field would be clearer. `assemble_fsl_direct` looks like the `slot_rep == 0` case of `_assemble_fsl_slots` and keeps parameters from the old reader (`def_thresholds`, `nullable`); possibly mergeable, effect on the waveform path's speed unchecked.
+4. Split src/reader.jl at its seams (planning and pruning vs assembly), and move the Arrow.write bridge at the end of src/arrays.jl (`_arrow_native`, `_concat`) to its own file, so what must be rechecked on each Arrow release is in one place.
+5. Split test/runtests.jl by its existing group names, one file per group, `Pkg.test` as the only entry point. (Note from implementation: the groups are already named and independent since f1ee2b4, each run alone once, so this would be a move-only change.)
+6. Leftovers, each checked against the code on 2026-10-05 and accurate as stated: `get_leaf_columns` is used only by tests (once in src, its definition; twice in test/); `own_def_level` / `own_rep_level` on `SchemaNode` are set in filereader.jl and never read; `ReadContext` is a one-field named tuple passed through four functions; `assemble_flat_column` and `collect_page_data` are assembly code living in src/pagereader.jl and called only from src/reader.jl.
+The auditor advised leaving two things as they are: the symbol-tagged node kinds with if-chains, and the hand-written Thrift field tables.
+
 ## Small clean-ups carried over
 - [ ] `_read_leaf` scans a flat column's levels twice when its parent needs them:
       `assemble_flat_column` and then `_page_defs` (src/reader.jl). Minor; measure first.
