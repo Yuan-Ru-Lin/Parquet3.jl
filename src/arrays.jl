@@ -401,11 +401,13 @@ _concat(xs::Vector{<:Arrow.BoolVector{T}}, validity, n) where T =
 
 # Offsets of the joined list: each chunk's offsets, shifted by the items before it
 function _joined_offsets(xs, item_count)
-    offsets, shift = Int32[0], Int32(0)
+    offsets, shift = Int32[0], 0
     for x in xs
         own = x.offsets.offsets
-        append!(offsets, @view(own[2:end]) .- first(own) .+ shift)
-        shift += Int32(item_count(x))
+        # 64-bit arithmetic, then a checked conversion: more than 2^31 items in the joined
+        # array is an error here, not a wrapped offset
+        append!(offsets, Int32.(Int64.(@view(own[2:end])) .- first(own) .+ shift))
+        shift += item_count(x)
     end
     Arrow.Offsets(UInt8[], offsets)
 end
