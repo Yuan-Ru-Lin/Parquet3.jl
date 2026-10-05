@@ -1,6 +1,6 @@
 name = "Parquet3"
 uuid = "3166fecf-d40c-4933-8a20-3e0cfa208043"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Yuan-Ru Lin <yuanruleonlin@gmail.com>"]
 
 [deps]
