@@ -220,8 +220,9 @@ const ListOfStructsColumn{T, fnames, D} = NestedColumn{:list_of_structs, T, fnam
 every row as ragged lists sharing the map's offsets and validity."""
 const MapColumn{T, fnames, D} = NestedColumn{:map, T, fnames, D}
 
-"""List column whose items are fixed-size lists, at any list depth. It behaves as the list
-it wraps; the wrapper is what lets `Arrow.write` take the column without re-encoding it."""
+"""List column whose items Arrow.jl cannot take as they are: fixed-size lists, dates or naive
+timestamps, at any list depth. It behaves as the list it wraps; the wrapper is what lets
+`Arrow.write` be handed the column in Arrow's own layout."""
 const ListColumn{T, D} = NestedColumn{:list, T, (), D}
 
 ListColumn(data::AbstractVector{T}) where T = NestedColumn{:list, T, (), typeof(data)}(data)
@@ -272,21 +273,25 @@ _inner_struct(l::Arrow.List) = _inner_struct(l.data)
 _inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
-"""Whether `v` is a fixed-size list array, looking through any number of list levels."""
-_fixed_size_items(::FixedSizeListVector) = true
-_fixed_size_items(l::Arrow.List) = _fixed_size_items(l.data)
-_fixed_size_items(::Any) = false
+"""
+Whether `v`, looking through any number of list levels, is an array that has to be
+converted before Arrow.jl can write it: a fixed-size list, or dates / naive timestamps.
+"""
+_needs_arrow_conversion(::FixedSizeListVector) = true
+_needs_arrow_conversion(::Arrow.Primitive{T, Vector{S}}) where {T, S <: Union{Dates.Date, Dates.DateTime}} = true
+_needs_arrow_conversion(l::Arrow.List) = _needs_arrow_conversion(l.data)
+_needs_arrow_conversion(::Any) = false
 
 """
 Wrap an array whose elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`), or maps (`MapColumn`), so named access composes (`tbl.a.b.c`).
-A list of fixed-size lists becomes a `ListColumn`. Other arrays are returned as is.
+A list of fixed-size lists, dates or naive timestamps becomes a `ListColumn`. Other arrays are returned as is.
 """
 function _wrap_nested(v::AbstractVector)
     v isa ChainedVector && isempty(v.arrays) && return v
     chunk = _first_chunk(v)
     s = _inner_struct(chunk)
-    s === nothing && return chunk isa Arrow.List && _fixed_size_items(chunk) ? ListColumn(v) : v
+    s === nothing && return chunk isa Arrow.List && _needs_arrow_conversion(chunk) ? ListColumn(v) : v
     fnames = _struct_fnames(typeof(s))
     chunk isa Arrow.Struct ? StructColumn(v, fnames) :
     chunk isa MapVector ? MapColumn(v, fnames) : ListOfStructsColumn(v, fnames)
@@ -315,6 +320,11 @@ _arrow_native(c::NestedColumn) = _arrow_native(getfield(c, :_data))
 
 # Several row groups in one Arrow array: the chunks' buffers have to be joined
 _arrow_native(cv::ChainedVector) = _arrow_concat([_arrow_native(chunk) for chunk in cv.arrays])
+
+# Arrow stores a date as 32-bit days and a naive timestamp as milliseconds since 1970;
+# `Date` and `DateTime` are other integers. At top level Arrow.jl converts such a column
+# itself; inside a struct or a list it is handed over by us, so it is encoded here (a copy).
+_arrow_native(p::Arrow.Primitive{T, Vector{S}}) where {T, S <: Union{Dates.Date, Dates.DateTime}} = Arrow.toarrowvector(collect(p))
 
 _arrow_native(l::Arrow.List{T, O, Vector{UInt8}}) where {T, O} = l       # strings and binary
 _arrow_native(l::Arrow.List) = _list_over(l, _arrow_native(l.data))
@@ -369,6 +379,9 @@ function _struct_over(s::Arrow.Struct{T, S, fnames}, children::Tuple) where {T, 
 end
 
 Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
+# A chunked column of our own array types that Arrow.jl writes as one array (it does so
+# when the table's first column is not chunked, or is a wrapper): join the chunks
+Arrow.arrowvector(x::ChainedVector{T, A}, i, nl, fi, de, ded, meta; kw...) where {T, A <: Union{FixedSizeListVector, MapVector}} = _arrow_native(x)
 
 """
 Join Arrow.jl arrays of one type — a column's row-group chunks — into one array. Needed

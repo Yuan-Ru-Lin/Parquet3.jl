@@ -2891,6 +2891,63 @@ print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).
     end
 end
 
+@group "Arrow.write: dates inside structs and lists; chunked fixed-size lists in one batch" begin
+    P = Parquet3
+    mktempdir() do dir
+        # Dates and naive timestamps are stored differently by Arrow; inside a struct or a
+        # list they are handed over by us and have to be converted
+        dates = joinpath(dir, "dates.parquet")
+        script = """
+import pyarrow as pa, pyarrow.parquet as pq, datetime as dt
+day = lambda i: dt.date(2020, 1, i + 1)
+table = pa.table({
+    's':  pa.array([{'day': day(0), 't': dt.datetime(2020, 1, 1, 1)}, None, {'day': None, 't': dt.datetime(2020, 1, 3)}, {'day': day(3), 't': None}],
+                   pa.struct([('day', pa.date32()), ('t', pa.timestamp('ms'))])),
+    'ld': pa.array([[day(0), day(1)], [], [None, day(3)], None], pa.list_(pa.date32())),
+    'lt': pa.array([[dt.datetime(2020, 1, 1)], None, [dt.datetime(2020, 1, 2), None], []], pa.list_(pa.timestamp('ms'))),
+    'd':  pa.array([day(0), None, day(2), day(3)], pa.date32()),
+})
+pq.write_table(table, '$(dates)')
+pq.write_table(table, '$(joinpath(dir, "dates_rg.parquet"))', row_group_size=2)
+# a struct first, then chunked fixed-size lists: Arrow.jl writes the table as one batch
+chunked = pa.table({'s': pa.array([{'a': i} for i in range(6)], pa.struct([('a', pa.int64())])),
+                    'f': pa.array([[i, i + 1] for i in range(6)], pa.list_(pa.int32(), 2)),
+                    'u': pa.array([[i, i + 1] for i in range(6)], pa.list_(pa.uint8(), 2)),
+                    'm': pa.array([[('k', i)] for i in range(6)], pa.map_(pa.string(), pa.int64()))})
+pq.write_table(chunked, '$(joinpath(dir, "chunked.parquet"))', row_group_size=2)
+print('SUCCESS')"""
+        if _run_pyarrow(script) != "SUCCESS"
+            @warn "Skipping Arrow.write date fixtures: uv/pyarrow not available"
+            return
+        end
+        compare = """
+import pyarrow as pa, pyarrow.parquet as pq, sys
+norm = lambda v: {'key': norm(v[0]), 'value': norm(v[1])} if isinstance(v, tuple) else [norm(x) for x in v] if isinstance(v, list) else {k: norm(x) for k, x in v.items()} if isinstance(v, dict) else v
+a, b = pq.read_table(ARGS[0]), pa.ipc.open_file(ARGS[1]).read_all()
+print([n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.column(n).to_pylist())], ' '.join(str(b.schema.field(n).type) for n in ARGS[2:]))"""
+        for name in ("dates", "dates_rg")
+            t = read_parquet(joinpath(dir, name * ".parquet"))
+            @test t.ld isa P.ListColumn && t.lt isa P.ListColumn && t.s isa P.StructColumn
+            out = joinpath(dir, name * ".arrow")
+            Arrow.write(out, t)
+            @test _run_pyarrow("ARGS = ['$(joinpath(dir, name * ".parquet"))', '$(out)', 'd']\n" * compare) == "[] date32[day]"
+            # each nested column on its own as well
+            for k in (:s, :ld, :lt)
+                Arrow.write(out, NamedTuple{(k,)}((getproperty(t, k),)))
+                back = Arrow.Table(out)
+                @test isequal([ismissing(r) ? missing : collect(skipmissing(r isa NamedTuple ? values(r) : r)) for r in getproperty(back, k)],
+                              [ismissing(r) ? missing : collect(skipmissing(r isa NamedTuple ? values(r) : r)) for r in getproperty(t, k)])
+            end
+        end
+        t = read_parquet(joinpath(dir, "chunked.parquet"))
+        @test t.f isa P.ChainedVector && t.u isa P.ChainedVector
+        out = joinpath(dir, "chunked.arrow")
+        Arrow.write(out, t)
+        @test _run_pyarrow("ARGS = ['$(joinpath(dir, "chunked.parquet"))', '$(out)', 'f', 'u']\n" * compare) ==
+              "[] fixed_size_list<: int32 not null>[2] fixed_size_list<: uint8>[2]"
+    end
+end
+
 @group "Row group metadata" begin
     # The optional RowGroup fields, as pyarrow reports them (Thrift ids 5 and 6)
     mktempdir() do dir
