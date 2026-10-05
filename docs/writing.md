@@ -10,6 +10,8 @@ What `write_parquet` accepts and what it writes. Limits are collected in [limita
 
 Multiple row groups are not yet written.
 
+If writing fails partway (a value that cannot be written is found while the columns are processed), no partial file is left at the path. A file that was there before the call is then gone too, since writing starts by emptying it. When the path is a symbolic link, the file it points to is the one removed, and the link stays.
+
 ## Compression
 
 Pages are compressed with Snappy by default; pass `compression = :gzip`, `:brotli`, `:zstd`, `:lz4`, or `:uncompressed` to change it.
