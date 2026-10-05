@@ -92,6 +92,10 @@ A parent is rebuilt (a new header, no data) only when one of its children change
 - the `arrays` property Arrow.jl reads from every column when it splits a table whose first column is a `ChainedVector` (`Tables.partitions` of an `Arrow.Table`);
 - the positional constructors and fields of `Arrow.Primitive`, `Arrow.BoolVector`, `Arrow.List`, `Arrow.Struct`, `Arrow.FixedSizeList`, `Arrow.Map`, `Arrow.Offsets`, `Arrow.ValidityBitmap`, and of `Arrow.Table` (built field by field in `read_parquet`);
 - `Arrow.toarrowvector`, `Arrow.getmetadata`, `Arrow.tobuffer` (the schema message for `ARROW:schema`), `Arrow.FlatBuffers.getrootas` and the `Arrow.Meta` schema types (`Schema`, `Message`, `Field`, `Struct`, `List`, `LargeList`, `FixedSizeList`, `Map`, `TimeUnit`), used to read `ARROW:schema`;
+- behaviour of Arrow.jl's arrays that our types and tests rely on: indexing an `Arrow.List` returns a `SubArray` over an `Int64` range; an `Arrow.Timestamp` is one `Int64` in its field `x`; an `Arrow.Map` is read through the `key` and `value` members of its entries; that Arrow.jl converts a top-level `Date` / `DateTime` column itself but takes nested ones as handed over;
+- `SentinelArrays.ChainedVector`'s field `arrays` (the per-row-group chunks);
+- Thrift.jl internals used by the metadata reader and writer: `Thrift.julia_type`, the field `buff` of `TMemoryTransport`, and the `EOFError` a truncated header raises (the page-header reader grows its window on it);
+- `BitVector`'s field `chunks`, in Julia itself;
 - `ArrowTypes.ArrowKind` / `ArrowTypes.FixedSizeListKind` (public, listed for completeness);
 - the behaviour that a fixed-size list of exactly `UInt8` becomes fixed-size binary, which the two workarounds above depend on.
 

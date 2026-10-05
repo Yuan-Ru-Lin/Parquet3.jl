@@ -44,7 +44,7 @@ Multi-row-group files chain the per-group chunks without copying.
 
 `FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored wherever it is declared with a fixed-width element (numbers, `Bool`, dates, timestamps; a fixed-size list of strings or bytes reads as an ordinary list): at top level, as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), inside lists (`list<fixed_size_list>`, `list<struct<…>>`) and as a map value.
 
-The null bits are a type parameter of the two types (`Nothing` when the column has no null element), so a column has them only if a null element occurs in it and waveform columns without one pay nothing; both forms keep their fixed size through `write_parquet` and `Arrow.write`. `FixedSizeView{N, T}` names the views of a column whatever that parameter is.
+The null bits are a type parameter of the two types (`Nothing` when the column has no null element), so a column has them only if a null element occurs in it and waveform columns without one pay nothing; both forms keep their fixed size through `write_parquet` and `Arrow.write`. `FixedSizeView{N, T}` names the views of a column without null elements, and `FixedSizeView{N, Union{Missing, T}}` those of a column with them, whatever that parameter is.
 
 Of a fixed-size list of fixed-size lists only the inner level is restored; the outer one reads as a variable-length list.
 

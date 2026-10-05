@@ -6,7 +6,7 @@
 const PLAIN_FIXED_TYPES = Dict(INT32 => Int32, INT64 => Int64, INT96 => Int96, FLOAT => Float32, DOUBLE => Float64)
 
 """
-    decode_plain(type, data, count, type_length) -> Vector
+    decode_plain(ptype, data, count, type_length) -> Vector
 
 Decode plain-encoded values. `ptype` is a runtime value, so this branches instead of
 dispatching; fixed-width types are a reinterpreted view of the page bytes.
