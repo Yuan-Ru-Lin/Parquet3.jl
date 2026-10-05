@@ -140,7 +140,8 @@ function _build_leaf_array(leaf_values::AbstractVector{T}, leaf_nulls::BitVector
             end
             push!(offsets, Int32(length(flat)))
         end
-        BT = is_utf8 ? String : Vector{UInt8}
+        # Binary uses Arrow.jl's own element type for it, so Arrow.write accepts the array
+        BT = is_utf8 ? String : Base.CodeUnits{UInt8, String}
         ET = has_nulls ? Union{Missing,BT} : BT
         return Arrow.List{ET, Int32, Vector{UInt8}}(UInt8[], v, Arrow.Offsets(UInt8[], offsets), flat, n, meta)
     elseif ptype == BOOLEAN
@@ -192,8 +193,11 @@ Arrow.getmetadata(c::NestedColumn) = Arrow.getmetadata(_first_chunk(getfield(c, 
 Base.propertynames(::NestedColumn{kind, T, fnames}) where {kind, T, fnames} = fnames
 function Base.getproperty(c::NestedColumn{kind, T, fnames}, name::Symbol) where {kind, T, fnames}
     j = findfirst(==(name), fnames)
-    j === nothing && return getfield(c, name)
-    _child_column(getfield(c, :_data), j)
+    j === nothing || return _child_column(getfield(c, :_data), j)
+    # Arrow.jl splits a table into record batches by taking `column.arrays[i]` of every
+    # column once the first one is chunked; answer with this column's per-row-group chunks.
+    name === :arrays && return [_wrap_nested(chunk) for chunk in _chunks(getfield(c, :_data))]
+    getfield(c, name)
 end
 
 """Project field `j` out of a nested container: struct → child column, list-over-struct → ragged list."""
@@ -239,3 +243,115 @@ _struct_fnames(::Type{<:Arrow.Struct{T, S, fnames}}) where {T, S, fnames} = fnam
 
 _first_chunk(v::AbstractVector) = v
 _first_chunk(cv::ChainedVector) = first(cv.arrays)
+_chunks(v::AbstractVector) = [v]
+_chunks(cv::ChainedVector) = cv.arrays
+
+# ── Arrow.write ──────────────────────────────────────────────────────────────
+#
+# Arrow.write takes any array that is one of Arrow.jl's own types as it is, and re-encodes
+# everything else row by row. Our arrays are Arrow.jl arrays underneath, wrapped
+# (NestedColumn), or laid out the way Arrow lays them out (FixedSizeListVector, MapVector).
+# `_arrow_native` hands Arrow.jl the equivalent array of its own types over the same
+# buffers, so nothing is re-encoded.
+
+"""
+An array of Arrow.jl's own types equivalent to `x`, sharing its buffers. Arrays that
+already are one are returned as they are.
+"""
+_arrow_native(x::AbstractVector) = x
+_arrow_native(c::NestedColumn) = _arrow_native(getfield(c, :_data))
+
+# Several row groups in one Arrow array: the chunks' buffers have to be joined
+_arrow_native(cv::ChainedVector) = _arrow_concat([_arrow_native(chunk) for chunk in cv.arrays])
+
+_arrow_native(l::Arrow.List{T, O, Vector{UInt8}}) where {T, O} = l       # strings and binary
+_arrow_native(l::Arrow.List) = _list_over(l, _arrow_native(l.data))
+
+function _arrow_native(s::Arrow.Struct{T, S, fnames}) where {T, S, fnames}
+    children = map(_arrow_native, s.data)
+    all(children .=== s.data) ? s : _struct_over(s, children)
+end
+
+function _arrow_native(v::FixedSizeListVector{N, T, ET}) where {N, T, ET}
+    child = Arrow.Primitive(T, UInt8[], _validity(falses(length(v.data))), v.data, length(v.data), nothing)
+    E = Missing <: ET ? Union{Missing, NTuple{N, T}} : NTuple{N, T}
+    Arrow.FixedSizeList{E, typeof(child)}(UInt8[], _validity(v.nulls), child, v.len, nothing)
+end
+
+function _arrow_native(m::MapVector)
+    l = m.entries
+    entries = _arrow_native(l.data)
+    D = Dict{eltype(entries.data[1]), eltype(entries.data[2])}
+    Arrow.Map{Missing <: eltype(m) ? Union{Missing, D} : D, Int32, typeof(entries)}(l.validity, l.offsets, entries, l.ℓ, l.metadata)
+end
+
+"""`l` with `child` in place of its elements' array (same offsets and validity)."""
+function _list_over(l::Arrow.List{T, O}, child::AbstractVector) where {T, O}
+    child === l.data && return l
+    E = SubArray{eltype(child), 1, typeof(child), Tuple{UnitRange{Int64}}, true}
+    Arrow.List{Missing <: T ? Union{Missing, E} : E, O, typeof(child)}(l.arrow, l.validity, l.offsets, child, l.ℓ, l.metadata)
+end
+
+"""`s` with `children` in place of its members' arrays (same validity)."""
+function _struct_over(s::Arrow.Struct{T, S, fnames}, children::Tuple) where {T, S, fnames}
+    NT = NamedTuple{fnames, Tuple{map(eltype, children)...}}
+    Arrow.Struct{Missing <: T ? Union{Missing, NT} : NT, typeof(children), fnames}(s.validity, children, s.ℓ, s.metadata)
+end
+
+Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
+
+"""
+Join Arrow.jl arrays of one type — a column's row-group chunks — into one array. Needed
+when a chunked column is written as a single Arrow record batch; buffers are copied once,
+column by column, not re-encoded row by row.
+"""
+function _arrow_concat(xs::Vector)
+    length(xs) == 1 && return only(xs)
+    _concat(xs, _validity(reduce(vcat, [BitVector(!x.validity[i] for i in 1:length(x)) for x in xs])), sum(length, xs))
+end
+
+_concat(xs::Vector{<:Arrow.Primitive{T}}, validity, n) where T =
+    Arrow.Primitive(T, UInt8[], validity, reduce(vcat, [collect(x.data) for x in xs]), n, first(xs).metadata)
+
+_concat(xs::Vector{<:Arrow.BoolVector{T}}, validity, n) where T =
+    Arrow.BoolVector{T}(packed_bits(reduce(vcat, [BitVector(coalesce.(x, false)) for x in xs])), 1, validity, n, first(xs).metadata)
+
+# Offsets of the joined list: each chunk's offsets, shifted by the items before it
+function _joined_offsets(xs, item_count)
+    offsets, shift = Int32[0], Int32(0)
+    for x in xs
+        own = x.offsets.offsets
+        append!(offsets, @view(own[2:end]) .- first(own) .+ shift)
+        shift += Int32(item_count(x))
+    end
+    Arrow.Offsets(UInt8[], offsets)
+end
+_used_bytes(x) = @view x.data[first(x.offsets.offsets) + 1 : last(x.offsets.offsets)]
+
+function _concat(xs::Vector{<:Arrow.List{T, O, Vector{UInt8}}}, validity, n) where {T, O}
+    Arrow.List{T, O, Vector{UInt8}}(UInt8[], validity, _joined_offsets(xs, x -> length(_used_bytes(x))),
+                                    reduce(vcat, map(_used_bytes, xs)), n, first(xs).metadata)
+end
+
+function _concat(xs::Vector{<:Arrow.List}, validity, n)
+    child = _arrow_concat([x.data for x in xs])
+    first_list = first(xs)
+    l = typeof(first_list)(UInt8[], validity, _joined_offsets(xs, x -> length(x.data)), first_list.data, n, first_list.metadata)
+    _list_over(l, child)
+end
+
+function _concat(xs::Vector{<:Arrow.Struct}, validity, n)
+    first_struct = first(xs)
+    children = Tuple(_arrow_concat([x.data[j] for x in xs]) for j in eachindex(first_struct.data))
+    _struct_over(typeof(first_struct)(validity, first_struct.data, n, first_struct.metadata), children)
+end
+
+function _concat(xs::Vector{<:Arrow.FixedSizeList{T}}, validity, n) where T
+    child = _arrow_concat([x.data for x in xs])
+    Arrow.FixedSizeList{T, typeof(child)}(UInt8[], validity, child, n, first(xs).metadata)
+end
+
+function _concat(xs::Vector{<:Arrow.Map{T, O}}, validity, n) where {T, O}
+    entries = _arrow_concat([x.data for x in xs])
+    Arrow.Map{T, O, typeof(entries)}(validity, _joined_offsets(xs, x -> length(x.data)), entries, n, first(xs).metadata)
+end

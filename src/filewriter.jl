@@ -6,8 +6,10 @@ const CREATED_BY = "Parquet3.jl"
 const WRITER_CODECS = Dict(:uncompressed => UNCOMPRESSED, :none => UNCOMPRESSED, :snappy => SNAPPY,
                            :gzip => GZIP, :brotli => BROTLI, :zstd => ZSTD, :lz4 => LZ4_RAW)
 
-# Vector{UInt8} is a byte string; any other vector element type is a list
-_is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && T !== Vector{UInt8}
+# Vector{UInt8} and Base.CodeUnits (what a binary column reads as) are byte strings; any
+# other vector element type is a list
+_is_bytes_type(::Type{T}) where T = T === Vector{UInt8} || T <: Base.CodeUnits
+_is_list_type(::Type{T}) where T = T !== Union{} && T <: AbstractVector && !_is_bytes_type(T)
 _is_struct_type(::Type{T}) where T = T !== Union{} && T <: NamedTuple
 _is_map_type(::Type{T}) where T = T !== Union{} && T <: AbstractDict
 

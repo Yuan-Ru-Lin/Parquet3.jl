@@ -1006,12 +1006,12 @@ table = pa.table({
                     @test back.fsl isa Parquet3.FixedSizeListVector{3, Int32}
                     @test back.fslf isa Parquet3.FixedSizeListVector{2, Float64}
 
-                    # Arrow IPC round-trip of nested reader columns. A struct with a list member
-                    # and a null struct row is a known Arrow.write failure (see dev-note.md).
+                    # Arrow IPC round-trip of nested reader columns, including a struct with a
+                    # list member and a null struct row (the fuller test is "Arrow.write" below)
                     arrow_rt(col) = (io = IOBuffer(); Arrow.write(io, (c = col,)); seekstart(io);
                                      isequal(plain(Arrow.Table(io).c), plain(col)))
                     @test arrow_rt(t.ev) && arrow_rt(t.parts)
-                    @test_broken try arrow_rt(t.wf) catch; false end
+                    @test arrow_rt(t.wf)
 
                     # ARROW:schema is written only when a FixedSizeList column needs it
                     has_schema(path) = (pf = open_parquet(path); kv = pf.metadata.key_value_metadata; close(pf);
@@ -2378,6 +2378,128 @@ print('SUCCESS')""") == "SUCCESS"
             t = read_parquet(path; columns = ["id", "s.a", "l.a"])
             @test collect(t.id) == [1, 2, 3] && isequal(collect(t.s.a), [1, missing, 3]) && ismissing(t.s[2])
             @test isequal(plain(t.l), Any[Any[(a = 1,)], Any[], missing])
+        end
+    end
+end
+
+@testset "Arrow.write of what read_parquet returns" begin
+    P = Parquet3
+    # Compare through lists, structs, maps and tuples (Arrow's fixed-size list rows), reading
+    # dates and timestamps as their raw counts so that nothing is converted lossily on the way.
+    canon(v::Date) = Dates.value(v - Date(1970, 1, 1))
+    canon(v::DateTime) = Dates.value(v - DateTime(1970, 1, 1))
+    canon(v::Union{Arrow.Timestamp, Arrow.Date}) = v.x
+    canon(v) = v
+    same(a, b) = (a === missing || b === missing) ? (a === missing && b === missing) :
+        a isa AbstractDict ? (b isa AbstractDict && length(a) == length(b) && all(haskey(b, k) && same(v, b[k]) for (k, v) in a)) :
+        (a isa AbstractVector || a isa Tuple) ? (length(a) == length(b) && all(same(x, y) for (x, y) in zip(a, b))) :
+        a isa NamedTuple ? all(same(x, y) for (x, y) in zip(values(a), values(b))) : isequal(canon(a), canon(b))
+    function roundtrip(tbl)
+        io = IOBuffer(); Arrow.write(io, tbl); seekstart(io)
+        Arrow.Table(io; convert = false)
+    end
+    equal_tables(t, a) = all(same(Tables.getcolumn(t, k), Tables.getcolumn(a, k)) for k in Tables.columnnames(t))
+
+    # Every corpus file, as a whole table. Arrow has no 96-bit integer, so INT96 columns are
+    # left out (Known Limitations).
+    mktempdir() do dir
+        @testset "$label" for (label, path) in harness_corpus(dir)
+            pf = open_parquet(path)
+            writable = [name for (name, element) in zip(column_names(pf), P.build_schema_tree(pf.metadata.schema).children)
+                        if !any(leaf -> leaf.element.type == P.INT96, last.(P.get_leaf_columns(P.SchemaNode(element = element.element, children = [element]))))]
+            close(pf)
+            t = read_parquet(path; columns = writable)
+            @test equal_tables(t, roundtrip(t))
+        end
+    end
+
+    # Each wrapper, with a null at each level, from one row group and from several
+    mktempdir() do dir
+        path, out = joinpath(dir, "n.parquet"), joinpath(dir, "n.arrow")
+        M = Missing
+        V = P.FixedSizeView{2, Int32}
+        fsv(a, b) = V(Int32[a, b], 0)
+        WF = @NamedTuple{t0::Union{M, Float64}, values::Union{M, Vector{Union{M, Int32}}}, fixed::V, blob::Union{M, Vector{UInt8}}}
+        PT = @NamedTuple{pt::Union{M, Float32}, tags::Union{M, Vector{String}}}
+        n = 12
+        tbl = (
+            id   = collect(1:n),
+            # a struct with a fixed-size list (never null: pyarrow cannot write a fixed-size list under a null parent) ...
+            wf   = WF[(t0 = i % 3 == 0 ? missing : 0.5i, values = i % 5 == 0 ? missing : [i, missing][1:(i % 3)],
+                       fixed = fsv(i, -i), blob = isodd(i) ? UInt8[i] : missing) for i in 1:n],
+            # ... and a nullable struct with a list member, the shape Arrow.write used to throw on
+            wn   = Union{M, @NamedTuple{a::Union{M, Int}, v::Union{M, Vector{Union{M, Int32}}}}}[
+                       i % 4 == 0 ? missing : (a = isodd(i) ? i : missing, v = i % 5 == 0 ? missing : [i, missing][1:(i % 3)]) for i in 1:n],
+            ev   = @NamedTuple{run::Int, vertex::Union{M, @NamedTuple{x::Float64, tag::Union{M, String}}}}[
+                       (run = i, vertex = i % 3 == 0 ? missing : (x = 0.1i, tag = isodd(i) ? "v$i" : missing)) for i in 1:n],
+            parts = Union{M, Vector{Union{M, PT}}}[i % 5 == 0 ? missing : Union{M, PT}[j == 2 ? missing : (pt = j == 3 ? missing : 1f0 * j, tags = j == 1 ? missing : ["a", "b"][1:(i % 3)])
+                                                                           for j in 1:(i % 4)] for i in 1:n],
+            m    = Union{M, Dict{String, Union{M, Int}}}[i % 4 == 0 ? missing : Dict{String, Union{M, Int}}("k$j" => (j == 2 ? missing : j) for j in 1:(i % 3)) for i in 1:n],
+            lm   = [[Dict("a" => 1.5i), Dict{String, Float64}()][1:(i % 3)] for i in 1:n],
+            ll   = Union{M, Vector{Union{M, Vector{Int}}}}[i % 6 == 0 ? missing : Union{M, Vector{Int}}[j == 2 ? missing : collect(1:j) for j in 1:(i % 4)] for i in 1:n],
+            fsl  = [fsv(i, 2i) for i in 1:n],
+            blob = [isodd(i) ? UInt8[i, i + 1] : missing for i in 1:n],
+            ts   = [Arrow.Timestamp{Arrow.Meta.TimeUnit.MICROSECOND, :UTC}(1_700_000_000_000_000 + i) for i in 1:n],
+        )
+        write_parquet(path, tbl)
+        single = read_parquet(path)
+        # the same data in three row groups, rewritten by pyarrow
+        result = _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq
+pq.write_table(pq.read_table('$(path)'), '$(joinpath(dir, "multi.parquet"))', row_group_size=4)
+print(pq.ParquetFile('$(joinpath(dir, "multi.parquet"))').metadata.num_row_groups)""")
+        tables = result === nothing ? [("one row group", single)] :
+                 [("one row group", single), ("three row groups", read_parquet(joinpath(dir, "multi.parquet")))]
+        result === nothing || @test result == "3"
+
+        @testset "$label" for (label, t) in tables
+            a = roundtrip(t)
+            @test equal_tables(t, a) && equal_tables(tbl, a)
+
+            # What each column is on the Arrow side
+            chunk(col) = col isa P.ChainedVector ? first(col.arrays) : col
+            @test chunk(a.wf) isa Arrow.Struct && chunk(a.wn) isa Arrow.Struct && chunk(a.ev) isa Arrow.Struct && chunk(a.parts) isa Arrow.List
+            @test chunk(a.m) isa Arrow.Map && chunk(a.fsl) isa Arrow.FixedSizeList && chunk(a.ll) isa Arrow.List
+            @test eltype(a.blob) == Union{M, Base.CodeUnits}                 # Arrow's binary
+
+            # Each column on its own as well (a chunked column is then joined into one array)
+            @test all(same(Tables.getcolumn(t, k), Tables.getcolumn(roundtrip(NamedTuple{(k,)}((Tables.getcolumn(t, k),))), k))
+                      for k in Tables.columnnames(t))
+
+            # pyarrow reads the Arrow file and finds what it reads from the Parquet file
+            Arrow.write(out, t)
+            verdict = _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq
+a, b = pq.read_table('$(path)'), pa.ipc.open_file('$(out)').read_all()
+print([n for n in a.column_names if a.column(n).to_pylist() != b.column(n).to_pylist()])
+print(pa.types.is_struct(b.schema.field('wf').type), pa.types.is_map(b.schema.field('m').type), pa.types.is_fixed_size_list(b.schema.field('fsl').type),
+      pa.types.is_fixed_size_list(b.schema.field('wf').type.field('fixed').type), pa.types.is_binary(b.schema.field('blob').type), b.schema.field('ts').type)""")
+            if verdict !== nothing
+                @test split(verdict, '\n') == ["[]", "True True True True True timestamp[us, tz=UTC]"]
+            end
+        end
+
+        # Buffers are handed over, not copied: the Arrow arrays hold the reader's own vectors
+        native = P._arrow_native
+        @test native(single.wf).data[1].data === getfield(single.wf, :_data).data[1].data            # struct member values
+        @test native(single.wf).data[3].data.data === getfield(single.wf, :_data).data[3].data       # fixed-size list buffer in a struct
+        @test native(single.fsl).data.data === single.fsl.data                                        # top-level fixed-size list buffer
+        @test native(single.parts).offsets === getfield(single.parts, :_data).offsets                 # list offsets
+        @test native(single.m).data.data[1] === getfield(single.m, :_data).entries.data.data[1]       # map keys
+        @test native(single.id) === single.id
+
+        # A fixed-size list under a null struct (one row group only; pyarrow cannot produce the file)
+        nulled = Union{M, @NamedTuple{t0::Float64, fixed::V}}[(t0 = 0.5, fixed = fsv(1, 2)), missing, (t0 = 1.5, fixed = fsv(3, 4))]
+        write_parquet(path, (s = nulled, id = [1, 2, 3]))
+        t = read_parquet(path)
+        @test equal_tables(t, roundtrip(t)) && ismissing(roundtrip(t).s[2]) && roundtrip(t).s[3].fixed == (3, 4)
+
+        # Several row groups become several Arrow record batches when the table is written
+        if length(tables) == 2
+            multi = last(last(tables))
+            io = IOBuffer(); Arrow.write(io, multi); seekstart(io)
+            back = Arrow.Table(io; convert = false)
+            @test back.wf isa P.ChainedVector && length(back.wf.arrays) == 3 && length(back.id.arrays) == 3
         end
     end
 end

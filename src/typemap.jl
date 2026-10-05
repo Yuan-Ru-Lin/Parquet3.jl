@@ -115,7 +115,7 @@ function writer_parquet_type(::Type{T}) where T
     T === Float64 && return (DOUBLE, nothing)
     T === Bool    && return (BOOLEAN, nothing)
     T <: AbstractString && return (BYTE_ARRAY, CT_UTF8)
-    T === Vector{UInt8} && return (BYTE_ARRAY, nothing)
+    (T === Vector{UInt8} || T <: Base.CodeUnits) && return (BYTE_ARRAY, nothing)
     error("write_parquet: unsupported column eltype $T " *
           "(supported: signed and unsigned integers up to 64 bits, Float32, Float64, Bool, String, " *
           "Date, DateTime, Arrow.Timestamp, Vector{UInt8}, " *

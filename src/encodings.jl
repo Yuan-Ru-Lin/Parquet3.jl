@@ -73,7 +73,7 @@ packed_bits(bits::BitVector) = reinterpret(UInt8, bits.chunks)[1:cld(length(bits
 encode_plain(values::Vector{Bool}) = packed_bits(BitVector(values))
 
 """PLAIN-encode strings/byte arrays as 4-byte LE length + payload (inverse of decode_plain_byte_array)."""
-function encode_plain(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})
+function encode_plain(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}, Base.CodeUnits}})
     out = IOBuffer()
     for v in values
         bytes = v isa AbstractString ? codeunits(v) : v
@@ -458,7 +458,7 @@ end
 DELTA_LENGTH_BYTE_ARRAY (inverse of decode_delta_length_byte_array): all lengths,
 DELTA_BINARY_PACKED as INT32, followed by the values' bytes back to back.
 """
-function encode_delta_length_byte_array(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}}})
+function encode_delta_length_byte_array(values::AbstractVector{<:Union{AbstractString, Vector{UInt8}, Base.CodeUnits}})
     out = IOBuffer()
     write(out, encode_delta_binary_packed(Int32[sizeof(v) for v in values]))
     foreach(v -> write(out, v), values)
