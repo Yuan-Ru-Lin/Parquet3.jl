@@ -1,17 +1,16 @@
-# Minimal Arrow IPC schema parser for extracting FixedSizeList and field metadata info
+# Minimal Arrow IPC schema parser: the Arrow schema (the reader finds FixedSizeLists in it) and field metadata
 # Parses the ARROW:schema FlatBuffer from Parquet key-value metadata
 
 import Base64
 
-const _EMPTY_ARROW_SCHEMA = (schema=nothing, fsl=Dict{String,Int}(), field_meta=Dict{String,Base.ImmutableDict{String,String}}())
+const _EMPTY_ARROW_SCHEMA = (schema=nothing, field_meta=Dict{String,Base.ImmutableDict{String,String}}())
 
 """
-    parse_arrow_schema(metadata) -> (schema, fsl, field_meta)
+    parse_arrow_schema(metadata) -> (schema, field_meta)
 
-Extract the Arrow schema, FixedSizeList field sizes, and per-field custom_metadata from
+Extract the Arrow schema and per-field custom_metadata from
 the ARROW:schema Parquet metadata. Returns a named tuple with:
 - `schema::Union{Arrow.Meta.Schema,Nothing}` — the parsed Arrow schema, or nothing
-- `fsl::Dict{String,Int}` — field_name → list_size for FixedSizeList fields
 - `field_meta::Dict{String,ImmutableDict{String,String}}` — field_name → custom metadata
 """
 function parse_arrow_schema(metadata::Union{Vector{KeyValue}, Nothing})
@@ -23,17 +22,16 @@ end
 
 function _parse_arrow_schema_bytes(buf::Vector{UInt8})
     schema = Ref{Union{Arrow.Meta.Schema,Nothing}}(nothing)
-    fsl = Dict{String,Int}()
     field_meta = Dict{String,Base.ImmutableDict{String,String}}()
     try
-        _parse_arrow_schema_bytes!(schema, fsl, field_meta, buf)
+        _parse_arrow_schema_bytes!(schema, field_meta, buf)
     catch e
         @warn "Failed to parse ARROW:schema" exception=(e, catch_backtrace())
     end
-    (schema=schema[], fsl=fsl, field_meta=field_meta)
+    (schema=schema[], field_meta=field_meta)
 end
 
-function _parse_arrow_schema_bytes!(schema_ref, fsl, field_meta, buf)
+function _parse_arrow_schema_bytes!(schema_ref, field_meta, buf)
     fb_start = (length(buf) >= 8 && buf[1:4] == UInt8[0xff, 0xff, 0xff, 0xff]) ? 8 : 0
 
     msg = Arrow.FlatBuffers.getrootas(Arrow.Meta.Message, buf, fb_start)
@@ -64,9 +62,16 @@ function _parse_arrow_schema_bytes!(schema_ref, fsl, field_meta, buf)
             end
         end
 
-        # FixedSizeList detection via union type dispatch
-        t = field.type
-        t isa Arrow.Meta.FixedSizeList || continue
-        fsl[name] = Int(t.listSize)
     end
+end
+
+"""Parse Parquet key-value metadata into Arrow-compatible ImmutableDict."""
+function _parse_kv_metadata(kv::Union{Vector{KeyValue}, Nothing})
+    kv === nothing && return nothing
+    isempty(kv) && return nothing
+    d = Base.ImmutableDict(kv[1].key => something(kv[1].value, ""))
+    for i in 2:length(kv)
+        d = Base.ImmutableDict(d, kv[i].key => something(kv[i].value, ""))
+    end
+    d
 end

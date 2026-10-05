@@ -1,1 +1,5 @@
 Manifest.toml
+dev/
+testdata/
+part-0.parquet
+papers/

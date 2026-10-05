@@ -1,0 +1,8 @@
+[project]
+name = "parquet3-test-pyhelper"
+version = "0.1.0"
+description = "Python environment for Parquet3.jl's test suite: pyarrow is the reference implementation the tests compare against"
+requires-python = ">=3.11"
+dependencies = [
+    "pyarrow==23.0.0",
+]

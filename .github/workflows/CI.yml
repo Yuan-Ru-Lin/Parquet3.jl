@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+concurrency:
+  # Cancel superseded runs of the same branch or pull request
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+
+jobs:
+  test:
+    name: Julia ${{ matrix.version }} - ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.10'   # the minimum declared in Project.toml
+          - '1'      # the latest release
+        os:
+          - ubuntu-latest
+    env:
+      # A missing test dependency (uv/pyarrow, the parquet-testing submodule) fails the run
+      # instead of skipping the tests that need it.
+      PARQUET3_TEST_STRICT: "1"
+      # More than one thread, so per-row-group and per-column parallelism is exercised
+      JULIA_NUM_THREADS: "4"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true          # test/parquet-testing
+      - uses: astral-sh/setup-uv@v5  # runs pyarrow from test/pyhelper (pinned by uv.lock)
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - uses: julia-actions/julia-runtest@v1

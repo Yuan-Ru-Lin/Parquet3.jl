@@ -21,6 +21,8 @@ function read_footer(data::Vector{UInt8})::FileMetaData
 end
 
 function open_parquet(path::String)::ParquetFile
+    # Checked first: Mmap.mmap creates an empty file at a path that does not exist
+    isfile(path) || throw(SystemError("opening file $(repr(path))", Libc.ENOENT))
     data = Mmap.mmap(path)
     ParquetFile(data, path, read_footer(data))
 end
@@ -32,18 +34,13 @@ num_row_groups(pf::ParquetFile) = length(pf.metadata.row_groups)
 schema(pf::ParquetFile) = pf.metadata.schema
 metadata(pf::ParquetFile) = pf.metadata
 
-function column_names(pf::ParquetFile)::Vector{String}
-    tree = build_schema_tree(pf.metadata.schema)
-    seen = Set{String}()
-    names = String[]
-    for (path, node) in get_leaf_columns(tree)
-        name = node.max_rep_level > 0 ? path[1] : join(path, ".")
-        name in seen && continue
-        push!(seen, name)
-        push!(names, name)
-    end
-    names
-end
+"""
+    column_names(pf::ParquetFile) -> Vector{String}
+
+The file's columns as `read_parquet` returns them: the top-level fields of the schema.
+"""
+column_names(pf::ParquetFile)::Vector{String} =
+    [child.element.name for child in build_schema_tree(pf.metadata.schema).children]
 
 function build_schema_tree(schema::Vector{SchemaElement})::SchemaNode
     isempty(schema) && error("Empty schema")
@@ -82,39 +79,6 @@ function build_schema_tree(schema::Vector{SchemaElement})::SchemaNode
     first(build(1, 0, 0))
 end
 
-function find_column(root::SchemaNode, path::Vector{String})
-    node = root
-    for name in path
-        found = findfirst(c -> c.element.name == name, node.children)
-        found === nothing && return nothing
-        node = node.children[found]
-    end
-    node
-end
-
-"""
-    compute_def_thresholds(root::SchemaNode, path::Vector{String}) -> Vector{Int}
-
-Compute the definition level threshold for each repetition level.
-`thresholds[i]` is the minimum def_level at which rep_level `i` has a defined element.
-Used by nested column assembly to distinguish "empty inner list" from "null leaf value".
-"""
-function compute_def_thresholds(root::SchemaNode, path::Vector{String})
-    thresholds = Int[]
-    cum_def = 0
-    node = root
-    for name in path
-        idx = findfirst(c -> c.element.name == name, node.children)
-        idx === nothing && break
-        child = node.children[idx]
-        rt = child.element.repetition_type
-        cum_def += (rt == OPTIONAL || rt == REPEATED) ? 1 : 0
-        rt == REPEATED && push!(thresholds, cum_def)
-        node = child
-    end
-    thresholds
-end
-
 function get_leaf_columns(root::SchemaNode)
     result = Tuple{Vector{String}, SchemaNode}[]
 
@@ -134,4 +98,40 @@ function get_leaf_columns(root::SchemaNode)
         traverse(child, String[])
     end
     result
+end
+
+"""
+    schema_string(pf::ParquetFile) -> String
+
+Get a human-readable schema representation.
+"""
+function schema_string(pf::ParquetFile)::String
+    lines = String[]
+
+    function format_element(elem::SchemaElement, indent::Int)
+        parts = String[]
+        elem.repetition_type !== nothing && push!(parts, string(elem.repetition_type))
+        elem.type !== nothing && push!(parts, string(elem.type))
+        (elem.num_children !== nothing && elem.num_children > 0) && push!(parts, "group")
+        push!(parts, elem.name)
+        elem.converted_type !== nothing && push!(parts, "($(elem.converted_type))")
+        "  "^indent * join(parts, " ")
+    end
+
+    function traverse(schema, idx, indent)
+        idx > length(schema) && return idx
+        elem = schema[idx]
+        push!(lines, format_element(elem, indent))
+
+        next_idx = idx + 1
+        if elem.num_children !== nothing
+            for _ in 1:elem.num_children
+                next_idx = traverse(schema, next_idx, indent + 1)
+            end
+        end
+        next_idx
+    end
+
+    traverse(pf.metadata.schema, 1, 0)
+    join(lines, "\n")
 end
