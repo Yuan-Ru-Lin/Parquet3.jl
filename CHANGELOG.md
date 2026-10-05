@@ -73,9 +73,9 @@ pyarrow read what we write.
 
 ### Known limitations
 
-- pyarrow cannot read a file in which a fixed-size list row is null (for example a null
-  waveform); it fails with "Expected all lists to be of size=N". This is so for such files
-  from any writer. `write_parquet` writes them faithfully and `read_parquet` reads them.
+- pyarrow cannot read a file in which a fixed-size list is null (for example a null
+  waveform) or sits inside a null struct; it fails with "Expected all lists to be of
+  size=N". This is so for such files from any writer, pyarrow included. `write_parquet` writes them faithfully and `read_parquet` reads them.
 - The writer writes one row group and one page per column, with no min/max statistics and
   no dictionary encoding.
 - Not read yet: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for fixed-length byte arrays, the

@@ -228,7 +228,7 @@ A `FixedSizeListVector` is written as a plain LIST, as pyarrow does; the fixed s
 in the `ARROW:schema` key-value entry. `_arrow_schema_kv` gets that entry from Arrow.jl
 instead of building FlatBuffers by hand: it serializes a zero-row copy of the table and
 keeps the first IPC message, which is the schema. The entry is written only when the table
-has a FixedSizeList column, at top level or nested in structs/lists (`_has_fsl`): Arrow.jl compiles its schema code for each new set of column
+has a FixedSizeList column, at top level or nested in structs, lists or maps (`_has_fsl`): Arrow.jl compiles its schema code for each new set of column
 types, which adds 5–20 s to a first `write_parquet` call (measured 2026-10-03), and no
 other type we write needs it. Tables with a FixedSizeList column still pay that once per
 session and table shape.
@@ -381,7 +381,7 @@ corpus test when present and are not needed for a green run.
   - the outer level of a fixed-size list of fixed-size lists (`fixed_size_list<fixed_size_list<T>[M]>[N]` reads, and is written back, as `list<fixed_size_list<T>[M]>`);
   - a fixed-size list whose elements are not fixed-width. The rule (`_fixed_width_leaf`): the element's Julia type must be a bits type, which covers integers, floats, `Bool`, `Date`, `DateTime`, `Arrow.Timestamp` and INT96. Strings, binary, fixed-length byte arrays (so decimals and Float16, see below), structs and lists are not.
 - pyarrow reads the values of a `map<K, fixed_size_list>` as variable-length lists even from its own files; this package restores the fixed size from `ARROW:schema`.
-- pyarrow cannot read a Parquet file in which a fixed-size list is null ("Expected all lists to be of size=N but index i had size=0"), whoever wrote the file, and cannot write one either; this is a limit of pyarrow's Parquet reader, since a null list has no values in Parquet. `write_parquet` keeps the file faithful (decided 2026-10-04): it writes such columns (a null waveform, say) with the fixed size declared, and `read_parquet` reads them back, but pyarrow rejects the file. This is the one known exception to "pyarrow reads what we write". Null *elements* inside a fixed-size list are fine in both directions.
+- pyarrow cannot read a Parquet file in which a fixed-size list is null ("Expected all lists to be of size=N but index i had size=0"), whoever wrote the file, and cannot write one either; this is a limit of pyarrow's Parquet reader, since a null list has no values in Parquet. `write_parquet` keeps the file faithful (decided 2026-10-04): it writes such columns (a null waveform, say) with the fixed size declared, and `read_parquet` reads them back, but pyarrow rejects the file. The same holds when the null is on an ancestor: a null struct that has a fixed-size list member (pyarrow can write that file, cannot read it back, and cannot read our rewrite of it either, which has identical levels). This is the one known exception to "pyarrow reads what we write". Null *elements* inside a fixed-size list are fine in both directions.
 - A fixed-size list whose stored lists do not all have the declared size is not rejected: extra elements are ignored and missing ones left as zero.
 - A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.
 - Selecting only a map's keys or only its values (`columns=["m.key"]`) returns a list of one-member structs, not a map.
