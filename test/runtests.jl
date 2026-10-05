@@ -2517,3 +2517,79 @@ print(pa.types.is_struct(b.schema.field('wf').type), pa.types.is_map(b.schema.fi
         end
     end
 end
+
+@testset "FixedSizeList inside lists" begin
+    P = Parquet3
+    M = Missing
+    plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa AbstractVector ? Any[plain(v) for v in x] :
+               x isa NamedTuple ? map(plain, x) : x
+    # The array under a column, through wrappers and row-group chunks, and what is inside it
+    inner(c) = c isa P.NestedColumn ? inner(getfield(c, :_data)) : c isa P.ChainedVector ? inner(first(c.arrays)) : c
+    fixed(a) = a isa P.FixedSizeListVector
+
+    mktempdir() do dir
+        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=4"))
+            path = joinpath(dir, name)
+            _run_pyarrow(HARNESS_NESTED_FIXED_SIZE * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
+                (@warn "Skipping nested fixed-size list fixtures: uv/pyarrow not available"; break)
+            t = read_parquet(path)
+
+            # Restored wherever ARROW:schema declares it
+            @test fixed(inner(t.lf).data) && fixed(inner(t.dense).data) && fixed(inner(t.top))
+            @test fixed(inner(t.ls).data.data[2]) && t.ls isa P.ListOfStructsColumn        # list<struct<…, values: fsl>>
+            @test fixed(inner(t.sl).data[1].data) && t.sl isa P.StructColumn                # struct with a list<fsl> member
+            @test fixed(inner(t.llf).data.data)                                             # list<list<fsl>>
+            @test fixed(inner(t.mf).entries.data.data[2]) && t.mf isa P.MapColumn           # map<string, fsl>
+            # One fixed-size list inside another: the inner level is fixed, the outer reads as a list
+            @test fixed(inner(t.ff).data) && inner(t.ff) isa Arrow.List && eltype(inner(t.ff).data) == P.FixedSizeView{2, Int32}
+
+            # Rows are views of FixedSizeViews: no copy, and the fixed size is in the type
+            @test t.lf[1] isa SubArray && t.lf[1][2] isa P.FixedSizeView{3, Int32} && t.lf[1][2] == [4, 5, 6]
+            @test isempty(t.lf[2]) && ismissing(t.lf[3]) && length(t.lf[5]) == 3
+            @test t.ls[4][2].values == [7, 8, 9] && ismissing(t.ls[4][2].t0) && plain(t.ls.values[4]) == Any[Any[4, 5, 6], Any[7, 8, 9]]
+            @test plain(t.sl.hits[4]) == Any[Any[4, 5, 6], Any[7, 8, 9]] && ismissing(t.sl[5]) && ismissing(t.sl.hits[3]) && isempty(t.sl[2].hits)
+            @test isequal(plain(t.llf[5]), Any[missing, Any[Any[0, 1, 2]]]) && plain(t.llf[1]) == Any[Any[Any[1, 2, 3]], Any[]]
+            @test t.mf[4]["c"] == [7, 8, 9] && t.mf[4]["c"] isa P.FixedSizeView{3, Int32} && ismissing(t.mf[3])
+            @test plain(t.ff[2]) == Any[Any[1, 2], Any[3, 4], Any[5, 6]] && plain(t.dense[6]) == Any[Any[5, 5, 5], Any[6, 6, 6]]
+            @test isempty(loose_nodes(t))
+
+            # pyarrow reads the same values from the file it wrote. (pyarrow itself gives the
+            # map's values back as variable-length lists; the sizes here come from ARROW:schema.)
+            out = joinpath(dir, "rw_" * name)
+            write_parquet(out, t)
+            back = read_parquet(out)
+            @test all(isequal(plain(getproperty(back, k)), plain(getproperty(t, k))) && eltype(getproperty(back, k)) == eltype(getproperty(t, k))
+                      for k in propertynames(t))
+            verdict = _run_pyarrow("""
+import pyarrow.parquet as pq
+a, b = pq.read_table('$(path)'), pq.read_table('$(out)')
+print([n for n in a.column_names if a.column(n).to_pylist() != b.column(n).to_pylist()])
+print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).type], b.schema.field('ff').type)
+print(b.schema.field('lf').type, '|', b.schema.field('llf').type)""")
+            lines = split(verdict, '\n')
+            @test lines[1] == "[]"
+            # everything keeps its type except the outer level of the list-in-list, which is a known gap
+            @test lines[2] == "['ff'] list<element: fixed_size_list<element: int32>[2]>"
+            @test lines[3] == "list<element: fixed_size_list<element: int32>[3]> | list<element: list<element: fixed_size_list<element: int32>[3]>>"
+        end
+    end
+
+    # Null fixed-size lists below a list, next to empty and null lists (from our writer)
+    mktempdir() do dir
+        path = joinpath(dir, "n.parquet")
+        V = P.FixedSizeView{2, Int32}
+        fsv(a, b) = V(Int32[a, b], 0)
+        S = @NamedTuple{t0::Float64, v::Union{M, V}}
+        tbl = (
+            lf = Union{M, Vector{Union{M, V}}}[[fsv(1, 2), missing, fsv(3, 4)], missing, [], [missing], [fsv(5, 6)]],
+            ls = Vector{S}[[(t0 = 0.5, v = fsv(1, 2))], S[], [(t0 = 1.5, v = missing), (t0 = 2.5, v = fsv(3, 4))], [(t0 = 3.5, v = fsv(5, 6))], [(t0 = 4.5, v = missing)]],
+            ll = [[[fsv(1, 2)], V[]], Vector{V}[], [[fsv(3, 4), fsv(5, 6)]], [[fsv(7, 8)]], [V[], [fsv(9, 0)]]],
+        )
+        write_parquet(path, tbl)
+        t = read_parquet(path)
+        @test all(isequal(plain(getproperty(t, k)), plain(tbl[k])) for k in keys(tbl))
+        @test fixed(inner(t.lf).data) && eltype(inner(t.lf).data) == Union{M, V} && ismissing(t.lf[1][2]) && t.lf[1][3] == [3, 4]
+        @test fixed(inner(t.ll).data.data) && eltype(inner(t.ll).data.data) == V      # no nulls seen, none in the type
+        @test isempty(loose_nodes(t))
+    end
+end

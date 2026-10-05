@@ -325,10 +325,10 @@ Dense FSL assembly: when there are no nulls, page values are already contiguous.
 Copy them directly into the flat FSL buffer — no rep/def level processing needed.
 """
 function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaElement,
-                             list_size::Int; nullable::Bool=false)
+                             list_size::Int; nullable::Bool=false, num_slots::Union{Int, Nothing}=nothing)
     T = element_julia_type(ptype, leaf_annotation(elem))
-    # Count records from rep levels
-    num_records = sum(pages) do page
+    # One slot per row (counted from the rep levels), unless the caller knows the count
+    num_records = num_slots !== nothing ? num_slots : sum(pages) do page
         page.rep_levels === nothing ? page.num_values : count(==(0), page.rep_levels)
     end
 
@@ -419,10 +419,10 @@ function _read_buffers(ctx::ReadContext, rg::Union{RowGroup, Nothing}, node::Rea
         nulls = need ? _slot_nulls(levels, slot_rep, slot_def, node.def_level) : falses(length(first(children).nulls))
         return (RawNode(nothing, nulls, Int32[], children), levels)
     end
-    # A list that ARROW:schema declares fixed-size, with a primitive element and outside other lists
+    # A list that ARROW:schema declares fixed-size, with a primitive element
     child = only(node.children)
-    if slot_rep == 0 && child.kind == :leaf && node.fsl_size > 0
-        return _read_fixed_size_list(ctx, rg, node, child, node.fsl_size, want_levels)
+    if child.kind == :leaf && node.fsl_size > 0
+        return _read_fixed_size_list(ctx, rg, node, child, slot_rep, slot_def, want_levels)
     end
     raw_child, levels = _read_buffers(ctx, rg, child, node.rep_level, node.item_def, true)
     offsets, nulls = _list_structure(levels, slot_rep, slot_def, node)
@@ -500,25 +500,80 @@ function _list_structure(levels::Levels, slot_rep::Int, slot_def::Int, node::Rea
 end
 
 """
-A fixed-size list, read into one flat vector. Without nulls the page values are copied
-straight in (the dense path); otherwise they are scattered by level. It reports one level
-entry per row, since nothing above it needs to look inside.
+A fixed-size list, read into one flat vector with one slot per row, or per item of the
+enclosing list. Without nulls the page values are copied straight in (the dense path:
+every level entry is then one element, whatever the nesting); otherwise they are
+scattered by level.
+
+Nothing above the node needs to look inside it, so it reports the levels a plain leaf in
+its place would have: one entry per slot (and per empty or null enclosing list), without
+the entries that only continue a fixed-size list. Outside lists that is one entry per row.
 """
-function _read_fixed_size_list(ctx::ReadContext, rg, node::ReadNode, leaf::ReadNode, size::Int, want_levels::Bool)
+function _read_fixed_size_list(ctx::ReadContext, rg, node::ReadNode, leaf::ReadNode,
+                               slot_rep::Int, slot_def::Int, want_levels::Bool)
     pages = _read_pages_for_rg(ctx.data, rg, leaf.path, leaf.schema)
     elem = leaf.schema.element
-    max_def = leaf.def_level
-    if _fsl_no_nulls(pages, max_def)
-        column = _assemble_fsl_dense(pages, elem.type, elem, size)
-        defs = want_levels ? fill(max_def, length(column)) : nothing
-    else
-        rep, def, raw = collect_page_data(pages, max_def)
-        converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
-        column = assemble_fsl_direct(rep, def, converted, max_def, size, elem, [node.item_def];
-                                     record_null_def = node.def_level)
-        defs = want_levels ? _record_defs(rep, def) : nothing
+    size, max_def = node.fsl_size, leaf.def_level
+    dense = _fsl_no_nulls(pages, max_def)
+
+    if slot_rep == 0        # one list per row: the waveform path
+        if dense
+            column = _assemble_fsl_dense(pages, elem.type, elem, size)
+            defs = want_levels ? fill(max_def, length(column)) : nothing
+        else
+            rep, def, raw = collect_page_data(pages, max_def)
+            converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
+            column = assemble_fsl_direct(rep, def, converted, max_def, size, elem, [node.item_def];
+                                         record_null_def = node.def_level)
+            defs = want_levels ? _record_defs(rep, def) : nothing
+        end
+        return (RawNode(column, column.nulls, Int32[], RawNode[]), want_levels ? Levels(nothing, defs) : nothing)
     end
-    (RawNode(column, column.nulls, Int32[], RawNode[]), want_levels ? Levels(nothing, defs) : nothing)
+
+    # Inside a list: a slot is an item of the enclosing list
+    rep, def, raw = collect_page_data(pages, max_def)
+    column = if dense
+        _assemble_fsl_dense(pages, elem.type, elem, size; num_slots = length(def) ÷ size)
+    else
+        converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
+        _assemble_fsl_slots(rep, def, converted, size, elem, slot_rep, slot_def, node, max_def)
+    end
+    keep = rep .<= slot_rep
+    (RawNode(column, column.nulls, Int32[], RawNode[]), want_levels ? Levels(rep[keep], def[keep]) : nothing)
+end
+
+"""
+Scatter the values of a fixed-size list that sits inside another list. An entry with
+`rep <= slot_rep` starts a slot when `def >= slot_def` (below that, the enclosing list is
+empty or null and there is no slot); the slot is a null fixed-size list when
+`def < node.def_level`. Other entries are its elements, null when `def < max_def`.
+"""
+function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::SchemaElement,
+                             slot_rep::Int, slot_def::Int, node::ReadNode, max_def::Int)
+    T = element_julia_type(elem.type, leaf_annotation(elem))
+    nslots = count(i -> rep[i] <= slot_rep && def[i] >= slot_def, eachindex(def))
+    data = Vector{T}(undef, size * nslots)
+    nulls = falses(nslots)
+    slot = position = 0     # current slot; elements placed in it so far
+    value = 0
+    @inbounds for i in eachindex(def)
+        r, d = rep[i], def[i]
+        if r <= slot_rep
+            d >= slot_def || continue
+            slot += 1
+            position = 0
+            if d < node.def_level
+                nulls[slot] = true
+                fill!(@view(data[(slot - 1) * size + 1 : slot * size]), zero(T))
+                continue
+            end
+        end
+        d >= node.item_def || continue
+        position += 1
+        filled = d == max_def ? T(values[value += 1]) : zero(T)
+        position <= size && (data[(slot - 1) * size + position] = filled)
+    end
+    FixedSizeListVector{size, T, FixedSizeView{size, T}}(data, nulls, nslots)
 end
 
 """

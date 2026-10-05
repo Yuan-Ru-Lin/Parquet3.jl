@@ -236,3 +236,24 @@ function harness_compare_selections(read, path::String, selections, dir::String)
     result = _run_pyarrow("ARGS = ['$(path)', $(join(specs, ", "))]\n" * HARNESS_COMPARE_SELECTIONS)
     result === nothing ? nothing : split(result, ';')
 end
+
+# Fixed-size lists inside lists, structs and maps, and one inside another. pyarrow cannot
+# write a null fixed-size list below a list, so those come from our own writer in the tests.
+const HARNESS_NESTED_FIXED_SIZE = """
+import pyarrow as pa, pyarrow.parquet as pq
+fsl = pa.list_(pa.int32(), 3)
+st = pa.struct([('t0', pa.float64()), ('values', fsl)])
+table = pa.table({
+    'lf':  pa.array([[[1, 2, 3], [4, 5, 6]], [], None, [[7, 8, 9]], [[10, 11, 12], [13, 14, 15], [16, 17, 18]], []], type=pa.list_(fsl)),
+    'ls':  pa.array([[{'t0': 0.5, 'values': [1, 2, 3]}], [], None, [{'t0': 1.5, 'values': [4, 5, 6]}, {'t0': None, 'values': [7, 8, 9]}], [],
+                     [{'t0': 2.5, 'values': [0, 0, 1]}]], type=pa.list_(st)),
+    'sl':  pa.array([{'hits': [[1, 2, 3]], 'n': 1}, {'hits': [], 'n': 2}, {'hits': None, 'n': 3}, {'hits': [[4, 5, 6], [7, 8, 9]], 'n': 4}, None,
+                     {'hits': [[1, 1, 1]], 'n': None}], type=pa.struct([('hits', pa.list_(fsl)), ('n', pa.int64())])),
+    'llf': pa.array([[[[1, 2, 3]], []], None, [], [[[4, 5, 6], [7, 8, 9]]], [None, [[0, 1, 2]]], [[]]], type=pa.list_(pa.list_(fsl))),
+    'mf':  pa.array([[('a', [1, 2, 3])], [], None, [('b', [4, 5, 6]), ('c', [7, 8, 9])], [('d', [0, 0, 0])], []], type=pa.map_(pa.string(), fsl)),
+    'ff':  pa.array([[[i, i + 1], [i + 2, i + 3], [i + 4, i + 5]] for i in range(6)], type=pa.list_(pa.list_(pa.int32(), 2), 3)),
+    'dense': pa.array([[[i, i, i], [i + 1, i + 1, i + 1]] for i in range(6)], type=pa.list_(fsl)),
+    'top': pa.FixedSizeListArray.from_arrays(pa.array(range(18), type=pa.int32()), 3),
+    'id':  pa.array(range(6), type=pa.int64()),
+})
+"""
