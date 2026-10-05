@@ -2,75 +2,77 @@
 
 # ── FixedSizeList types ──────────────────────────────────────────────────────
 
-"""Lightweight zero-copy view into a flat array, carrying list size N in the type."""
-struct FixedSizeView{N, T} <: AbstractVector{T}
+"""
+    FixedSizeView{N, E, T, B} <: AbstractVector{E}
+
+One row of a fixed-size list column: a zero-copy view of `N` elements of the column's flat
+`Vector{T}`. `B` is the type of the element-level null bits (Arrow's validity of the list's
+child array):
+
+- `B === Nothing`: no element of the column is null, and `E === T`. The view is the flat
+  vector and an offset, and indexing is a plain load. `FixedSizeView{N, T}(parent, offset)`
+  builds one.
+- `B === BitVector`: `E === Union{Missing, T}`, and `v[j]` is `missing` where the bit is
+  set. `FixedSizeView{N, Union{Missing, T}}(parent, nulls, offset)` builds one.
+
+`FixedSizeView{N, E}` names both parameters a caller cares about; the other two follow.
+"""
+struct FixedSizeView{N, E, T, B <: Union{Nothing, BitVector}} <: AbstractVector{E}
     parent::Vector{T}
-    offset::Int  # 0-based; element j is at parent[offset + j]
+    nulls::B        # one bit per element of `parent` (true = null), or `nothing`
+    offset::Int     # 0-based; element j is at parent[offset + j]
 end
+
+FixedSizeView{N, T}(parent::Vector{T}, offset::Int) where {N, T} = FixedSizeView{N, T, T, Nothing}(parent, nothing, offset)
+FixedSizeView{N, Union{Missing, T}}(parent::Vector{T}, nulls::BitVector, offset::Int) where {N, T} =
+    FixedSizeView{N, Union{Missing, T}, T, BitVector}(parent, nulls, offset)
 
 Base.size(::FixedSizeView{N}) where N = (N,)
 Base.IndexStyle(::Type{<:FixedSizeView}) = Base.IndexLinear()
-@Base.propagate_inbounds function Base.getindex(v::FixedSizeView{N,T}, i::Int) where {N,T}
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeView{N, E, T, Nothing}, i::Int) where {N, E, T}
     @boundscheck checkbounds(v, i)
     @inbounds v.parent[v.offset + i]
 end
-
-# Tell Arrow.write this is a FixedSizeList element
-ArrowTypes.ArrowKind(::Type{FixedSizeView{N,T}}) where {N,T} = ArrowTypes.FixedSizeListKind{N,T}()
-
-"""Fixed-size list column: flat child array with fixed stride N, plus record-level nulls."""
-struct FixedSizeListVector{N, T, ET} <: AbstractVector{ET}
-    data::Vector{T}
-    nulls::BitVector    # true = record is null
-    len::Int
-end
-
-Base.size(v::FixedSizeListVector) = (v.len,)
-Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
-@Base.propagate_inbounds function Base.getindex(v::FixedSizeListVector{N,T,ET}, i::Int) where {N,T,ET}
-    @boundscheck checkbounds(v, i)
-    v.nulls[i] && return missing
-    FixedSizeView{N,T}(v.data, (i - 1) * N)
-end
-
-"""
-A `FixedSizeView` whose elements can be null: the same flat array, plus the column's
-element-level null bits (Arrow's validity of a fixed-size list's child array). `v[j]` is
-`missing` for a null element.
-"""
-struct NullableFixedSizeView{N, T} <: AbstractVector{Union{Missing, T}}
-    parent::Vector{T}
-    nulls::BitVector    # one per element of `parent`; true = null
-    offset::Int
-end
-
-Base.size(::NullableFixedSizeView{N}) where N = (N,)
-Base.IndexStyle(::Type{<:NullableFixedSizeView}) = Base.IndexLinear()
-@Base.propagate_inbounds function Base.getindex(v::NullableFixedSizeView, i::Int)
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeView{N, E, T, BitVector}, i::Int) where {N, E, T}
     @boundscheck checkbounds(v, i)
     @inbounds v.nulls[v.offset + i] ? missing : v.parent[v.offset + i]
 end
 
-ArrowTypes.ArrowKind(::Type{NullableFixedSizeView{N,T}}) where {N,T} = ArrowTypes.FixedSizeListKind{N,Union{Missing,T}}()
+# Tell Arrow.write this is a FixedSizeList element
+ArrowTypes.ArrowKind(::Type{<:FixedSizeView{N, E}}) where {N, E} = ArrowTypes.FixedSizeListKind{N, E}()
 
 """
-Fixed-size list column with null elements: `FixedSizeListVector`'s flat array and
-record-level nulls, plus one null bit per element. A column is given this type only when
-a null element occurs in it; otherwise it is a `FixedSizeListVector`.
+    FixedSizeListVector{N, T, ET, B} <: AbstractVector{ET}
+
+Fixed-size list column: one flat `Vector{T}` with stride `N`, record-level nulls, and, when
+`B === BitVector`, one null bit per element (a column has them only if a null element
+occurs in it; otherwise `B === Nothing` and the field holds `nothing`). Rows are
+`FixedSizeView`s with the same `B`.
 """
-struct NullableFixedSizeListVector{N, T, ET} <: AbstractVector{ET}
+struct FixedSizeListVector{N, T, ET, B <: Union{Nothing, BitVector}} <: AbstractVector{ET}
     data::Vector{T}
-    element_nulls::BitVector    # one per element of `data`; true = null
-    nulls::BitVector            # true = record is null
+    element_nulls::B    # one per element of `data`; true = null
+    nulls::BitVector    # true = record is null
     len::Int
 end
 
-Base.size(v::NullableFixedSizeListVector) = (v.len,)
-Base.IndexStyle(::Type{<:NullableFixedSizeListVector}) = Base.IndexLinear()
-@Base.propagate_inbounds function Base.getindex(v::NullableFixedSizeListVector{N,T}, i::Int) where {N,T}
+"""Build the column for stride `N`; `nullable` says whether a record can be null."""
+function FixedSizeListVector(N::Int, data::Vector{T}, element_nulls::B, nulls::BitVector, len::Int, nullable::Bool) where {T, B}
+    V = FixedSizeView{N, B === Nothing ? T : Union{Missing, T}, T, B}
+    FixedSizeListVector{N, T, nullable ? Union{Missing, V} : V, B}(data, element_nulls, nulls, len)
+end
+
+Base.size(v::FixedSizeListVector) = (v.len,)
+Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeListVector{N, T, ET, Nothing}, i::Int) where {N, T, ET}
     @boundscheck checkbounds(v, i)
     v.nulls[i] && return missing
-    NullableFixedSizeView{N,T}(v.data, v.element_nulls, (i - 1) * N)
+    FixedSizeView{N, T, T, Nothing}(v.data, nothing, (i - 1) * N)
+end
+@Base.propagate_inbounds function Base.getindex(v::FixedSizeListVector{N, T, ET, BitVector}, i::Int) where {N, T, ET}
+    @boundscheck checkbounds(v, i)
+    v.nulls[i] && return missing
+    FixedSizeView{N, Union{Missing, T}, T, BitVector}(v.data, v.element_nulls, (i - 1) * N)
 end
 
 # ── Map types ────────────────────────────────────────────────────────────────
@@ -271,7 +273,7 @@ _inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
 """Whether `v` is a fixed-size list array, looking through any number of list levels."""
-_fixed_size_items(::Union{FixedSizeListVector, NullableFixedSizeListVector}) = true
+_fixed_size_items(::FixedSizeListVector) = true
 _fixed_size_items(l::Arrow.List) = _fixed_size_items(l.data)
 _fixed_size_items(::Any) = false
 
@@ -341,8 +343,6 @@ function _fixed_size_over(child::AbstractVector, N::Int, nulls::BitVector, len::
 end
 
 _arrow_native(v::FixedSizeListVector{N, T, ET}) where {N, T, ET} =
-    _fixed_size_over(_fixed_size_child(v.data, nothing), N, v.nulls, v.len, Missing <: ET)
-_arrow_native(v::NullableFixedSizeListVector{N, T, ET}) where {N, T, ET} =
     _fixed_size_over(_fixed_size_child(v.data, v.element_nulls), N, v.nulls, v.len, Missing <: ET)
 
 function _arrow_native(m::MapVector)
@@ -365,7 +365,7 @@ function _struct_over(s::Arrow.Struct{T, S, fnames}, children::Tuple) where {T, 
     Arrow.Struct{Missing <: T ? Union{Missing, NT} : NT, typeof(children), fnames}(s.validity, children, s.ℓ, s.metadata)
 end
 
-Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, NullableFixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
+Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
 
 """
 Join Arrow.jl arrays of one type — a column's row-group chunks — into one array. Needed

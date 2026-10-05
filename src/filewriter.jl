@@ -189,10 +189,27 @@ _shred_stop!(node, rep::Int, def::Int) =
 function _has_fsl(::Type{FT}) where FT
     T = Base.nonmissingtype(FT)
     T === Union{} && return false
-    T <: Union{FixedSizeView, NullableFixedSizeView} && return true
+    T <: FixedSizeView && return true
     T <: NamedTuple && return isconcretetype(T) && any(_has_fsl, fieldtypes(T))
     _is_list_type(T) && _has_fsl(eltype(T))
 end
+
+"""
+Element type `FT` as Arrow.jl needs it to derive the schema: every type concrete. A column
+typed with the short name `FixedSizeView{N, E}` (a family of types, since the null-bits
+type is a parameter too) would otherwise lose its fixed size there. Lists become `Vector`s,
+which have the same schema.
+"""
+function _schema_eltype(::Type{FT}) where FT
+    _has_fsl(FT) || return FT
+    T = Base.nonmissingtype(FT)
+    S = T <: FixedSizeView ? _concrete_view(T) :
+        T <: NamedTuple ? NamedTuple{fieldnames(T), Tuple{map(_schema_eltype, fieldtypes(T))...}} :
+        Vector{_schema_eltype(eltype(T))}
+    Missing <: FT ? Union{Missing, S} : S
+end
+_concrete_view(::Type{<:FixedSizeView{N, E}}) where {N, E} =
+    Missing <: E ? FixedSizeView{N, E, Base.nonmissingtype(E), BitVector} : FixedSizeView{N, E, E, Nothing}
 
 """
 The table's Arrow schema as an `ARROW:schema` key-value entry (base64 of an IPC schema
@@ -205,7 +222,7 @@ per table type (seconds on a first call), and no other type we write needs the e
 """
 function _arrow_schema_kv(names::Vector{Symbol}, vectors::Vector)
     any(v -> _has_fsl(eltype(v)), vectors) || return nothing
-    empties = NamedTuple{Tuple(names)}(Tuple(eltype(v)[] for v in vectors))
+    empties = NamedTuple{Tuple(names)}(Tuple(_schema_eltype(eltype(v))[] for v in vectors))
     buf = take!(Arrow.tobuffer(empties))
     # Encapsulated message: 0xFFFFFFFF continuation, Int32 metadata length, metadata
     len = ltoh(reinterpret(Int32, buf[5:8])[1])

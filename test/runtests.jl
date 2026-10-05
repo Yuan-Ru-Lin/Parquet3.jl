@@ -1107,7 +1107,7 @@ table = pa.table({'wf': pa.array([{'t0': 0.5 * i, 'values': [i, i + 1, i + 2]} f
         for kwargs in ("{}", "{'row_group_size': 4}")
             _with_pyarrow_file("struct{fsl} ($kwargs)", "test_n16_src.parquet", pytable * "write_kwargs = $kwargs") do t
                 try
-                    @test eltype(t.wf.values) == Parquet3.FixedSizeView{3, Int32}
+                    @test eltype(t.wf.values) <: Parquet3.FixedSizeView{3, Int32}
                     @test t.wf[2].values == [1, 2, 3] && collect.(t.wf.values)[6] == [5, 6, 7]
 
                     write_parquet(out, t)
@@ -2223,7 +2223,7 @@ end
         ))
         t = read_parquet(path)
         @test t.fsl isa Parquet3.FixedSizeListVector{2, Int32} && collect.(t.fsl) == [[1, 2], [3, 4], [5, 6], [7, 8]]
-        @test eltype(t.wf.values) == Union{Missing, V} && ismissing(t.wf.values[2]) && t.wf.values[3] == [3, 4]
+        @test Missing <: eltype(t.wf.values) <: Union{Missing, V} && ismissing(t.wf.values[2]) && t.wf.values[3] == [3, 4]
         @test isequal(collect.(skipmissing(t.wf.tags)), [["a", missing], String[]]) && ismissing(t.wf[2]) && ismissing(t.wf[3].tags)
         @test collect(map(l -> collect.(l), t.ll)) == [[[1, 2], Int[]], Vector{Int}[], [[3]], [[4], [5, 6]]]
         @test !(Missing <: eltype(t.ll)) && !(Missing <: eltype(first(t.ll))) && eltype(first(first(t.ll))) == Int64
@@ -2547,7 +2547,7 @@ end
             @test fixed(inner(t.llf).data.data)                                             # list<list<fsl>>
             @test fixed(inner(t.mf).entries.data.data[2]) && t.mf isa P.MapColumn           # map<string, fsl>
             # One fixed-size list inside another: the inner level is fixed, the outer reads as a list
-            @test fixed(inner(t.ff).data) && inner(t.ff) isa Arrow.List && eltype(inner(t.ff).data) == P.FixedSizeView{2, Int32}
+            @test fixed(inner(t.ff).data) && inner(t.ff) isa Arrow.List && eltype(inner(t.ff).data) <: P.FixedSizeView{2, Int32}
 
             # Rows are views of FixedSizeViews: no copy, and the fixed size is in the type
             @test t.lf[1] isa SubArray && t.lf[1][2] isa P.FixedSizeView{3, Int32} && t.lf[1][2] == [4, 5, 6]
@@ -2601,8 +2601,8 @@ print(b.schema.field('lf').type, '|', b.schema.field('llf').type)""")
         write_parquet(path, tbl)
         t = read_parquet(path)
         @test all(isequal(plain(getproperty(t, k)), plain(tbl[k])) for k in keys(tbl))
-        @test fixed(inner(t.lf).data) && eltype(inner(t.lf).data) == Union{M, V} && ismissing(t.lf[1][2]) && t.lf[1][3] == [3, 4]
-        @test fixed(inner(t.ll).data.data) && eltype(inner(t.ll).data.data) == V      # no nulls seen, none in the type
+        @test fixed(inner(t.lf).data) && Missing <: eltype(inner(t.lf).data) <: Union{M, V} && ismissing(t.lf[1][2]) && t.lf[1][3] == [3, 4]
+        @test fixed(inner(t.ll).data.data) && eltype(inner(t.ll).data.data) <: V      # no nulls seen, none in the type
         @test arrow_equal(t, arrow_roundtrip(t))
         @test isempty(loose_nodes(t))
     end
@@ -2699,13 +2699,13 @@ end
             @test isequal(plain(t.bo), Any[Any[true, i == 5 ? missing : false] for i in 0:n-1])
             # Still a fixed-size list over one flat vector, of the type with element nulls in
             # every row group, though only one row group has a null
-            @test all(c -> chunks_are(P.NullableFixedSizeListVector, c), (t.top, t.st.v, t.dt, t.bo))
-            @test inner(t.li).data isa P.NullableFixedSizeListVector && t.li isa P.ListColumn
-            @test eltype(t.top) == P.NullableFixedSizeView{3, Int32} && eltype(eltype(t.top)) == Union{Missing, Int32}
-            @test t.top[6] isa P.NullableFixedSizeView{3, Int32} && ismissing(t.top[6][2]) && t.top[6][3] === Int32(7)
+            @test all(c -> chunks_are(P.FixedSizeListVector{3, Int32, <:Any, BitVector}, c) || chunks_are(P.FixedSizeListVector{2, <:Any, <:Any, BitVector}, c), (t.top, t.st.v, t.dt, t.bo))
+            @test inner(t.li).data isa P.FixedSizeListVector{3, Int32, <:Any, BitVector} && t.li isa P.ListColumn
+            @test eltype(t.top) == P.FixedSizeView{3, Union{Missing, Int32}, Int32, BitVector} && eltype(eltype(t.top)) == Union{Missing, Int32}
+            @test t.top[6] isa P.FixedSizeView{3, Union{Missing, Int32}} && ismissing(t.top[6][2]) && t.top[6][3] === Int32(7)
             @test inner(t.top).data isa Vector{Int32} && t.top[6].parent === P._chunks(t.top)[end - (name == "one.parquet" ? 0 : 1)].data
             # A column without a null element keeps the plain types
-            @test chunks_are(P.FixedSizeListVector, t.ok) && eltype(t.ok) == P.FixedSizeView{3, Int32}
+            @test chunks_are(P.FixedSizeListVector{3, Int32, <:Any, Nothing}, t.ok) && eltype(t.ok) == P.FixedSizeView{3, Int32, Int32, Nothing}
             @test isempty(loose_nodes(t))
             @test isequal(plain(read_parquet(path; columns = ["top"]).top), plain(t.top))
 
@@ -2732,15 +2732,15 @@ print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).
     # A null list and a null element are independent (from our writer: pyarrow can neither write nor read a null fixed-size list)
     mktempdir() do dir
         path = joinpath(dir, "n.parquet")
-        V = P.NullableFixedSizeView{2, Int32}
-        nv(a, b) = V(Int32[coalesce(a, 0), coalesce(b, 0)], BitVector([ismissing(a), ismissing(b)]), 0)
+        V = P.FixedSizeView{2, Union{Missing, Int32}, Int32, BitVector}
+        nv(a, b) = P.FixedSizeView{2, Union{Missing, Int32}}(Int32[coalesce(a, 0), coalesce(b, 0)], BitVector([ismissing(a), ismissing(b)]), 0)
         tbl = (top = Union{Missing, V}[nv(1, 2), missing, nv(missing, 4), nv(5, missing), nv(missing, missing)],
                li  = Union{Missing, Vector{Union{Missing, V}}}[[nv(1, missing), missing], missing, [], [nv(3, 4)], [missing, nv(missing, 6)]])
         write_parquet(path, tbl)
         t = read_parquet(path)
         @test all(isequal(plain(getproperty(t, k)), plain(tbl[k])) for k in keys(tbl))
-        @test inner(t.top) isa P.NullableFixedSizeListVector && eltype(t.top) == Union{Missing, V}
-        @test inner(t.li).data isa P.NullableFixedSizeListVector && eltype(inner(t.li).data) == Union{Missing, V}
+        @test inner(t.top) isa P.FixedSizeListVector{2, Int32, <:Any, BitVector} && eltype(t.top) == Union{Missing, V}
+        @test inner(t.li).data isa P.FixedSizeListVector{2, Int32, <:Any, BitVector} && eltype(inner(t.li).data) == Union{Missing, V}
         @test all(isequal(plain(Tables.getcolumn(arrow_roundtrip(t), k)), plain(tbl[k])) for k in keys(tbl))
 
         # Null elements alone, pyarrow reads from our file. (A null fixed-size list it cannot

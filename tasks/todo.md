@@ -13,21 +13,22 @@ Decision (the user, via the planning session): follow Arrow. An Arrow fixed-size
 validity bitmap on the list and a second one on its child; `FixedSizeListVector` has only
 the first, so a null element read as 0.
 
-- **The dense types do not change.** `FixedSizeView{N,T}` and `FixedSizeListVector{N,T,ET}`
-  keep their fields, layout and indexing. The waveform path never sees the new types.
-- **Two new types beside them** (src/arrays.jl):
-  `NullableFixedSizeListVector{N,T,ET}`: the same flat `Vector{T}`, the list-level nulls,
-  plus `element_nulls::BitVector`, one bit per element of the flat vector. No copy of the
-  values, no `Vector{Union{Missing,T}}`.
-  `NullableFixedSizeView{N,T} <: AbstractVector{Union{Missing,T}}`: the flat vector, the
-  element bitmap and an offset; `v[j]` is `missing` when the bit is set.
-  A view is (storage, offset); a shape for the v0.3 2-D idea can be added to a view type
-  later without touching this.
+- **One view type and one vector type** (the user, after a first version with two extra
+  types): the element null bits are a field whose type is a parameter,
+  `FixedSizeView{N, E, T, B}` and `FixedSizeListVector{N, T, ET, B}`. `B === Nothing` for a
+  column without a null element: a field of type `Nothing` takes no space and the null
+  check is resolved by dispatch, so the dense layout (16-byte view, 24-byte column) and the
+  machine code for indexing are what they were. `B === BitVector` otherwise, with
+  `E === Union{Missing, T}` over the same flat `Vector{T}`.
+  Four parameters on the view because Julia cannot derive a field type or a supertype from
+  another parameter: `E` (element type, for `AbstractVector{E}`), `T` (storage) and `B` all
+  have to be named. `FixedSizeView{N, E}` is the short form.
+  A view is (storage, offset); a shape for the v0.3 2-D idea can be added later.
 - **Stage 1** (per row group): the scatter path records the positions of null elements, only
   when the levels show one. The dense path cannot meet one (every level is at its maximum).
 - **Stage 2** (the wrap, across row groups): if any row group recorded a null element, every
-  chunk of the column is a `NullableFixedSizeListVector` (chunks without one get an all-false
-  bitmap); otherwise every chunk is a `FixedSizeListVector`, as today. So chunks agree.
+  chunk of the column has the bitmap (all false for a row group without one); otherwise
+  none has. So chunks agree on the type.
 - **Arrow.write**: `Arrow.FixedSizeList` over an `Arrow.Primitive` child carrying the element
   validity; buffers reused.
 - **write_parquet**: the element type is a vector of `Union{Missing,T}`, which the writer
@@ -47,8 +48,11 @@ the first, so a null element read as 0.
 - An empty list that cannot be null reads as `[]`, not `missing`.
 - UTC and sub-millisecond timestamps read as `Arrow.Timestamp`, not `DateTime`.
 - A missing file is a `SystemError`; nothing is created at the path.
-- A null element in a fixed-size list reads as `missing` (the column is then a
-  `NullableFixedSizeListVector`); it used to read as a silent 0.
+- A null element in a fixed-size list reads as `missing`; it used to read as a silent 0.
+- `FixedSizeView` and `FixedSizeListVector` have more type parameters
+  (`FixedSizeView{N, E, T, B}`, `FixedSizeListVector{N, T, ET, B}`). `FixedSizeView{N, T}`
+  and `FixedSizeListVector{N, T}` still match with `isa` / `<:` but are no longer concrete
+  types, so `eltype(col) == FixedSizeView{N, T}` is now false; use `<:`.
 - A fixed-size list of strings or binary reads as a variable-length list; without nulls it
   used to read as a `FixedSizeListVector` of strings.
 

@@ -309,8 +309,7 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
     end
 
     has_nulls = any(nulls) || nullable
-    ET = has_nulls ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
-    FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
+    FixedSizeListVector(list_size, data, nothing, nulls, num_records, has_nulls)
 end
 
 """
@@ -353,8 +352,7 @@ function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaEl
     # Convert and copy page values in bulk using a function barrier for type stability
     _fsl_dense_copy!(data, pages, ptype, leaf_annotation(elem))
 
-    ET = nullable ? Union{Missing, FixedSizeView{list_size, T}} : FixedSizeView{list_size, T}
-    FixedSizeListVector{list_size, T, ET}(data, nulls, num_records)
+    FixedSizeListVector(list_size, data, nothing, nulls, num_records, nullable)
 end
 
 """Type-stable inner loop: convert page values and copyto! into the flat buffer."""
@@ -593,7 +591,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
             element_nulls === nothing || (element_nulls[index] = true)
         end
     end
-    FixedSizeListVector{size, T, FixedSizeView{size, T}}(data, nulls, nslots)
+    FixedSizeListVector(size, data, nothing, nulls, nslots, false)
 end
 
 """
@@ -630,14 +628,10 @@ The same fixed-size list buffers with the type the whole column agreed on: wheth
 can be null, and whether an element can (then with the chunk's element null bits, all
 false for a row group that has none).
 """
-function _fixed_size_list(chunk::RawNode, column::FixedSizeListVector{N, T}, nullable::Bool, null_elements::Bool) where {N, T}
-    if !null_elements
-        ET = nullable ? Union{Missing, FixedSizeView{N, T}} : FixedSizeView{N, T}
-        return FixedSizeListVector{N, T, ET}(column.data, column.nulls, column.len)
-    end
-    element_nulls = isempty(chunk.children) ? falses(length(column.data)) : only(chunk.children).nulls
-    ET = nullable ? Union{Missing, NullableFixedSizeView{N, T}} : NullableFixedSizeView{N, T}
-    NullableFixedSizeListVector{N, T, ET}(column.data, element_nulls, column.nulls, column.len)
+function _fixed_size_list(chunk::RawNode, column::FixedSizeListVector{N}, nullable::Bool, null_elements::Bool) where N
+    element_nulls = !null_elements ? nothing :
+                    isempty(chunk.children) ? falses(length(column.data)) : only(chunk.children).nulls
+    FixedSizeListVector(N, column.data, element_nulls, column.nulls, column.len, nullable)
 end
 
 """Read one top-level column of the plan: stage 1 per row group, then stage 2."""
