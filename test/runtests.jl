@@ -1818,10 +1818,7 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
                                                  "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
     # malformed (a required column whose pages contain nulls); pyarrow rejects it as well
     "fixed_length_byte_array.parquet" => ["flba_field"],
-    "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
-    "hadoop_lz4_compressed_larger.parquet" => ["a"],
     "large_string_map.brotli.parquet" => ["arr"],
-    "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
 )
 
 if HAS_PARQUET_TESTING
@@ -1947,6 +1944,22 @@ if HAS_PARQUET_TESTING
             @test length(Tables.columnnames(t)) == 3
             @test t.c0 == [1593604800, 1593604800, 1593604801, 1593604801]
             @test t.v11 ≈ [42.0, 7.7, 42.125, 7.7]
+        end
+
+        # The deprecated LZ4 codec: Hadoop's frames ([uncompressed size][compressed size][block]),
+        # and a single raw block under the same codec id. Same data as lz4_raw_compressed.
+        @testset "deprecated LZ4 codec: $f" for f in ("hadoop_lz4_compressed.parquet", "non_hadoop_lz4_compressed.parquet")
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, f))
+            raw = read_parquet(joinpath(PARQUET_TESTING_DIR, "lz4_raw_compressed.parquet"))
+            @test t.c0 == [1593604800, 1593604800, 1593604801, 1593604801]
+            @test t.v11 ≈ [42.0, 7.7, 42.125, 7.7]
+            @test all(isequal(collect(getproperty(t, k)), collect(getproperty(raw, k))) for k in propertynames(raw))
+        end
+
+        @testset "hadoop_lz4_compressed_larger" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "hadoop_lz4_compressed_larger.parquet"))
+            raw = read_parquet(joinpath(PARQUET_TESTING_DIR, "lz4_raw_compressed_larger.parquet"))
+            @test length(t.a) == 10000 && t.a == raw.a
         end
 
         @testset "lz4_raw_compressed_larger" begin

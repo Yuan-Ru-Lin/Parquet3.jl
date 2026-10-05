@@ -71,8 +71,7 @@ the first, so a null element read as 0.
   `encoding` name today, and the bit-packed run encoder is not written. Needs: dictionary
   page, index page, `dictionary_page_offset`, bit-packed runs in `encode_rle_bitpacked`;
   no size-based fallback to PLAIN (record as a limitation).
-- Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT beyond FLOAT/DOUBLE; the deprecated LZ4
-  codec; string data over 2 GB in one chunk (64-bit offsets)
+- Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT for fixed-length byte arrays; string data over 2 GB in one chunk (64-bit offsets). (The deprecated LZ4 codec was fixed on 2026-10-05: the frame header's two sizes were read in the wrong order.)
 - Other logical types: LIST-only annotation without a converted type, TIME, INT96 timestamps,
   DECIMAL (read as the raw unscaled bytes today), Float16 (two raw bytes), duration (Int64)
 - First-write latency for tables with a FixedSizeList (build the ARROW:schema message

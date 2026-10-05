@@ -23,7 +23,7 @@ All codecs go through [ChunkCodecs.jl](https://github.com/JuliaIO/ChunkCodecs.jl
 | Brotli | yes | `:brotli` | ChunkCodecLibBrotli |
 | Zstd | yes | `:zstd` | ChunkCodecLibZstd |
 | LZ4 (raw) | yes | `:lz4` | ChunkCodecLibLz4 |
-| LZ4 (deprecated codec id) | not working yet (the parquet-testing files fail; see [limitations.md](limitations.md)) | no | Custom Hadoop framing around ChunkCodecLibLz4 blocks |
+| LZ4 (deprecated codec id) | yes, in Hadoop's framing and as a single raw block | no | Custom Hadoop framing around ChunkCodecLibLz4 blocks |
 
 ## Encodings
 
