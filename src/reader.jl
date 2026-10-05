@@ -273,7 +273,8 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
         def = all_def[i]
 
         if rep == 0
-            # New record
+            # New record; the one before it must have had exactly `list_size` elements
+            record_idx > 0 && !nulls[record_idx] && slot_idx != list_size && _fsl_size_error(list_size, slot_idx)
             record_idx += 1
             slot_idx = 0
             base = (record_idx - 1) * list_size
@@ -294,20 +295,19 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
 
         if def == max_def
             slot_idx += 1
-            if slot_idx <= list_size
-                data[base + slot_idx] = convert(T, values[value_idx])
-            end
+            slot_idx <= list_size || _fsl_size_error(list_size, "has more than $list_size elements in a list")
+            data[base + slot_idx] = convert(T, values[value_idx])
             value_idx += 1
         elseif def >= inner_threshold
             # Null leaf value
             slot_idx += 1
-            if slot_idx <= list_size
-                data[base + slot_idx] = _blank(T)
-                element_nulls === nothing || (element_nulls[base + slot_idx] = true)
-            end
+            slot_idx <= list_size || _fsl_size_error(list_size, "has more than $list_size elements in a list")
+            data[base + slot_idx] = _blank(T)
+            element_nulls === nothing || (element_nulls[base + slot_idx] = true)
         end
     end
 
+    record_idx > 0 && !nulls[record_idx] && slot_idx != list_size && _fsl_size_error(list_size, slot_idx)
     has_nulls = any(nulls) || nullable
     FixedSizeListVector(list_size, data, nothing, nulls, num_records, has_nulls)
 end
@@ -320,6 +320,25 @@ are read as bytes) are not; such a list is read as an ordinary list.
 """
 _fixed_width_leaf(node::ReadNode) = node.kind == :leaf &&
     isbitstype(element_julia_type(node.schema.element.type, leaf_annotation(node.schema.element)))
+
+"""A stored list whose length is not the fixed size the file declares: the file is malformed."""
+_fsl_size_error(size::Int, found) =
+    error("a list declared fixed_size_list[$size] in ARROW:schema " * (found isa Integer ? "has $found elements" : found) * "; the file is malformed")
+
+"""
+Check, for a fixed-size list column without nulls, that every list has exactly `size`
+elements: among the level entries, a list starts at every `size`-th one and nowhere else.
+`starts(level)` says whether an entry starts a list. `position` is the number of entries
+before `levels` (a column chunk can span pages). With `counted = true` the caller has
+already established that the number of starts is the number of entries divided by `size`,
+and only the strided pass runs: one entry per list.
+"""
+function _check_fsl_starts(starts, levels::AbstractVector, size::Int, position::Int; counted::Bool = false)
+    first_start = mod(-position, size) + 1
+    (counted || count(starts, levels) == length(first_start:size:length(levels))) && all(starts, @view levels[first_start:size:end]) ||
+        _fsl_size_error(size, "does not have $size elements in every list")
+    nothing
+end
 
 """The value stored under a null in a fixed-size list's flat vector: all bits zero."""
 _blank(::Type{T}) where T = reinterpret(T, ntuple(_ -> 0x00, sizeof(T)))
@@ -346,6 +365,20 @@ function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaEl
         page.rep_levels === nothing ? page.num_values : count(==(0), page.rep_levels)
     end
 
+    # Without nulls every stored value is an element: the count must match, and (one list
+    # per row, checked here; inside a list the caller checks) a row must start every
+    # `list_size` values and nowhere else. `num_records` is the number of row starts, so
+    # with the count matching it is enough that every `list_size`-th entry is a start.
+    stored = sum(page -> length(page.values), pages; init = 0)
+    stored == list_size * num_records || _fsl_size_error(list_size, "does not have $list_size elements in every list")
+    if num_slots === nothing
+        position = 0
+        for page in pages
+            page.rep_levels === nothing && continue
+            _check_fsl_starts(iszero, page.rep_levels, list_size, position; counted = true)
+            position += length(page.rep_levels)
+        end
+    end
     data = Vector{T}(undef, list_size * num_records)
     nulls = falses(num_records)
 
@@ -474,7 +507,7 @@ function _scatter_leaf(values::AbstractVector{T}, def::Vector{Int}, slot_def::In
         if d == max_def
             out[slot] = values[value += 1]
         else
-            nulls[slot] = true      # the slot's value is never read
+            nulls[slot] = true      # the slot keeps whatever the memory held; readers mask it with `nulls`
         end
     end
     (out, nulls)
@@ -528,7 +561,10 @@ function _read_fixed_size_list(ctx::ReadContext, rg, node::ReadNode, leaf::ReadN
     elem = leaf.schema.element
     size, max_def = node.fsl_size, leaf.def_level
     if _fsl_no_nulls(pages, max_def)
-        slot_rep == 0 || ((rep, def, _) = collect_page_data(pages, max_def))
+        if slot_rep > 0
+            rep, def, _ = collect_page_data(pages, max_def)
+            _check_fsl_starts(<=(slot_rep), rep, size, 0)
+        end
         column = _assemble_fsl_dense(pages, elem.type, elem, size; num_slots = slot_rep == 0 ? nothing : length(def) ÷ size)
         element_nulls = nothing
         defs = slot_rep == 0 && want_levels ? fill(max_def, length(column)) : nothing
@@ -572,6 +608,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
         r, d = rep[i], def[i]
         if r <= slot_rep
             d >= slot_def || continue
+            slot > 0 && !nulls[slot] && position != size && _fsl_size_error(size, position)
             slot += 1
             position = 0
             if d < node.def_level
@@ -582,7 +619,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
         end
         d >= node.item_def || continue
         position += 1
-        position <= size || (d == max_def && (value += 1); continue)
+        position <= size || _fsl_size_error(size, "has more than $size elements in a list")
         index = (slot - 1) * size + position
         if d == max_def
             data[index] = convert(T, values[value += 1])
@@ -591,6 +628,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
             element_nulls === nothing || (element_nulls[index] = true)
         end
     end
+    slot > 0 && !nulls[slot] && position != size && _fsl_size_error(size, position)
     FixedSizeListVector(size, data, nothing, nulls, nslots, false)
 end
 

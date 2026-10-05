@@ -94,7 +94,7 @@ close(pf)
 |---|---|---|
 | Nested types | Any nesting of lists, structs and maps is read, to any depth; fixed-size lists (waveforms) come back as zero-copy views, under the rules in the details | [Returned types](docs/reading.md#returned-types) |
 | Written column types | Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp`, `Vector{UInt8}`, and lists, structs and maps of these nested to any depth, with `Missing` at every level | [Column types and nesting](docs/writing.md#column-types-and-nesting) |
-| Compression | Snappy, Gzip, Brotli, Zstd and LZ4 (raw), read and written | [Compression](docs/writing.md#compression) |
+| Compression | Snappy, Gzip, Brotli, Zstd and LZ4 (raw), read and written; the deprecated LZ4 codec is read | [Compression](docs/writing.md#compression) |
 | Encodings read | Plain, RLE/Bit-Packed, Dictionary, Delta Binary Packed, Delta Length Byte Array, Byte Stream Split (float, double, int32, int64) | [Encodings read](docs/reading.md#encodings-read) |
 | Encodings written | PLAIN (default), BYTE_STREAM_SPLIT, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY | [Encodings](docs/writing.md#encodings) |
 | Logical types | UTF8, Date, Int8/16/32/64, UInt8/16/32/64, and timestamps with their unit and UTC flag | [Logical types](docs/reading.md#logical-types) |

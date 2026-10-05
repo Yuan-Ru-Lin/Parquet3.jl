@@ -1,4 +1,4 @@
-# Parquet file writer (flat, list, and struct columns, arbitrarily nested; one row group)
+# Parquet file writer (flat, list, struct and map columns, arbitrarily nested; one row group)
 
 const CREATED_BY = "Parquet3.jl"
 
@@ -248,6 +248,10 @@ in a single row group.
 its unit (milli-, micro-, or nanoseconds) and is written as UTC-adjusted unless `TZ`
 is `nothing`, so a timestamp column from `read_parquet` writes back unchanged.
 
+If writing fails partway, no partial file is left at `path`; a file that was there before
+the call is then gone too, since writing starts by emptying it. (Through a symbolic
+link, the file it points to is the one removed; the link stays.)
+
 `compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:brotli`, `:zstd`, `:lz4`,
 or `:uncompressed`; a string is accepted too.
 
@@ -276,7 +280,7 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
     nodes = [_plan_node(String(name), eltype(col), String[], 0, 0) for (name, col) in zip(names, vectors)]
     leaf_encodings = Iterators.Stateful(_leaf_encodings(encoding, reduce(vcat, [node.leaves for node in nodes])))
 
-    open(path, "w") do io
+    _write_whole_file(path) do io
         write(io, PARQUET_MAGIC)
 
         schema = [SchemaElement(name = "schema", num_children = Int32(length(names)))]
@@ -319,6 +323,28 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
         write(io, PARQUET_MAGIC)
     end
     path
+end
+
+"""
+Open `path` for writing and run `f` on it. If `f` throws (a value that cannot be written
+turns up while the columns are shredded, say), the file is removed, so that no partial
+file is left. If the file cannot be opened, nothing is removed. A file that was already
+at `path` is emptied by opening it, as with any write, and is therefore gone after a
+failed write. What is removed is the file that was written: when `path` is a symbolic
+link, that is the file it points to, and the link itself stays. Only a regular file is
+removed: a device or a pipe that was written to (`/dev/null`, say) is left alone.
+"""
+function _write_whole_file(f, path::String)
+    io = open(path, "w")
+    written = realpath(path)        # the file itself, also when `path` is a link to it
+    try
+        f(io)
+    catch
+        close(io)
+        isfile(written) && rm(written; force = true)     # a regular file only: never a device or a pipe
+        rethrow()
+    end
+    close(io)
 end
 
 """

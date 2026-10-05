@@ -12,8 +12,8 @@ Parquet3 now reads every nested shape Parquet can hold and writes Parquet files.
 - `columns=` selects by the path you would use to reach the data: `"id"`, `"wf.values"`, `"particles.pt"`, `"m.key"`.
 - Element types say exactly where nulls occur: a column, member or element admits `Missing` only if the data has a null there.
 - Timestamps keep their unit and UTC flag. Naive millisecond timestamps are `DateTime`; everything else is an `Arrow.Timestamp`, exact to the nanosecond.
-- More encodings and layouts: DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT (float, double, int32, int64), RLE booleans, data page v2 edge cases, legacy list layouts. 55 of the 64 Apache parquet-testing files read in full.
-- Compression: Snappy, Gzip, Brotli, Zstd and LZ4 (the raw codec; the deprecated LZ4 codec does not work yet).
+- More encodings and layouts: DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY, BYTE_STREAM_SPLIT (float, double, int32, int64), RLE booleans, data page v2 edge cases, legacy list layouts. 58 of the 64 Apache parquet-testing files read in full.
+- Compression: Snappy, Gzip, Brotli, Zstd and LZ4 (the raw codec, and the deprecated LZ4 codec for reading).
 
 ### Writing (new)
 
@@ -40,13 +40,14 @@ Parquet3 now reads every nested shape Parquet can hold and writes Parquet files.
   - A null element reads as `missing`; it used to read as 0.
   - `FixedSizeView` and `FixedSizeListVector` have more type parameters. `x isa FixedSizeView{N, T}` and `col isa FixedSizeListVector{N, T}` still work, but `FixedSizeView{N, T}` is no longer a concrete type, so `eltype(col) == FixedSizeView{N, T}` is now false; use `<:`.
   - A fixed-size list of strings or bytes reads as an ordinary list.
+- **Lists of dates.** A list column whose elements are dates, naive timestamps (`DateTime`) or fixed-length byte arrays is returned as a `ListColumn`, a wrapper that indexes like the `Arrow.List` inside it. Code that tests `col isa Arrow.List` needs to allow for it.
 - **A missing file** is a `SystemError`, and nothing is created at the path.
 
 ### Known limitations
 
 - pyarrow cannot read a file in which a fixed-size list is null (for example a null waveform) or sits inside a null struct; it fails with "Expected all lists to be of size=N". This is so for such files from any writer, pyarrow included. `write_parquet` writes them faithfully and `read_parquet` reads them.
 - The writer writes one row group and one page per column, with no min/max statistics and no dictionary encoding.
-- Not read yet: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for fixed-length byte arrays, the deprecated LZ4 codec, and more than 2 GB of strings in one column chunk.
+- Not read yet: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for fixed-length byte arrays, and more than 2 GB of strings in one column chunk.
 - Decimals, Float16, durations, times and INT96 timestamps are returned as stored (raw bytes or integers), not converted. Written back, they keep their values but lose the annotation: decimals, Float16 and fixed-length binary become plain binary, times and durations plain integers. INT96 columns cannot be written.
 - `Arrow.write` of rows collected out of a fixed-size list of `UInt8` (`collect(tbl.col)`) produces Arrow fixed-size binary; the column as read is written as a fixed-size list.
 - Of a fixed-size list of fixed-size lists only the inner size is restored.

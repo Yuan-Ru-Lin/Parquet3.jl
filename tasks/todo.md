@@ -71,10 +71,10 @@ the first, so a null element read as 0.
   `encoding` name today, and the bit-packed run encoder is not written. Needs: dictionary
   page, index page, `dictionary_page_offset`, bit-packed runs in `encode_rle_bitpacked`;
   no size-based fallback to PLAIN (record as a limitation).
-- Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT beyond FLOAT/DOUBLE; the deprecated LZ4
-  codec; string data over 2 GB in one chunk (64-bit offsets)
+- Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT for fixed-length byte arrays; string data over 2 GB in one chunk (64-bit offsets). (The deprecated LZ4 codec was fixed on 2026-10-05: the frame header's two sizes were read in the wrong order.)
 - Other logical types: LIST-only annotation without a converted type, TIME, INT96 timestamps,
   DECIMAL (read as the raw unscaled bytes today), Float16 (two raw bytes), duration (Int64)
+- `write_parquet`: shred and encode every column before the file is opened, so that once it is open only an I/O error can occur and a failed table never touches a file that was already there. Cost: peak memory rises from about one column's shredded data plus one page to that plus the whole compressed file. It would also settle three narrow cases left as they are in `_write_whole_file` (2026-10-05): `close` in the failure branch can itself throw (a full disk) before the file is removed; `close` on the success path is outside the `try`; `realpath` is outside the `try`.
 - First-write latency for tables with a FixedSizeList (build the ARROW:schema message
   without Arrow.jl's generic writer)
 - Infer struct member types for loosely typed `NamedTuple` / `Dict` literals
@@ -140,6 +140,9 @@ Suggestions from the auditor's reading of e1bfcc1. The user's ruling: they shoul
 4. Split src/reader.jl at its seams (planning and pruning vs assembly), and move the Arrow.write bridge at the end of src/arrays.jl (`_arrow_native`, `_concat`) to its own file, so what must be rechecked on each Arrow release is in one place.
 5. Split test/runtests.jl by its existing group names, one file per group, `Pkg.test` as the only entry point. (Note from implementation: the groups are already named and independent since f1ee2b4, each run alone once, so this would be a move-only change.)
 6. Leftovers, each checked against the code on 2026-10-05 and accurate as stated: `get_leaf_columns` is used only by tests (once in src, its definition; twice in test/); `own_def_level` / `own_rep_level` on `SchemaNode` are set in filereader.jl and never read; `ReadContext` is a one-field named tuple passed through four functions; `assemble_flat_column` and `collect_page_data` are assembly code living in src/pagereader.jl and called only from src/reader.jl.
+7. From the reading-guide agent's pass over src/ at 6022cac (2026-10-05), not acted on: `_key_covers` is defined in src/filewriter.jl but also used by src/reader.jl (it belongs with the plan, or in a shared place); a local named `keys` shadows `Base.keys`; `path::String` arguments where a path type would be more usual; the vestigial parameters of `assemble_fsl_direct` (already in item 3).
+8. Field metadata of a fixed-size list column is dropped on read (`Arrow.getmetadata(col)` is `nothing` though the file has it; other column kinds keep it), because `FixedSizeListVector` has no metadata field; and the `Arrow.arrowvector` method for our types ignores its `meta` argument, so `colmetadata=` in `Arrow.write` has no effect on wrapper, fixed-size list and map columns. Reproduced 2026-10-05; not fixed, since carrying metadata means a new field on the dense type.
+9. Corrupt or truncated pages: the `@inbounds` loops trust the count the decoders return (`decode_rle_bitpacked` can return fewer values than asked, `decode_delta_binary_packed` an unassigned tail). The cheapest sound guard is one length check per page after `decode_values` in `read_page` (`length(values) == non_null`, else an error), which is outside the per-value loops; a truncated delta block needs its own check inside the decoder. Not added yet: reported for a decision.
 The auditor advised leaving two things as they are: the symbol-tagged node kinds with if-chains, and the hand-written Thrift field tables.
 
 ## Small clean-ups carried over
