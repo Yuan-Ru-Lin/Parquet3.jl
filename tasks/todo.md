@@ -48,11 +48,16 @@ the first, so a null element read as 0.
 - An empty list that cannot be null reads as `[]`, not `missing`.
 - UTC and sub-millisecond timestamps read as `Arrow.Timestamp`, not `DateTime`.
 - A missing file is a `SystemError`; nothing is created at the path.
+- Also for the changelog (not a break): pyarrow cannot read a file in which a fixed-size
+  list row is null; `write_parquet` still writes it faithfully.
 - A null element in a fixed-size list reads as `missing`; it used to read as a silent 0.
 - `FixedSizeView` and `FixedSizeListVector` have more type parameters
   (`FixedSizeView{N, E, T, B}`, `FixedSizeListVector{N, T, ET, B}`). `FixedSizeView{N, T}`
   and `FixedSizeListVector{N, T}` still match with `isa` / `<:` but are no longer concrete
-  types, so `eltype(col) == FixedSizeView{N, T}` is now false; use `<:`.
+  types. What stops working: `eltype(col) == FixedSizeView{N, T}` (now false; use `<:`) and
+  any dispatch or field typed on the two-parameter name expecting a concrete type. What
+  still works: `x isa FixedSizeView{N, T}`, `col isa FixedSizeListVector{N, T}`, `<:`, the
+  constructor `FixedSizeView{N, T}(parent, offset)`, and writing a column typed with it.
 - A fixed-size list of strings or binary reads as a variable-length list; without nulls it
   used to read as a `FixedSizeListVector` of strings.
 
@@ -80,6 +85,20 @@ the first, so a null element read as 0.
 Done since this list was first written, no longer v0.3: nullability from decoded levels
 (shipped with the recursive reader); every nested shape and maps; member selection.
 
+
+## Test speed (closed 2026-10-04)
+- Slimming the two slow groups: closed without changes; the measurements are the result.
+  The suite takes about 12 min and is compile-bound. "Arrow.write of what read_parquet
+  returns" (3 min 10 s): in its corpus loop, 145 s, Arrow.jl compiling its writer per
+  schema takes 74 s, the comparison 36 s, reading 22 s. "Writer" (2 min 04 s): the
+  read → write round-trip of two table types takes 33 s, the other 18 sub-groups 0.1–12 s.
+  The heavy parts already use one many-column table per schema. A non-specialised
+  comparison helper was slower (part-0: 3 s → 45 s). `-O0` cut the loop from 145 s to 80 s
+  but was ruled out, as was dropping cases.
+- [x] Selective runs instead: `Pkg.test(test_args=[…])`, see dev-note "Running tests".
+      Working rule: selective runs while iterating, the full suite before every commit.
+- [x] Benchmark gate lightened and written down: dev-note "Benchmark gate",
+      `test/benchmark_part0.jl`.
 
 ## Upstream to Arrow.jl (not tied to a Parquet3 version)
 Parquet3 builds its own Arrow array types, which means implementing Arrow.jl's internal

@@ -4,7 +4,26 @@ using Arrow
 using Tables
 using Dates
 
-@testset "Parquet3.jl" begin
+# Selective runs: `Pkg.test(test_args=["FixedSizeList", "Writer"])` runs only the groups
+# whose name contains one of the arguments (case-insensitive); without arguments every
+# group runs. A group is a top-level `@group "name" begin … end`, which is a `@testset`
+# when selected. Groups do not depend on each other; shared helpers are at top level.
+const GROUP_FILTERS = lowercase.(ARGS)
+const GROUPS_RUN, GROUPS_SKIPPED = String[], String[]
+group_selected(name) = isempty(GROUP_FILTERS) || any(f -> occursin(f, lowercase(name)), GROUP_FILTERS)
+
+macro group(name, body)
+    esc(quote
+        if group_selected($name)
+            push!(GROUPS_RUN, $name)
+            @testset $name $body
+        else
+            push!(GROUPS_SKIPPED, $name)
+        end
+    end)
+end
+
+@group "Parquet3.jl" begin
 
     @testset "Plain Encoding" begin
         data = collect(reinterpret(UInt8, Int32[1, 2, 3, 4, 5]))
@@ -157,7 +176,7 @@ function _with_pyarrow_file(test_fn::Function, label::String, filename::String, 
     end
 end
 
-@testset "Real Parquet File" begin
+@group "Real Parquet File" begin
     _with_pyarrow_file("real parquet file", "test.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 table = pa.table({
@@ -173,14 +192,14 @@ table = pa.table({
     end
 end
 
-@testset "Missing file" begin
+@group "Missing file" begin
     path = joinpath(mktempdir(), "nope.parquet")
     @test_throws "No such file or directory" read_parquet(path)
     @test_throws SystemError open_parquet(path)
     @test !ispath(path)        # and nothing is created there
 end
 
-@testset "column_names matches read_parquet keys" begin
+@group "column_names matches read_parquet keys" begin
     _with_pyarrow_file("column_names consistency", "test_colnames.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 table = pa.table({
@@ -196,7 +215,7 @@ table = pa.table({
     end
 end
 
-@testset "Nested Data (Lists)" begin
+@group "Nested Data (Lists)" begin
     _with_pyarrow_file("nested data (lists)", "test_nested.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 table = pa.table({
@@ -224,7 +243,7 @@ table = pa.table({
     end
 end
 
-@testset "Deeply Nested Data (List<List<Int>>)" begin
+@group "Deeply Nested Data (List<List<Int>>)" begin
     _with_pyarrow_file("deeply nested data (List<List<Int>>)", "test_deep_nested.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 data = [
@@ -257,7 +276,7 @@ table = pa.table({
     end
 end
 
-@testset "Compression Codecs" begin
+@group "Compression Codecs" begin
     pyscript = """
 import pyarrow as pa, pyarrow.parquet as pq
 table = pa.table({
@@ -283,7 +302,7 @@ table = pa.table({
     end
 end
 
-@testset "Multi-RowGroup with ChainedVector" begin
+@group "Multi-RowGroup with ChainedVector" begin
     _with_pyarrow_file("multi-rowgroup flat", "test_multi_rg.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 table = pa.table({
@@ -318,7 +337,7 @@ write_kwargs = {'row_group_size': 5}""") do tbl
     end
 end
 
-@testset "Field-level metadata from ARROW:schema" begin
+@group "Field-level metadata from ARROW:schema" begin
     _with_pyarrow_file("field-level metadata", "test_field_meta.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 schema = pa.schema([
@@ -342,7 +361,7 @@ table = pa.table({'x': [1.0, 2.0], 'y': pa.array([10, 20], type=pa.int32()), 'pl
     end
 end
 
-@testset "Narrow and unsigned integers" begin
+@group "Narrow and unsigned integers" begin
     _with_pyarrow_file("narrow/unsigned ints", "test_small_ints.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 st = pa.struct([('i8', pa.int8()), ('u32', pa.uint32()), ('l', pa.list_(pa.uint64()))])
@@ -371,7 +390,7 @@ table = pa.table({
     end
 end
 
-@testset "Null and empty lists at every level" begin
+@group "Null and empty lists at every level" begin
     _with_pyarrow_file("nested list nulls", "test_list_nulls.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 st = pa.struct([('x', pa.list_(pa.string())), ('vv', pa.list_(pa.list_(pa.int64())))])
@@ -398,7 +417,7 @@ table = pa.table({
     end
 end
 
-@testset "Zero-row file" begin
+@group "Zero-row file" begin
     _with_pyarrow_file("zero rows", "test_zero_rows.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 schema = pa.schema([
@@ -420,7 +439,7 @@ table = schema.empty_table()""") do tbl
     end
 end
 
-@testset "Column selection" begin
+@group "Column selection" begin
     _with_pyarrow_file("column selection", "test_select.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 table = pa.table({'id': [1, 2], 's': pa.array([{'a': 1, 'b': 'x'}, {'a': 2, 'b': 'y'}], type=pa.struct([('a', pa.int64()), ('b', pa.string())]))})""") do _
@@ -436,7 +455,7 @@ table = pa.table({'id': [1, 2], 's': pa.array([{'a': 1, 'b': 'x'}, {'a': 2, 'b':
     end
 end
 
-@testset "Struct edge cases" begin
+@group "Struct edge cases" begin
     plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x
 
     _with_pyarrow_file("required struct and members", "test_struct_required.parquet", """
@@ -478,7 +497,7 @@ table = pa.table({'s': pa.array(rows, type=t)})
     end
 end
 
-@testset "Page headers larger than 1 KB" begin
+@group "Page headers larger than 1 KB" begin
     # pyarrow stores min/max statistics in the page header, so long values make long headers
     _with_pyarrow_file("long page headers", "test_long_header.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
@@ -499,7 +518,7 @@ table = pa.table({
     end
 end
 
-@testset "Struct Columns" begin
+@group "Struct Columns" begin
     _with_pyarrow_file("flat struct with nulls", "test_struct.parquet", """
 import pyarrow as pa, pyarrow.parquet as pq
 person = pa.array([
@@ -731,7 +750,7 @@ write_kwargs = {'row_group_size': 10}""") do tbl
     end
 end
 
-@testset "Writer (W1)" begin
+@group "Writer (W1)" begin
     wfile(name) = joinpath(@__DIR__, name)
 
     @testset "flat round-trip, all supported types" begin
@@ -1774,7 +1793,7 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
 if HAS_PARQUET_TESTING
     @info "Running parquet-testing suite"
 
-    @testset "parquet-testing: Smoke (all files open)" begin
+    @group "parquet-testing: Smoke (all files open)" begin
         files = filter(f -> endswith(f, ".parquet"), readdir(PARQUET_TESTING_DIR))
         for f in files
             @testset "$f" begin
@@ -1786,7 +1805,7 @@ if HAS_PARQUET_TESTING
         end
     end
 
-    @testset "parquet-testing: Row counts" begin
+    @group "parquet-testing: Row counts" begin
         expected_rows = Dict(
             "alltypes_dictionary.parquet" => 2,
             "alltypes_plain.parquet" => 8,
@@ -1839,7 +1858,7 @@ if HAS_PARQUET_TESTING
         end
     end
 
-    @testset "parquet-testing: Full read" begin
+    @group "parquet-testing: Full read" begin
 
         @testset "alltypes_plain" begin
             t = read_parquet(joinpath(PARQUET_TESTING_DIR, "alltypes_plain.parquet"))
@@ -2031,7 +2050,7 @@ if HAS_PARQUET_TESTING
         end
     end
 
-    @testset "parquet-testing: Nested types" begin
+    @group "parquet-testing: Nested types" begin
 
         @testset "nested_lists.snappy" begin
             t = read_parquet(joinpath(PARQUET_TESTING_DIR, "nested_lists.snappy.parquet"))
@@ -2050,7 +2069,7 @@ if HAS_PARQUET_TESTING
         end
     end
 
-    @testset "parquet-testing: Byte Stream Split cross-check" begin
+    @group "parquet-testing: Byte Stream Split cross-check" begin
         path = joinpath(PARQUET_TESTING_DIR, "byte_stream_split_extended.gzip.parquet")
         # BYTE_STREAM_SPLIT is decoded for FLOAT, DOUBLE, INT32 and INT64; the three fixed-length columns are an error
         err = try read_parquet(path); nothing catch e; e end
@@ -2065,7 +2084,7 @@ if HAS_PARQUET_TESTING
         @test t.int64_byte_stream_split == t.int64_plain && eltype(t.int64_byte_stream_split) == eltype(t.int64_plain)
     end
 
-    @testset "parquet-testing: every file reads fully or is a known gap" begin
+    @group "parquet-testing: every file reads fully or is a known gap" begin
         for f in filter(endswith(".parquet"), readdir(PARQUET_TESTING_DIR))
             path = joinpath(PARQUET_TESTING_DIR, f)
             failing = filter(column_names(open_parquet(path))) do name
@@ -2092,7 +2111,7 @@ end
 # =============================================================================
 
 
-@testset "Reader corpus: every file reads in full, with exact nullability" begin
+@group "Reader corpus: every file reads in full, with exact nullability" begin
     @testset "loose_nodes" begin
         tight = (a = [1, 2], l = [[1], Int[]], s = [(x = 1,), (x = 2,)], o = [1, missing])
         @test isempty(loose_nodes(tight))
@@ -2115,7 +2134,7 @@ end
     end
 end
 
-@testset "Reader: plan and pruning" begin
+@group "Reader: plan and pruning" begin
     P = Parquet3
     plan_of(path) = (pf = open_parquet(path); tree = P.build_schema_tree(pf.metadata.schema); close(pf);
                      (P.plan_read_tree(tree), tree))
@@ -2199,7 +2218,7 @@ end
 end
 
 
-@testset "Reader: leaves, structs, lists, fixed-size lists" begin
+@group "Reader: leaves, structs, lists, fixed-size lists" begin
     if HAS_PARQUET_TESTING
         # An empty list that cannot be null (bare repeated field) is [], as pyarrow reads it; it used to read as missing
         path = joinpath(PARQUET_TESTING_DIR, "repeated_primitive_no_list.parquet")
@@ -2250,7 +2269,7 @@ end
     end
 end
 
-@testset "Reader: nested shapes and maps" begin
+@group "Reader: nested shapes and maps" begin
     P = Parquet3
     plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
 
@@ -2349,7 +2368,7 @@ end
     end
 end
 
-@testset "Reader: member selection" begin
+@group "Reader: member selection" begin
     P = Parquet3
     plain(x) = x isa AbstractVector ? Any[plain(v) for v in x] : x isa NamedTuple ? map(plain, x) : x
     mktempdir() do dir
@@ -2396,7 +2415,7 @@ print('SUCCESS')""") == "SUCCESS"
     end
 end
 
-@testset "Arrow.write of what read_parquet returns" begin
+@group "Arrow.write of what read_parquet returns" begin
     P = Parquet3
     # Compare through lists, structs, maps and tuples (Arrow's fixed-size list rows), reading
     # dates and timestamps as their raw counts so that nothing is converted lossily on the way.
@@ -2518,7 +2537,7 @@ print(pa.types.is_struct(b.schema.field('wf').type), pa.types.is_map(b.schema.fi
     end
 end
 
-@testset "FixedSizeList inside lists" begin
+@group "FixedSizeList inside lists" begin
     P = Parquet3
     M = Missing
     plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa Union{AbstractVector, Tuple} ? Any[plain(v) for v in x] :
@@ -2608,7 +2627,7 @@ print(b.schema.field('lf').type, '|', b.schema.field('llf').type)""")
     end
 end
 
-@testset "FixedSizeList element types" begin
+@group "FixedSizeList element types" begin
     P = Parquet3
     # A fixed-size list is restored when its element is fixed-width; of anything else it reads as a list
     fixed_kinds = (:bool, :date, :tsms, :tsus, :i8, :u16, :u64, :f32, :f64, :dur, :time)
@@ -2669,7 +2688,7 @@ print(','.join(sorted(n for n in a.names if a.field(n).type != b.field(n).type))
     end
 end
 
-@testset "FixedSizeList with a null element" begin
+@group "FixedSizeList with a null element" begin
     P = Parquet3
     # Arrow.jl gives a fixed-size list row as a tuple and, unconverted, a date as its day count
     plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa Union{AbstractVector, Tuple} ? Any[plain(v) for v in x] :
@@ -2749,4 +2768,49 @@ print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).
         @test _run_pyarrow("import pyarrow.parquet as pq\nt = pq.read_table('$(path)')\nprint(t.schema.field('c').type, t.column('c').to_pylist())") in
               (nothing, "fixed_size_list<element: int32>[2] [[1, 2], [None, 4], [5, None]]")
     end
+end
+
+@group "Types returned as stored (decimal, Float16, duration)" begin
+    mktempdir() do dir
+        path = joinpath(dir, "stored.parquet")
+        script = """
+import pyarrow as pa, pyarrow.parquet as pq, decimal
+D = decimal.Decimal
+vals = [D('1.25'), None, D('-3.00')]
+ints = pa.table({'d9': pa.array(vals, pa.decimal128(9, 2)), 'd18': pa.array(vals, pa.decimal128(18, 2))})
+pq.write_table(ints, '$(path)', store_decimal_as_integer=True)
+rest = pa.table({'d9': pa.array(vals, pa.decimal128(9, 2)), 'd30': pa.array(vals, pa.decimal128(30, 2)),
+                 'f16': pa.array([1.5, None, -2.0], pa.float32()).cast(pa.float16()),
+                 'dur': pa.array([1500, None, -2], pa.duration('ms'))})
+pq.write_table(rest, '$(joinpath(dir, "bytes.parquet"))')
+print('SUCCESS')"""
+        if _run_pyarrow(script) != "SUCCESS"
+            @warn "Skipping stored-type fixtures: uv/pyarrow not available"
+            return
+        end
+        # A decimal stored as an integer is that integer, unscaled
+        t = read_parquet(path)
+        @test isequal(collect(t.d9), [Int32(125), missing, Int32(-300)]) && isequal(collect(t.d18), [125, missing, -300])
+        @test eltype(t.d9) == Union{Missing, Int32} && eltype(t.d18) == Union{Missing, Int64}
+        # As pyarrow stores it by default, the unscaled value in big-endian two's-complement bytes
+        b = read_parquet(joinpath(dir, "bytes.parquet"))
+        unscaled(bytes) = foldl((acc, x) -> (acc << 8) | x, bytes; init = (bytes[1] & 0x80 == 0 ? Int128(0) : Int128(-1)))
+        @test length(b.d9[1]) == 4 && length(b.d30[1]) == 13 && ismissing(b.d9[2])
+        @test unscaled.(b.d9[[1, 3]]) == [125, -300] && unscaled.(b.d30[[1, 3]]) == [125, -300]
+        # Float16 as its two bytes, a duration as its count
+        @test reinterpret(Float16, Vector{UInt8}(b.f16[1]))[1] == 1.5 && reinterpret(Float16, Vector{UInt8}(b.f16[3]))[1] == -2.0 && ismissing(b.f16[2])
+        @test isequal(collect(b.dur), [1500, missing, -2]) && eltype(b.dur) == Union{Missing, Int64}
+    end
+end
+
+# What this run covered. An argument that selects nothing is an error: a selective run
+# must never pass by running no tests.
+let unmatched = [f for f in GROUP_FILTERS if !any(name -> occursin(f, lowercase(name)), vcat(GROUPS_RUN, GROUPS_SKIPPED))]
+    if isempty(GROUP_FILTERS)
+        @info "Full run: $(length(GROUPS_RUN)) groups"
+    else
+        @info "Selective run" arguments = ARGS ran = GROUPS_RUN skipped = length(GROUPS_SKIPPED)
+        @info "Skipped groups:\n  " * join(GROUPS_SKIPPED, "\n  ")
+    end
+    isempty(unmatched) || error("No test group matches $(join(repr.(unmatched), ", ")). Groups:\n  " * join(vcat(GROUPS_RUN, GROUPS_SKIPPED), "\n  "))
 end

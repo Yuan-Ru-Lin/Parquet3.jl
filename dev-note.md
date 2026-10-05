@@ -323,6 +323,36 @@ Without `uv`, or without the submodule, the tests that need them are skipped wit
 warning. With `PARQUET3_TEST_STRICT=1` a missing dependency is a failure instead; CI sets
 it, so a green run means the pyarrow cross-checks and the parquet-testing suite ran.
 
+**Running tests.** The full suite takes about 12 minutes, nearly all of it Julia compiling
+code for each new table schema. While iterating, run only the groups that matter:
+
+```
+julia --project=. -e 'using Pkg; Pkg.test(test_args=["FixedSizeList", "Writer"])'
+```
+
+runs the top-level groups (`@group "name"` in `test/runtests.jl`) whose name contains one
+of the arguments, ignoring case, and logs which groups ran and which were skipped. An
+argument that matches no group is an error. A single group takes its own time plus about
+20 s to load. Groups do not depend on each other. The rule: selective runs while
+iterating, the full suite (no arguments) before every commit. CI passes no arguments.
+
+**Benchmark gate.** Reads of the waveform columns of `testdata/part-0.parquet` must not
+slow down. `julia --project=. -t4 test/benchmark_part0.jl` prints the best and median of
+15 reads for all columns, each waveform column and `tracelist`.
+1. Quick form, the default: run it once on the change and once on the baseline commit
+   (`git archive <commit> | tar -x -C <dir>`, copy `Manifest.toml`, `--project=<dir>`),
+   and compare the minima.
+2. The minimum of one process varies by about ±15% on unchanged code (measured:
+   `waveform_windowed` between 145 and 192 ms). So the quick form only shows a regression
+   larger than about 20%. If the change is slower by more than the reference spread
+   below, or touches the dense path, alternate the two sides three times and compare the
+   ranges; a regression is a range that sits above the baseline's.
+3. Reference (2026-10-04, 4 threads, Apple silicon, minima over three alternating rounds):
+   all columns 175–213 ms, `waveform_windowed` 138–175 ms, `waveform_presummed`
+   113–138 ms, `tracelist` 3.9–4.4 ms.
+Layout checks complement it for the fixed-size types: `sizeof` of the dense view is 16
+and of the column 24, and `@code_native` of dense indexing has no branch.
+
 `.github/workflows/CI.yml` runs the suite on Julia 1.10 (the declared minimum) and the
 latest release, on Linux, with four threads. `CompatHelper.yml` opens a pull request when
 a dependency moves outside the `[compat]` bounds, which matters for the tight Arrow bound.
@@ -351,7 +381,7 @@ corpus test when present and are not needed for a green run.
   - the outer level of a fixed-size list of fixed-size lists (`fixed_size_list<fixed_size_list<T>[M]>[N]` reads, and is written back, as `list<fixed_size_list<T>[M]>`);
   - a fixed-size list whose elements are not fixed-width. The rule (`_fixed_width_leaf`): the element's Julia type must be a bits type, which covers integers, floats, `Bool`, `Date`, `DateTime`, `Arrow.Timestamp` and INT96. Strings, binary, fixed-length byte arrays (so decimals and Float16, see below), structs and lists are not.
 - pyarrow reads the values of a `map<K, fixed_size_list>` as variable-length lists even from its own files; this package restores the fixed size from `ARROW:schema`.
-- pyarrow cannot read a Parquet file in which a fixed-size list is null ("Expected all lists to be of size=N but index i had size=0"), and cannot write one either; this is a limit of pyarrow's Parquet reader, since a null list has no values in Parquet. `write_parquet` writes such columns (a null waveform, say) and `read_parquet` reads them back, but pyarrow rejects the file. Null *elements* inside a fixed-size list are fine in both directions.
+- pyarrow cannot read a Parquet file in which a fixed-size list is null ("Expected all lists to be of size=N but index i had size=0"), whoever wrote the file, and cannot write one either; this is a limit of pyarrow's Parquet reader, since a null list has no values in Parquet. `write_parquet` keeps the file faithful (decided 2026-10-04): it writes such columns (a null waveform, say) with the fixed size declared, and `read_parquet` reads them back, but pyarrow rejects the file. This is the one known exception to "pyarrow reads what we write". Null *elements* inside a fixed-size list are fine in both directions.
 - A fixed-size list whose stored lists do not all have the declared size is not rejected: extra elements are ignored and missing ones left as zero.
 - A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.
 - Selecting only a map's keys or only its values (`columns=["m.key"]`) returns a list of one-member structs, not a map.
