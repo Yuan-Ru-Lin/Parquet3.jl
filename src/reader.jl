@@ -273,7 +273,8 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
         def = all_def[i]
 
         if rep == 0
-            # New record
+            # New record; the one before it must have had exactly `list_size` elements
+            record_idx > 0 && !nulls[record_idx] && slot_idx != list_size && _fsl_size_error(list_size, slot_idx)
             record_idx += 1
             slot_idx = 0
             base = (record_idx - 1) * list_size
@@ -308,6 +309,7 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
         end
     end
 
+    record_idx > 0 && !nulls[record_idx] && slot_idx != list_size && _fsl_size_error(list_size, slot_idx)
     has_nulls = any(nulls) || nullable
     FixedSizeListVector(list_size, data, nothing, nulls, num_records, has_nulls)
 end
@@ -320,6 +322,10 @@ are read as bytes) are not; such a list is read as an ordinary list.
 """
 _fixed_width_leaf(node::ReadNode) = node.kind == :leaf &&
     isbitstype(element_julia_type(node.schema.element.type, leaf_annotation(node.schema.element)))
+
+"""A stored list whose length is not the fixed size the file declares: the file is malformed."""
+_fsl_size_error(size::Int, found) =
+    error("a list declared fixed_size_list[$size] in ARROW:schema has $found elements; the file is malformed")
 
 """The value stored under a null in a fixed-size list's flat vector: all bits zero."""
 _blank(::Type{T}) where T = reinterpret(T, ntuple(_ -> 0x00, sizeof(T)))
@@ -346,6 +352,9 @@ function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaEl
         page.rep_levels === nothing ? page.num_values : count(==(0), page.rep_levels)
     end
 
+    # Without nulls every stored value is an element, so the count must match exactly
+    stored = sum(page -> length(page.values), pages; init = 0)
+    stored == list_size * num_records || _fsl_size_error(list_size, "$stored values in $num_records lists; some list")
     data = Vector{T}(undef, list_size * num_records)
     nulls = falses(num_records)
 
@@ -572,6 +581,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
         r, d = rep[i], def[i]
         if r <= slot_rep
             d >= slot_def || continue
+            slot > 0 && !nulls[slot] && position != size && _fsl_size_error(size, position)
             slot += 1
             position = 0
             if d < node.def_level
@@ -582,7 +592,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
         end
         d >= node.item_def || continue
         position += 1
-        position <= size || (d == max_def && (value += 1); continue)
+        position <= size || _fsl_size_error(size, "more than $size")
         index = (slot - 1) * size + position
         if d == max_def
             data[index] = convert(T, values[value += 1])
@@ -591,6 +601,7 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
             element_nulls === nothing || (element_nulls[index] = true)
         end
     end
+    slot > 0 && !nulls[slot] && position != size && _fsl_size_error(size, position)
     FixedSizeListVector(size, data, nothing, nulls, nslots, false)
 end
 

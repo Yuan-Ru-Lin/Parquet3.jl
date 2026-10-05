@@ -2948,6 +2948,55 @@ print([n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.colu
     end
 end
 
+@group "FixedSizeList: a stored list of the wrong size is an error" begin
+    P = Parquet3
+    V = P.FixedSizeView{3, Int32}
+    fsv(a, b, c) = V(Int32[a, b, c], 0)
+    # No writer produces such a file, so one is made: the data of a file with ordinary
+    # lists under the footer metadata (ARROW:schema) of a file with fixed-size lists
+    function with_declared_size(path, lists, declared)
+        mktempdir() do dir
+            a, b = joinpath(dir, "a.parquet"), joinpath(dir, "b.parquet")
+            write_parquet(a, (c = declared,)); write_parquet(b, (c = lists,))
+            pa, pb = open_parquet(a), open_parquet(b)
+            kv, meta = pa.metadata.key_value_metadata, pb.metadata
+            close(pa); close(pb)
+            footer = P.serialize_thrift(P.FileMetaData(version = meta.version, schema = meta.schema, num_rows = meta.num_rows,
+                                                         row_groups = meta.row_groups, key_value_metadata = kv, created_by = meta.created_by),
+                                        P.FILE_METADATA_FIELDS)
+            bytes = read(b)
+            old = Int(ltoh(reinterpret(UInt32, bytes[end-7:end-4])[1]))
+            write(path, vcat(bytes[1:end-8-old], footer, reinterpret(UInt8, [htol(UInt32(length(footer)))]), bytes[end-3:end]))
+        end
+        path
+    end
+    reads(path) = collect.(skipmissing(read_parquet(path).c))
+    cause(path) = try read_parquet(path); nothing catch e; e isa P.ColumnReadError ? sprint(showerror, e.cause) : rethrow() end
+
+    mktempdir() do dir
+        path = joinpath(dir, "f.parquet")
+        top = [fsv(1, 2, 3), fsv(4, 5, 6)]
+        # the construction itself: lists of the declared size read as the fixed-size list
+        @test read_parquet(with_declared_size(path, [Int32[1, 2, 3], Int32[4, 5, 6]], top)).c isa P.FixedSizeListVector
+        # without nulls (the dense path): too short, too long, empty
+        for lists in ([Int32[1, 2, 3], Int32[4, 5], Int32[7, 8, 9]], [Int32[1, 2, 3], Int32[4, 5, 6, 60]], [Int32[1, 2, 3], Int32[]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, top)), ""))
+        end
+        # with a null list (the scatter path): the wrong size in the middle and at the end
+        nullable = Union{Missing, V}[fsv(1, 2, 3), missing]
+        for lists in (Union{Missing, Vector{Int32}}[Int32[1, 2], missing, Int32[4, 5, 6]], Union{Missing, Vector{Int32}}[Int32[1, 2, 3], missing, Int32[4, 5, 6, 7]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, nullable)), ""))
+        end
+        @test reads(with_declared_size(path, Union{Missing, Vector{Int32}}[Int32[1, 2, 3], missing, Int32[4, 5, 6]], nullable)) == [[1, 2, 3], [4, 5, 6]]
+        # inside a list, next to an empty list
+        inside = [[fsv(1, 2, 3)], V[]]
+        for lists in ([[Int32[1, 2, 3], Int32[4, 5]], Vector{Int32}[]], [[Int32[1, 2, 3, 4]], Vector{Int32}[]], [Vector{Int32}[], [Int32[1, 2, 3], Int32[4]]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, inside)), ""))
+        end
+        @test length(read_parquet(with_declared_size(path, [[Int32[1, 2, 3], Int32[4, 5, 6]], Vector{Int32}[]], inside)).c) == 2
+    end
+end
+
 @group "write_parquet leaves no partial file" begin
     mktempdir() do dir
         path = joinpath(dir, "partial.parquet")
