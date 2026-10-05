@@ -133,7 +133,90 @@ Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, m
       in dependency order with the writer last; `encodings.jl` reordered so each decoder is
       followed by its encoder (same code lines).
 - [x] B — `Arrow.write` for every column `read_parquet` returns (see the section below)
-- [ ] C — FixedSizeList inside a list (plan first)
+- [ ] C — FixedSizeList inside a list: PLAN written 2026-10-04 (section below), awaiting approval; no code
+
+## Part C — FixedSizeList inside a list (PLAN, awaiting approval; no code written)
+
+Today a FixedSizeList is restored at top level and as a struct member. Inside a list
+(`list<fixed_size_list>`, `list<struct<…fsl…>>`) it reads as a variable-length list and is
+written back as one. Goal: restored wherever `ARROW:schema` declares it, and kept through
+write → read and write → pyarrow.
+
+### How the ARROW:schema walk finds them at any depth
+The Arrow field tree and the read plan have the same shape: struct ↔ struct (children by
+name), list ↔ List / LargeList / FixedSizeList (one child), map ↔ Map (its entries struct,
+then key and value). So `plan_read_tree` takes the Arrow schema and passes the matching
+Arrow field down its own recursion; a list node whose Arrow field is a FixedSizeList
+records the size on the node (`ReadNode` gains `fsl_size`). This replaces the dictionary
+keyed by dotted path (`_collect_fsl!`), which cannot say *which* list level of
+`list<list<…>>` is fixed, since user paths have no segment per list level.
+Where the two trees do not line up (no Arrow schema, a missing field, a different shape),
+the node is an ordinary list, as today. Never an error.
+
+### Result type
+A FixedSizeList node produces a `FixedSizeListVector` as that node's array, at any depth,
+and its parents wrap it as they wrap any child. So:
+- `list<fixed_size_list<T>[N]>` → `Arrow.List` whose child is a `FixedSizeListVector{N,T}`;
+  `col[i]` is a view of row i's items, each a `FixedSizeView{N,T}`. No copy.
+- `list<struct<…, values: fsl>>` → `ListOfStructsColumn`; the member is a
+  `FixedSizeListVector`, and `col.values` projects it through the list as any member.
+- struct with a `list<fsl>` member, `list<list<fsl>>`, `map<K, fsl>`: the same rule.
+Nothing new is needed in the wrappers, `_member_list`, or `Arrow.write` (`_arrow_native`
+already converts a `FixedSizeListVector` child of a list).
+
+### Reading: slots instead of rows, and the dense path
+Today the fixed-size path assumes one list per row (`slot_rep == 0`). Inside a list its
+slots are the items of the enclosing list, the same notion every other node uses:
+- **Scatter path** (`assemble_fsl_direct`): a slot starts at an entry with
+  `rep <= slot_rep && def >= slot_def`, is null when `def < node.def_level`, and entries
+  below `slot_def` (an empty or null enclosing list) are not slots. At `slot_rep == 0` this
+  is today's loop.
+- **Dense path** still applies, unchanged in cost: when every definition level is at its
+  maximum, every entry is one fixed-size element, whatever the nesting, so the page values
+  are copied straight into the flat buffer.
+- **Levels reported upward.** Today the node reports one entry per row. Inside a list its
+  parents need the level stream of a leaf at the fixed-size list's position: the entries
+  with `rep < node.rep_level` (slot starts and empty/null placeholders), with the
+  continuation entries dropped. At top level that is exactly the per-row report, so the
+  existing `rep === nothing` fast path is kept for `slot_rep == 0` and the waveform paths
+  do not change.
+
+### Writing
+Expected to need no change, to be confirmed by test rather than assumed:
+- `_plan_node` already writes a `FixedSizeView` element as a LIST at any depth;
+- `_has_fsl` already triggers `ARROW:schema` at any depth, and Arrow.jl derives
+  `List<FixedSizeList>` from the element type.
+
+### Fixed-size list inside a fixed-size list (2-D waveforms): not in this step
+Not nearly free. `FixedSizeView{N,T}` and `FixedSizeListVector` hold a `Vector{T}`; a 2-D
+array needs them generic over the parent array (a view into another
+`FixedSizeListVector`), which changes the type parameters of the two types the waveform
+path is built on and every place that names them. What falls out for free:
+`fixed_size_list<fixed_size_list<T>[M]>[N]` reads with the inner level fixed and the outer
+level variable (`list<fsl<T>[M]>`), and writes back that way. Remaining gap, to name in
+Known Limitations: the outer fixed size is lost. Also still not restored: a fixed-size
+list whose elements are not primitives (strings, structs).
+
+### Steps, each ending with a report
+- [ ] C1 — plan only: the Arrow field passed down `plan_read_tree`, `fsl_size` on the node,
+      the path dictionary removed. No behaviour change (still applied only outside lists).
+      Suite green; benchmark on part-0 unchanged.
+- [ ] C2 — reading inside lists: slot-based scatter, dense path, reduced levels. Tests
+      against pyarrow: `list<fsl>`, `list<struct<…fsl…>>`, struct with a `list<fsl>` member,
+      `list<list<fsl>>`, `map<K, fsl>`, `fsl<fsl>` (inner restored), with null and empty
+      lists, one row group and several. Null fixed-size elements come from our own writer,
+      since pyarrow cannot write them. Benchmark gate: top-level and struct-member waveform
+      reads must not slow down.
+- [ ] C3 — write → read keeps the types; write → pyarrow reports `list<fixed_size_list>`;
+      `Arrow.write` round-trip; README, Known Limitations, dev-note.
+
+### Risks
+- The reduced level stream is new level arithmetic (the fixed-size list under an empty or
+  null list). Mitigated by pyarrow fixtures and by the writer as an independent producer.
+- The Arrow and Parquet trees may disagree in files from other writers (extension types,
+  dictionary-encoded fields, renamed list children). Handled by falling back to a plain list.
+- A file whose lists do not all have the declared size: today's loop ignores extra
+  elements and leaves short ones unfilled. Unchanged; worth an explicit error later.
 
 ## Deferred to v0.3 (refreshed 2026-10-04)
 - Multiple row groups and multiple pages on write; min/max statistics
