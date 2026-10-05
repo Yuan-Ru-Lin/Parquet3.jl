@@ -2,7 +2,7 @@
 
 using ChunkCodecLibZlib: GzipCodec, GzipEncodeOptions, encode, decode
 using ChunkCodecLibZstd: ZstdCodec, ZstdEncodeOptions
-using ChunkCodecLibLz4: LZ4BlockCodec, LZ4BlockEncodeOptions
+using ChunkCodecLibLz4: LZ4BlockCodec, LZ4BlockEncodeOptions, ChunkCodecCore
 using ChunkCodecLibSnappy: SnappyCodec, SnappyEncodeOptions
 using ChunkCodecLibBrotli: BrotliCodec, BrotliEncodeOptions
 
@@ -64,7 +64,9 @@ function _lz4_hadoop_frames(data::AbstractVector{UInt8}, uncompressed_size::Int)
         (compressed_size <= length(data) - pos + 1 && length(result) + block_uncompressed <= uncompressed_size) || return nothing
         block = try
             decode(LZ4BlockCodec(), @view(data[pos:pos+compressed_size-1]); max_size = block_uncompressed)
-        catch
+        catch err
+            # only a block that does not decode means "not framed"; anything else is not ours to swallow
+            err isa Union{ChunkCodecCore.DecodingError, ChunkCodecCore.DecodedSizeError} || rethrow()
             return nothing
         end
         length(block) == block_uncompressed || return nothing
