@@ -33,6 +33,46 @@ Base.IndexStyle(::Type{<:FixedSizeListVector}) = Base.IndexLinear()
     FixedSizeView{N,T}(v.data, (i - 1) * N)
 end
 
+"""
+A `FixedSizeView` whose elements can be null: the same flat array, plus the column's
+element-level null bits (Arrow's validity of a fixed-size list's child array). `v[j]` is
+`missing` for a null element.
+"""
+struct NullableFixedSizeView{N, T} <: AbstractVector{Union{Missing, T}}
+    parent::Vector{T}
+    nulls::BitVector    # one per element of `parent`; true = null
+    offset::Int
+end
+
+Base.size(::NullableFixedSizeView{N}) where N = (N,)
+Base.IndexStyle(::Type{<:NullableFixedSizeView}) = Base.IndexLinear()
+@Base.propagate_inbounds function Base.getindex(v::NullableFixedSizeView, i::Int)
+    @boundscheck checkbounds(v, i)
+    @inbounds v.nulls[v.offset + i] ? missing : v.parent[v.offset + i]
+end
+
+ArrowTypes.ArrowKind(::Type{NullableFixedSizeView{N,T}}) where {N,T} = ArrowTypes.FixedSizeListKind{N,Union{Missing,T}}()
+
+"""
+Fixed-size list column with null elements: `FixedSizeListVector`'s flat array and
+record-level nulls, plus one null bit per element. A column is given this type only when
+a null element occurs in it; otherwise it is a `FixedSizeListVector`.
+"""
+struct NullableFixedSizeListVector{N, T, ET} <: AbstractVector{ET}
+    data::Vector{T}
+    element_nulls::BitVector    # one per element of `data`; true = null
+    nulls::BitVector            # true = record is null
+    len::Int
+end
+
+Base.size(v::NullableFixedSizeListVector) = (v.len,)
+Base.IndexStyle(::Type{<:NullableFixedSizeListVector}) = Base.IndexLinear()
+@Base.propagate_inbounds function Base.getindex(v::NullableFixedSizeListVector{N,T}, i::Int) where {N,T}
+    @boundscheck checkbounds(v, i)
+    v.nulls[i] && return missing
+    NullableFixedSizeView{N,T}(v.data, v.element_nulls, (i - 1) * N)
+end
+
 # ── Map types ────────────────────────────────────────────────────────────────
 
 """
@@ -231,7 +271,7 @@ _inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
 """Whether `v` is a fixed-size list array, looking through any number of list levels."""
-_fixed_size_items(::FixedSizeListVector) = true
+_fixed_size_items(::Union{FixedSizeListVector, NullableFixedSizeListVector}) = true
 _fixed_size_items(l::Arrow.List) = _fixed_size_items(l.data)
 _fixed_size_items(::Any) = false
 
@@ -282,11 +322,28 @@ function _arrow_native(s::Arrow.Struct{T, S, fnames}) where {T, S, fnames}
     all(children .=== s.data) ? s : _struct_over(s, children)
 end
 
-function _arrow_native(v::FixedSizeListVector{N, T, ET}) where {N, T, ET}
-    child = Arrow.Primitive(T, UInt8[], _validity(falses(length(v.data))), v.data, length(v.data), nothing)
-    E = Missing <: ET ? Union{Missing, NTuple{N, T}} : NTuple{N, T}
-    Arrow.FixedSizeList{E, typeof(child)}(UInt8[], _validity(v.nulls), child, v.len, nothing)
+"""
+The child array of a fixed-size list for Arrow.jl. Numbers and `Arrow.Timestamp`s are
+stored as Arrow stores them, so the flat vector is reused; `Bool` (bit-packed in Arrow),
+`Date` and `DateTime` (other integers in Arrow) are encoded by Arrow.jl, which copies.
+"""
+_fixed_size_child(data::Vector{T}, nulls::Union{BitVector, Nothing}) where {T <: Union{Integer, AbstractFloat, Arrow.Timestamp}} =
+    Arrow.Primitive(nulls === nothing ? T : Union{Missing, T}, UInt8[],
+                    _validity(nulls === nothing ? falses(length(data)) : nulls), data, length(data), nothing)
+_fixed_size_child(data::Vector{Bool}, nulls::Union{BitVector, Nothing}) = _fixed_size_child_encoded(data, nulls)
+_fixed_size_child(data::Vector, nulls::Union{BitVector, Nothing}) = _fixed_size_child_encoded(data, nulls)
+_fixed_size_child_encoded(data::Vector{T}, nulls) where T =
+    Arrow.toarrowvector(nulls === nothing ? data : Union{Missing, T}[n ? missing : d for (d, n) in zip(data, nulls)])
+
+function _fixed_size_over(child::AbstractVector, N::Int, nulls::BitVector, len::Int, nullable::Bool)
+    E = NTuple{N, eltype(child)}
+    Arrow.FixedSizeList{nullable ? Union{Missing, E} : E, typeof(child)}(UInt8[], _validity(nulls), child, len, nothing)
 end
+
+_arrow_native(v::FixedSizeListVector{N, T, ET}) where {N, T, ET} =
+    _fixed_size_over(_fixed_size_child(v.data, nothing), N, v.nulls, v.len, Missing <: ET)
+_arrow_native(v::NullableFixedSizeListVector{N, T, ET}) where {N, T, ET} =
+    _fixed_size_over(_fixed_size_child(v.data, v.element_nulls), N, v.nulls, v.len, Missing <: ET)
 
 function _arrow_native(m::MapVector)
     l = m.entries
@@ -308,7 +365,7 @@ function _struct_over(s::Arrow.Struct{T, S, fnames}, children::Tuple) where {T, 
     Arrow.Struct{Missing <: T ? Union{Missing, NT} : NT, typeof(children), fnames}(s.validity, children, s.ℓ, s.metadata)
 end
 
-Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
+Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, NullableFixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
 
 """
 Join Arrow.jl arrays of one type — a column's row-group chunks — into one array. Needed

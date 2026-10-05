@@ -2654,10 +2654,99 @@ end
         @test all(isequal(plain(getproperty(back, k)), plain(getproperty(t, k))) && eltype(getproperty(back, k)) == eltype(getproperty(t, k))
                   for k in propertynames(t))
         @test harness_pyarrow_compare([(joinpath(dir, "plain.parquet"), out)]) == ["equal"]
+        # Arrow.write, whose Bool, Date and DateTime arrays are not stored as ours are
+        io = IOBuffer(); Arrow.write(io, t); seekstart(io)
+        a = Arrow.Table(io; convert = false)
+        canon(x) = x isa Arrow.Date ? Date(1970) + Day(x.x) : x isa Arrow.Timestamp{Arrow.Flatbuf.TimeUnit.MILLISECOND, nothing} ? DateTime(1970) + Millisecond(x.x) :
+                   x isa Arrow.Timestamp ? x.x : x isa Union{AbstractVector, Tuple} && !(x isa Union{Base.CodeUnits, AbstractVector{UInt8}}) ? Any[canon(v) for v in x] :
+                   x isa NamedTuple ? map(canon, x) : plain(x)
+        @test all(isequal(canon(Tables.getcolumn(a, k)), canon(Tables.getcolumn(t, k))) for k in Tables.columnnames(t))
         changed = _run_pyarrow("""
 import pyarrow.parquet as pq
 a, b = pq.read_schema('$(joinpath(dir, "plain.parquet"))'), pq.read_schema('$(out)')
 print(','.join(sorted(n for n in a.names if a.field(n).type != b.field(n).type)))""")
         @test changed == join(sort(["$(pos)_$(kind)" for pos in (:top, :st, :li) for kind in (:str, :bin)]), ',')
+    end
+end
+
+@testset "FixedSizeList with a null element" begin
+    P = Parquet3
+    # Arrow.jl gives a fixed-size list row as a tuple and, unconverted, a date as its day count
+    plain(x) = x isa AbstractDict ? Dict(k => plain(v) for (k, v) in x) : x isa Union{AbstractVector, Tuple} ? Any[plain(v) for v in x] :
+               x isa NamedTuple ? map(plain, x) : x isa Arrow.Date ? Date(1970) + Day(x.x) : x
+    inner(c) = c isa P.NestedColumn ? inner(getfield(c, :_data)) : c isa P.ChainedVector ? inner(first(c.arrays)) : c
+    chunks_are(T, c) = all(chunk -> chunk isa T, P._chunks(c isa P.NestedColumn ? getfield(c, :_data) : c))
+    function arrow_roundtrip(t)
+        io = IOBuffer(); Arrow.write(io, t); seekstart(io)
+        Arrow.Table(io; convert = false)
+    end
+    row(i) = Any[i, i == 5 ? missing : i + 1, i + 2]
+    n = 8
+
+    mktempdir() do dir
+        for (name, kwargs) in (("one.parquet", ""), ("chunks.parquet", ", row_group_size=2"))
+            path = joinpath(dir, name)
+            _run_pyarrow(HARNESS_FIXED_SIZE_NULL_ELEMENT * "pq.write_table(table, '$(path)'$(kwargs))\nprint('SUCCESS')") == "SUCCESS" ||
+                (@warn "Skipping null-element fixtures: uv/pyarrow not available"; break)
+            t = read_parquet(path)
+
+            # The null element is `missing`, as pyarrow shows it, wherever the fixed-size list sits
+            @test isequal(plain(t.top), Any[row(i) for i in 0:n-1])
+            @test isequal(plain(t.st.v), Any[row(i) for i in 0:n-1]) && t.st.a == 0:n-1
+            @test isequal(plain(t.li), Any[i == 2 ? missing : fill(row(i), i % 3) for i in 0:n-1])
+            @test isequal(plain(t.mp), Any[isodd(i) ? Dict("k$i" => row(i)) : Dict() for i in 0:n-1])
+            @test isequal(plain(t.dt), Any[Any[Date(2020, 1, i + 1), i == 5 ? missing : Date(2021, 1, i + 1)] for i in 0:n-1])
+            @test isequal(plain(t.bo), Any[Any[true, i == 5 ? missing : false] for i in 0:n-1])
+            # Still a fixed-size list over one flat vector, of the type with element nulls in
+            # every row group, though only one row group has a null
+            @test all(c -> chunks_are(P.NullableFixedSizeListVector, c), (t.top, t.st.v, t.dt, t.bo))
+            @test inner(t.li).data isa P.NullableFixedSizeListVector && t.li isa P.ListColumn
+            @test eltype(t.top) == P.NullableFixedSizeView{3, Int32} && eltype(eltype(t.top)) == Union{Missing, Int32}
+            @test t.top[6] isa P.NullableFixedSizeView{3, Int32} && ismissing(t.top[6][2]) && t.top[6][3] === Int32(7)
+            @test inner(t.top).data isa Vector{Int32} && t.top[6].parent === P._chunks(t.top)[end - (name == "one.parquet" ? 0 : 1)].data
+            # A column without a null element keeps the plain types
+            @test chunks_are(P.FixedSizeListVector, t.ok) && eltype(t.ok) == P.FixedSizeView{3, Int32}
+            @test isempty(loose_nodes(t))
+            @test isequal(plain(read_parquet(path; columns = ["top"]).top), plain(t.top))
+
+            # Arrow.write: a fixed-size list whose child carries the nulls
+            a = arrow_roundtrip(t)
+            @test all(isequal(plain(Tables.getcolumn(a, k)), plain(Tables.getcolumn(t, k))) for k in Tables.columnnames(t))
+            @test eltype(a.top) == NTuple{3, Union{Missing, Int32}} && eltype(a.ok) == NTuple{3, Int32}
+
+            # write_parquet: the same values and types back, and pyarrow sees the nulls in fixed-size lists
+            out = joinpath(dir, "rw_" * name)
+            write_parquet(out, t)
+            back = read_parquet(out)
+            @test all(isequal(plain(getproperty(back, k)), plain(getproperty(t, k))) && eltype(getproperty(back, k)) == eltype(getproperty(t, k))
+                      for k in propertynames(t))
+            @test harness_pyarrow_compare([(path, out)]) == ["equal"]
+            @test _run_pyarrow("""
+import pyarrow.parquet as pq
+a, b = pq.read_table('$(path)'), pq.read_table('$(out)')
+print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).type], b.schema.field('top').type, b.column('top').to_pylist()[5])""") ==
+                  "[] fixed_size_list<element: int32>[3] [5, None, 7]"
+        end
+    end
+
+    # A null list and a null element are independent (from our writer: pyarrow can neither write nor read a null fixed-size list)
+    mktempdir() do dir
+        path = joinpath(dir, "n.parquet")
+        V = P.NullableFixedSizeView{2, Int32}
+        nv(a, b) = V(Int32[coalesce(a, 0), coalesce(b, 0)], BitVector([ismissing(a), ismissing(b)]), 0)
+        tbl = (top = Union{Missing, V}[nv(1, 2), missing, nv(missing, 4), nv(5, missing), nv(missing, missing)],
+               li  = Union{Missing, Vector{Union{Missing, V}}}[[nv(1, missing), missing], missing, [], [nv(3, 4)], [missing, nv(missing, 6)]])
+        write_parquet(path, tbl)
+        t = read_parquet(path)
+        @test all(isequal(plain(getproperty(t, k)), plain(tbl[k])) for k in keys(tbl))
+        @test inner(t.top) isa P.NullableFixedSizeListVector && eltype(t.top) == Union{Missing, V}
+        @test inner(t.li).data isa P.NullableFixedSizeListVector && eltype(inner(t.li).data) == Union{Missing, V}
+        @test all(isequal(plain(Tables.getcolumn(arrow_roundtrip(t), k)), plain(tbl[k])) for k in keys(tbl))
+
+        # Null elements alone, pyarrow reads from our file. (A null fixed-size list it cannot
+        # read from Parquet, whoever wrote the file: Known Limitations.)
+        write_parquet(path, (c = V[nv(1, 2), nv(missing, 4), nv(5, missing)],))
+        @test _run_pyarrow("import pyarrow.parquet as pq\nt = pq.read_table('$(path)')\nprint(t.schema.field('c').type, t.column('c').to_pylist())") in
+              (nothing, "fixed_size_list<element: int32>[2] [[1, 2], [None, 4], [5, None]]")
     end
 end

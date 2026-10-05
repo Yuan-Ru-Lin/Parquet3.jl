@@ -254,11 +254,13 @@ in a single pass, bypassing intermediate Vector{Vector{T}} creation.
 function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
                              max_def::Int, list_size::Int, elem::SchemaElement,
                              def_thresholds::Vector{Int}; nullable::Bool=false,
-                             record_null_def::Int = max_def > 0 ? 1 : 0) where V
+                             record_null_def::Int = max_def > 0 ? 1 : 0,
+                             element_nulls::Union{BitVector, Nothing} = nothing) where V
     T = element_julia_type(elem.type, leaf_annotation(elem))
     num_records = count(==(0), all_rep)
     data = Vector{T}(undef, list_size * num_records)
     nulls = falses(num_records)
+    element_nulls === nothing || fill!(resize!(element_nulls, length(data)), false)
 
     inner_threshold = length(def_thresholds) >= 1 ? def_thresholds[1] : 1
 
@@ -301,6 +303,7 @@ function assemble_fsl_direct(all_rep, all_def, values::AbstractVector{V},
             slot_idx += 1
             if slot_idx <= list_size
                 data[base + slot_idx] = _blank(T)
+                element_nulls === nothing || (element_nulls[base + slot_idx] = true)
             end
         end
     end
@@ -526,32 +529,29 @@ function _read_fixed_size_list(ctx::ReadContext, rg, node::ReadNode, leaf::ReadN
     pages = _read_pages_for_rg(ctx.data, rg, leaf.path, leaf.schema)
     elem = leaf.schema.element
     size, max_def = node.fsl_size, leaf.def_level
-    dense = _fsl_no_nulls(pages, max_def)
-
-    if slot_rep == 0        # one list per row: the waveform path
-        if dense
-            column = _assemble_fsl_dense(pages, elem.type, elem, size)
-            defs = want_levels ? fill(max_def, length(column)) : nothing
-        else
-            rep, def, raw = collect_page_data(pages, max_def)
-            converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
-            column = assemble_fsl_direct(rep, def, converted, max_def, size, elem, [node.item_def];
-                                         record_null_def = node.def_level)
-            defs = want_levels ? _record_defs(rep, def) : nothing
-        end
-        return (RawNode(column, column.nulls, Int32[], RawNode[]), want_levels ? Levels(nothing, defs) : nothing)
-    end
-
-    # Inside a list: a slot is an item of the enclosing list
-    rep, def, raw = collect_page_data(pages, max_def)
-    column = if dense
-        _assemble_fsl_dense(pages, elem.type, elem, size; num_slots = length(def) ÷ size)
+    if _fsl_no_nulls(pages, max_def)
+        slot_rep == 0 || ((rep, def, _) = collect_page_data(pages, max_def))
+        column = _assemble_fsl_dense(pages, elem.type, elem, size; num_slots = slot_rep == 0 ? nothing : length(def) ÷ size)
+        element_nulls = nothing
+        defs = slot_rep == 0 && want_levels ? fill(max_def, length(column)) : nothing
     else
+        rep, def, raw = collect_page_data(pages, max_def)
         converted = convert_primitive_values(raw, elem.type, leaf_annotation(elem))
-        _assemble_fsl_slots(rep, def, converted, size, elem, slot_rep, slot_def, node, max_def)
+        # A null element is a zero in the flat vector; its position is recorded so that
+        # stage 2 can give the column element-level nulls
+        element_nulls = any(d -> node.item_def <= d < max_def, def) ? BitVector() : nothing
+        column = slot_rep == 0 ?
+            assemble_fsl_direct(rep, def, converted, max_def, size, elem, [node.item_def];
+                                record_null_def = node.def_level, element_nulls) :
+            _assemble_fsl_slots(rep, def, converted, size, elem, slot_rep, slot_def, node, max_def, element_nulls)
+        defs = slot_rep == 0 && want_levels ? _record_defs(rep, def) : nothing
     end
+    raw_node = RawNode(column, column.nulls, Int32[],
+                       element_nulls === nothing ? RawNode[] : [RawNode(nothing, element_nulls, Int32[], RawNode[])])
+    want_levels || return (raw_node, nothing)
+    slot_rep == 0 && return (raw_node, Levels(nothing, defs))      # one list per row: the waveform path
     keep = rep .<= slot_rep
-    (RawNode(column, column.nulls, Int32[], RawNode[]), want_levels ? Levels(rep[keep], def[keep]) : nothing)
+    (raw_node, Levels(rep[keep], def[keep]))
 end
 
 """
@@ -561,11 +561,13 @@ empty or null and there is no slot); the slot is a null fixed-size list when
 `def < node.def_level`. Other entries are its elements, null when `def < max_def`.
 """
 function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::SchemaElement,
-                             slot_rep::Int, slot_def::Int, node::ReadNode, max_def::Int)
+                             slot_rep::Int, slot_def::Int, node::ReadNode, max_def::Int,
+                             element_nulls::Union{BitVector, Nothing})
     T = element_julia_type(elem.type, leaf_annotation(elem))
     nslots = count(i -> rep[i] <= slot_rep && def[i] >= slot_def, eachindex(def))
     data = Vector{T}(undef, size * nslots)
     nulls = falses(nslots)
+    element_nulls === nothing || fill!(resize!(element_nulls, length(data)), false)
     slot = position = 0     # current slot; elements placed in it so far
     value = 0
     @inbounds for i in eachindex(def)
@@ -582,8 +584,14 @@ function _assemble_fsl_slots(rep, def, values::AbstractVector, size::Int, elem::
         end
         d >= node.item_def || continue
         position += 1
-        filled = d == max_def ? convert(T, values[value += 1]) : _blank(T)
-        position <= size && (data[(slot - 1) * size + position] = filled)
+        position <= size || (d == max_def && (value += 1); continue)
+        index = (slot - 1) * size + position
+        if d == max_def
+            data[index] = convert(T, values[value += 1])
+        else
+            data[index] = _blank(T)
+            element_nulls === nothing || (element_nulls[index] = true)
+        end
     end
     FixedSizeListVector{size, T, FixedSizeView{size, T}}(data, nulls, nslots)
 end
@@ -605,7 +613,9 @@ function _wrap_buffers(node::ReadNode, chunks::Vector{RawNode}, meta)
         return [_make_struct(Tuple(member[i] for member in members), fnames, chunk.nulls, nullable, meta)
                 for (i, chunk) in enumerate(chunks)]
     elseif first(chunks).values isa FixedSizeListVector
-        return [_fixed_size_list(chunk.values, nullable) for chunk in chunks]
+        # A null element in any row group gives every chunk the type with element-level nulls
+        null_elements = any(chunk -> !isempty(chunk.children), chunks)
+        return [_fixed_size_list(chunk, chunk.values, nullable, null_elements) for chunk in chunks]
     end
     elements = _wrap_buffers(only(node.children), RawNode[only(chunk.children) for chunk in chunks], nothing)
     lists = [_make_list(elements[i], _validity(chunk.nulls), chunk.offsets, length(chunk.nulls), nullable, meta)
@@ -615,10 +625,19 @@ function _wrap_buffers(node::ReadNode, chunks::Vector{RawNode}, meta)
     node.kind == :map && length(only(node.children).children) == 2 ? map(MapVector, lists) : lists
 end
 
-"""The same fixed-size list buffers with the element type the whole column agreed on."""
-function _fixed_size_list(column::FixedSizeListVector{N, T}, nullable::Bool) where {N, T}
-    ET = nullable ? Union{Missing, FixedSizeView{N, T}} : FixedSizeView{N, T}
-    FixedSizeListVector{N, T, ET}(column.data, column.nulls, column.len)
+"""
+The same fixed-size list buffers with the type the whole column agreed on: whether a list
+can be null, and whether an element can (then with the chunk's element null bits, all
+false for a row group that has none).
+"""
+function _fixed_size_list(chunk::RawNode, column::FixedSizeListVector{N, T}, nullable::Bool, null_elements::Bool) where {N, T}
+    if !null_elements
+        ET = nullable ? Union{Missing, FixedSizeView{N, T}} : FixedSizeView{N, T}
+        return FixedSizeListVector{N, T, ET}(column.data, column.nulls, column.len)
+    end
+    element_nulls = isempty(chunk.children) ? falses(length(column.data)) : only(chunk.children).nulls
+    ET = nullable ? Union{Missing, NullableFixedSizeView{N, T}} : NullableFixedSizeView{N, T}
+    NullableFixedSizeListVector{N, T, ET}(column.data, element_nulls, column.nulls, column.len)
 end
 
 """Read one top-level column of the plan: stage 1 per row group, then stage 2."""

@@ -189,7 +189,7 @@ _shred_stop!(node, rep::Int, def::Int) =
 function _has_fsl(::Type{FT}) where FT
     T = Base.nonmissingtype(FT)
     T === Union{} && return false
-    T <: FixedSizeView && return true
+    T <: Union{FixedSizeView, NullableFixedSizeView} && return true
     T <: NamedTuple && return isconcretetype(T) && any(_has_fsl, fieldtypes(T))
     _is_list_type(T) && _has_fsl(eltype(T))
 end

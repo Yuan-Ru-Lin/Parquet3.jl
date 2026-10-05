@@ -15,6 +15,13 @@ This package uses two structs to circumvent the issue:
 - **`FixedSizeListVector{N, T, ET}`** — the column container. Stores data in a flat `Vector{T}` with fixed stride `N`, plus a `BitVector` for record-level nulls.
 - **`FixedSizeView{N, T}`** — a lightweight zero-copy view returned on index access. Carries only a pointer to the parent array and an offset (16 bytes), regardless of `N`.
 
+An Arrow fixed-size list has two validity bitmaps: one for the lists and one for the elements of its child array. The two types above carry only the first, which is all waveforms need, and their indexing has no branch per element. A column in which an element is null gets a second pair of types with the same flat `Vector{T}` and one more bitmap:
+
+- **`NullableFixedSizeListVector{N, T, ET}`** — flat data, record-level nulls, and `element_nulls`, one bit per element of the flat vector.
+- **`NullableFixedSizeView{N, T} <: AbstractVector{Union{Missing, T}}`** — the flat vector, the element bitmap and an offset; `v[j]` is `missing` for a null element.
+
+Which pair a column gets is settled after all its row groups are decoded, like nullability: one null element anywhere gives every chunk the nullable pair; otherwise the column is exactly what it was before these types existed. A null list and a null element are independent. Because a view is (storage, offset), a shape can be added to a view type later (the 2-D idea in the v0.3 list) without changing these.
+
 `FixedSizeListVector` is not an `Arrow.ArrowVector` subtype. It registers `ArrowKind = FixedSizeListKind{N,T}` so `Arrow.write` can serialize it correctly, but:
 
 - FSL fields are detected from ARROW:schema at any depth: the reader walks the Arrow schema together with its read plan (struct ↔ struct, list ↔ list, map ↔ map), so a fixed-size list is found at top level, in structs, in lists (`List<FixedSizeList<T>>`, `List<Struct<…>>`) and as a map value.
@@ -95,6 +102,12 @@ leaf in its place would have: one entry per slot and per empty or null enclosing
 nothing above it does per-element work. Outside lists that is one entry per row, and that
 case keeps its own branch so the waveform path is unchanged.
 
+A null *element* is stored as zero bits in the flat vector. When the levels of a row group
+show one, the scatter path also records its position (the dense path cannot meet one: it
+runs only when every level is at its maximum). Stage 2 then gives every chunk of the
+column the type with element-level nulls (`_fixed_size_list`), with an all-false bitmap
+for row groups that have none. Nothing is decoded twice and no value is copied.
+
 **Wrappers.** `_wrap_nested` (src/arrays.jl) gives named field access to any array whose
 elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`); `_member_list` projects a field through every list level,
@@ -136,7 +149,7 @@ the same buffers, and `Arrow.arrowvector` is defined for our three array types t
 | plain, string, list columns | themselves (`Arrow.Primitive`, `Arrow.BoolVector`, `Arrow.List`) | as they are |
 | binary | itself; its element type is Arrow.jl's binary type, `Base.CodeUnits` | as they are |
 | `StructColumn`, `ListOfStructsColumn` | the wrapped `Arrow.Struct` / `Arrow.List` | reused |
-| `FixedSizeListVector` (at any depth) | `Arrow.FixedSizeList` over an `Arrow.Primitive` of the flat vector | reused |
+| `FixedSizeListVector`, `NullableFixedSizeListVector` (at any depth) | `Arrow.FixedSizeList` over an `Arrow.Primitive` of the flat vector, which carries the element validity | reused for numbers and `Arrow.Timestamp`; `Bool`, `Date` and `DateTime` elements are stored differently by Arrow and are encoded by Arrow.jl (one copy) |
 | `ListColumn` (list of fixed-size lists) | `Arrow.List` over that `Arrow.FixedSizeList`, same offsets | reused |
 | `MapColumn` / `MapVector` | `Arrow.Map` over the same offsets and key/value struct | reused |
 
@@ -319,6 +332,7 @@ corpus test when present and are not needed for a green run.
   - the outer level of a fixed-size list of fixed-size lists (`fixed_size_list<fixed_size_list<T>[M]>[N]` reads, and is written back, as `list<fixed_size_list<T>[M]>`);
   - a fixed-size list whose elements are not fixed-width. The rule (`_fixed_width_leaf`): the element's Julia type must be a bits type, which covers integers, floats, `Bool`, `Date`, `DateTime`, `Arrow.Timestamp` and INT96. Strings, binary, fixed-length byte arrays (so decimals and Float16, see below), structs and lists are not.
 - pyarrow reads the values of a `map<K, fixed_size_list>` as variable-length lists even from its own files; this package restores the fixed size from `ARROW:schema`.
+- pyarrow cannot read a Parquet file in which a fixed-size list is null ("Expected all lists to be of size=N but index i had size=0"), and cannot write one either; this is a limit of pyarrow's Parquet reader, since a null list has no values in Parquet. `write_parquet` writes such columns (a null waveform, say) and `read_parquet` reads them back, but pyarrow rejects the file. Null *elements* inside a fixed-size list are fine in both directions.
 - A fixed-size list whose stored lists do not all have the declared size is not rejected: extra elements are ignored and missing ones left as zero.
 - A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.
 - Selecting only a map's keys or only its values (`columns=["m.key"]`) returns a list of one-member structs, not a map.

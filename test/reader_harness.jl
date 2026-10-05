@@ -307,3 +307,21 @@ pq.write_table(pa.table({'top_i96': pa.array([[dt.datetime(2020, 1, 1), dt.datet
                out + '/int96.parquet', use_deprecated_int96_timestamps=True)
 print('SUCCESS')
 """
+
+# Fixed-size lists with a null element, at each position a fixed-size list can sit. The
+# only null elements are in row 5, so with `row_group_size=2` a single row group has one.
+# `ok` has none and stays fixed-size.
+const HARNESS_FIXED_SIZE_NULL_ELEMENT = """
+import pyarrow as pa, pyarrow.parquet as pq, datetime as dt
+f, n = pa.list_(pa.int32(), 3), 8
+row = lambda i: [i, None if i == 5 else i + 1, i + 2]
+table = pa.table({
+    'top': pa.array([row(i) for i in range(n)], f),
+    'st':  pa.array([{'a': i, 'v': row(i)} for i in range(n)], pa.struct([('a', pa.int64()), ('v', f)])),
+    'li':  pa.array([None if i == 2 else [row(i)] * (i % 3) for i in range(n)], pa.list_(f)),
+    'mp':  pa.array([[('k%d' % i, row(i))] if i % 2 else [] for i in range(n)], pa.map_(pa.string(), f)),
+    'dt':  pa.array([[dt.date(2020, 1, i + 1), None if i == 5 else dt.date(2021, 1, i + 1)] for i in range(n)], pa.list_(pa.date32(), 2)),
+    'bo':  pa.array([[True, None if i == 5 else False] for i in range(n)], pa.list_(pa.bool_(), 2)),
+    'ok':  pa.array([[i, i + 1, i + 2] for i in range(n)], f),
+})
+"""
