@@ -53,7 +53,7 @@ Parquet3 now reads every nested shape Parquet can hold and writes Parquet files.
 - The first write of a table that contains a fixed-size list takes 5–20 s (one-time compilation per table schema).
 - `Arrow = "~2.8.1"`: the package uses Arrow.jl internals, so each Arrow minor release needs a check before the bound is raised.
 
-The full list is in `dev-note.md`, "Known Limitations".
+The full list is in [docs/limitations.md](docs/limitations.md).
 
 ## v0.1.0
 
