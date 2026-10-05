@@ -2685,13 +2685,13 @@ end
 @group "FixedSizeList element types" begin
     P = Parquet3
     # A fixed-size list is restored when its element is fixed-width; of anything else it reads as a list
-    fixed_kinds = (:bool, :date, :tsms, :tsus, :i8, :u16, :u64, :f32, :f64, :dur, :time)
+    fixed_kinds = (:bool, :date, :tsms, :tsus, :i8, :u8, :u16, :u64, :f32, :f64, :dur, :time)
     list_kinds = (:str, :bin, :flba, :dec9, :dec30, :f16)
     be(i, nbytes) = reverse!(collect(reinterpret(UInt8, [Int128(100i)])))[end - nbytes + 1:end]   # decimal i.00, big-endian
     expected = Dict{Symbol, Any}(
         :str => i -> "s$i", :bin => i -> fill(UInt8('b'), i), :bool => isodd, :date => i -> Date(2020, 1, i),
         :tsms => i -> DateTime(2020, 1, i), :tsus => i -> Dates.value(DateTime(2020, 1, i) - DateTime(1970)) * 1000,
-        :i8 => Int8, :u16 => UInt16, :u64 => UInt64, :f32 => Float32, :f64 => Float64,
+        :i8 => Int8, :u8 => UInt8, :u16 => UInt16, :u64 => UInt64, :f32 => Float32, :f64 => Float64,
         :flba => i -> Vector{UInt8}(lpad(i, 3, '0')), :dec9 => i -> be(i, 4), :dec30 => i -> be(i, 13),
         :f16 => i -> collect(reinterpret(UInt8, [Float16(i)])), :dur => Int64, :time => i -> Int32(1000i))
     plain(x) = x isa Arrow.Timestamp ? x.x : x isa Union{Base.CodeUnits, AbstractVector{UInt8}} ? Vector{UInt8}(x) :
@@ -2735,6 +2735,12 @@ end
                    x isa Arrow.Timestamp ? x.x : x isa Union{AbstractVector, Tuple} && !(x isa Union{Base.CodeUnits, AbstractVector{UInt8}}) ? Any[canon(v) for v in x] :
                    x isa NamedTuple ? map(canon, x) : plain(x)
         @test all(isequal(canon(Tables.getcolumn(a, k)), canon(Tables.getcolumn(t, k))) for k in Tables.columnnames(t))
+        # A fixed-size list of UInt8 stays one for pyarrow, in the Parquet file (checked with
+        # the other kinds above) and in the Arrow file; Arrow.jl would declare it fixed-size binary
+        arrow_file = joinpath(dir, "plain.arrow")
+        Arrow.write(arrow_file, t)
+        @test _run_pyarrow("import pyarrow as pa\ns = pa.ipc.open_file('$(arrow_file)').schema\nprint(pa.types.is_fixed_size_list(s.field('top_u8').type), s.field('top_u8').type.value_type, pa.types.is_fixed_size_list(s.field('li_u8').type.value_type))") ==
+              "True uint8 True"
         changed = _run_pyarrow("""
 import pyarrow.parquet as pq
 a, b = pq.read_schema('$(joinpath(dir, "plain.parquet"))'), pq.read_schema('$(out)')

@@ -120,6 +120,11 @@ What Parquet3 carries only because Arrow.jl lacks it, and what would go once it 
    constructors, the `Arrow.arrowvector` method, the `.arrays` property on `NestedColumn`,
    and the tight compat pin.
 
+5. A fixed-size list of `UInt8` that is not fixed-size binary. Arrow.jl turns any
+   fixed-size list with element type exactly `UInt8` into `FixedSizeBinary`. Would delete:
+   the two workarounds that present the elements as nullable (`_concrete_view` in the
+   writer, `_fixed_size_child` for `Arrow.write`).
+
 ## Small clean-ups carried over
 - [ ] `_read_leaf` scans a flat column's levels twice when its parent needs them:
       `assemble_flat_column` and then `_page_defs` (src/reader.jl). Minor; measure first.

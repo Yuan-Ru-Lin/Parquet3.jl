@@ -333,6 +333,9 @@ _fixed_size_child(data::Vector{T}, nulls::Union{BitVector, Nothing}) where {T <:
     Arrow.Primitive(nulls === nothing ? T : Union{Missing, T}, UInt8[],
                     _validity(nulls === nothing ? falses(length(data)) : nulls), data, length(data), nothing)
 _fixed_size_child(data::Vector{Bool}, nulls::Union{BitVector, Nothing}) = _fixed_size_child_encoded(data, nulls)
+# Arrow.jl writes a fixed-size list whose child has element type exactly `UInt8` as
+# fixed-size binary; with a validity bitmap on the child (all valid) it stays a list
+_fixed_size_child(data::Vector{UInt8}, ::Nothing) = _fixed_size_child(data, falses(length(data)))
 _fixed_size_child(data::Vector, nulls::Union{BitVector, Nothing}) = _fixed_size_child_encoded(data, nulls)
 _fixed_size_child_encoded(data::Vector{T}, nulls) where T =
     Arrow.toarrowvector(nulls === nothing ? data : Union{Missing, T}[n ? missing : d for (d, n) in zip(data, nulls)])

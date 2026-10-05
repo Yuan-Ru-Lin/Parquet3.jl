@@ -212,6 +212,9 @@ function _schema_eltype(::Type{FT}) where FT
 end
 _concrete_view(::Type{<:FixedSizeView{N, E}}) where {N, E} =
     Missing <: E ? FixedSizeView{N, E, Base.nonmissingtype(E), BitVector} : FixedSizeView{N, E, E, Nothing}
+# Arrow.jl declares a fixed-size list whose element type is exactly `UInt8` as fixed-size
+# binary. Declared with nullable elements it stays a fixed-size list, which is what it is.
+_concrete_view(::Type{<:FixedSizeView{N, UInt8}}) where N = FixedSizeView{N, Union{Missing, UInt8}, UInt8, BitVector}
 
 """
 The table's Arrow schema as an `ARROW:schema` key-value entry (base64 of an IPC schema

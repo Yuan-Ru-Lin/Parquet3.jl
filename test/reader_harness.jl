@@ -276,6 +276,7 @@ plain = {
     'tsms': (pa.timestamp('ms'), [dt.datetime(2020, 1, i) for i in n]),
     'tsus': (pa.timestamp('us', tz='UTC'), [dt.datetime(2020, 1, i) for i in n]),
     'i8':   (pa.int8(), list(n)),
+    'u8':   (pa.uint8(), list(n)),
     'u16':  (pa.uint16(), list(n)),
     'u64':  (pa.uint64(), list(n)),
     'f32':  (pa.float32(), [float(i) for i in n]),

@@ -172,7 +172,9 @@ minor release:
   `ARROW:schema`), `Arrow.FlatBuffers.getrootas` and the `Arrow.Meta` schema types
   (`Schema`, `Message`, `Field`, `Struct`, `List`, `LargeList`, `FixedSizeList`, `Map`,
   `TimeUnit`), used to read `ARROW:schema`;
-- `ArrowTypes.ArrowKind` / `ArrowTypes.FixedSizeListKind` (public, listed for completeness).
+- `ArrowTypes.ArrowKind` / `ArrowTypes.FixedSizeListKind` (public, listed for completeness);
+- the behaviour that a fixed-size list of exactly `UInt8` becomes fixed-size binary, which
+  the two workarounds above depend on.
 
 Several row groups: `Arrow.write(io, table)` asks the table for partitions. Arrow.jl
 splits a table whose first column is a `ChainedVector` by taking `column.arrays[i]` of
@@ -223,6 +225,13 @@ every shape, so a change in pyarrow's behaviour would show up there.
 Because dispatch is on element type, the reader's containers (`Arrow.List`, `StructColumn`,
 `ListOfStructsColumn`, `FixedSizeListVector`, `ChainedVector` chunks) are written without
 special cases.
+
+Arrow.jl declares a fixed-size list whose element type is exactly `UInt8` as fixed-size
+binary (`src/eltypes.jl` in Arrow.jl 2.8.1), which is not what a `FixedSizeList<UInt8>`
+column is. Both places that hand such a column to Arrow.jl therefore present its elements
+as nullable, which keeps it a list: `_concrete_view` for the `ARROW:schema` entry and
+`_fixed_size_child` for `Arrow.write`. pyarrow then sees `fixed_size_list<uint8>[N]`, with
+a nullable element field as in its own files.
 
 A `FixedSizeListVector` is written as a plain LIST, as pyarrow does; the fixed size lives
 in the `ARROW:schema` key-value entry. `_arrow_schema_kv` gets that entry from Arrow.jl
