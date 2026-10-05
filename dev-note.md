@@ -97,8 +97,7 @@ elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`); `_member_list` projects a field through every list level,
 sharing each level's offsets and validity. Both are one type, `NestedColumn`.
 `Arrow.Struct` stores fields positionally with no name-based access, which is why the
-wrapper exists; `Arrow.write` serializes a wrapped column by re-encoding it row by row,
-not by reusing the buffers (see Known Limitations for the one shape that fails).
+wrapper exists.
 
 **Maps.** A MAP group plans as a `:map` node: a list whose element is the key/value struct.
 It assembles exactly as a list (Arrow's own layout for a map) and stage 2 wraps the
@@ -119,6 +118,38 @@ writes back as a map; `Arrow.write` turns it into an `Arrow.Map` through ArrowTy
 **A column chunk with no pages** (zero-row file or row group) gets one empty page of the
 leaf's physical type (`_empty_pages`), so every shape assembles to a typed empty column,
 with no `Missing` anywhere since no null was seen.
+
+## Arrow.write
+
+`Arrow.write` takes an array of Arrow.jl's own types as it is and re-encodes anything else
+row by row. Everything `read_parquet` returns is an Arrow.jl array underneath, so
+`_arrow_native` (src/arrays.jl) hands Arrow.jl the equivalent array of its own types over
+the same buffers, and `Arrow.arrowvector` is defined for our three array types to call it:
+
+| Returned by `read_parquet` | Given to Arrow.jl | Buffers |
+|---|---|---|
+| plain, string, list columns | themselves (`Arrow.Primitive`, `Arrow.BoolVector`, `Arrow.List`) | as they are |
+| binary | itself; its element type is Arrow.jl's binary type, `Base.CodeUnits` | as they are |
+| `StructColumn`, `ListOfStructsColumn` | the wrapped `Arrow.Struct` / `Arrow.List` | reused |
+| `FixedSizeListVector` (top level or struct member) | `Arrow.FixedSizeList` over an `Arrow.Primitive` of the flat vector | reused |
+| `MapColumn` / `MapVector` | `Arrow.Map` over the same offsets and key/value struct | reused |
+
+A parent is rebuilt (a new header, no data) only when one of its children changed type.
+
+Several row groups: `Arrow.write(io, table)` asks the table for partitions. Arrow.jl
+splits a table whose first column is a `ChainedVector` by taking `column.arrays[i]` of
+every column, so a wrapper answers `.arrays` with its per-row-group chunks. Each row group
+then becomes one Arrow record batch, with its buffers reused. Two cases join the chunks
+into one array instead (`_arrow_concat`: one copy per buffer, column by column, not row by
+row): a chunked wrapper column written on its own, outside its table, and a table whose
+first column is a wrapper, which Arrow.jl treats as a single partition.
+
+Before this, wrapped columns were re-encoded row by row, which failed for a struct with a
+list member and a null row (Arrow.jl built a default list of the wrong type for it), and a
+multi-row-group table with a struct column could not be written at all.
+
+Read back with `Arrow.Table`, a fixed-size list is Arrow.jl's `NTuple`-based array and a
+map is an `Arrow.Map` of `Dict`s; the zero-copy views are this package's.
 
 ## Writer Design
 
@@ -270,7 +301,8 @@ corpus test when present and are not needed for a green run.
   - Fixed for v0.2.0 (2026-10-04): `dictionary_page_offset = 0` (`dict-page-offset-zero`); an empty v2 data section (`datapage_v2_empty_datapage.snappy`); v2 pages that store repetition levels for a non-repeated column, and RLE-encoded booleans (`rle_boolean_encoding`, `datapage_v2.snappy`).
 - The first `write_parquet` call for each new table schema that contains a FixedSizeList (top-level, or nested in structs or lists) takes 5–20 s. The `ARROW:schema` entry is produced by Arrow.jl's generic writer, which Julia compiles per table type. Tables without a FixedSizeList skip that path, and later writes of the same schema in the same session are fast. Hand-building the schema message would avoid it; that was decided against for v0.2.0.
 - Parquet stores only a UTC flag for timestamps, not a time zone name. An `Arrow.Timestamp` with a named zone is written as UTC-adjusted and reads back as `:UTC`. pyarrow shows it as `tz=UTC` too, unless the file also has an `ARROW:schema` entry (i.e. a FixedSizeList is present), in which case pyarrow restores the zone name from there. The instants are the same either way.
-- `Arrow.write` throws a `MethodError` for a struct column that has a list member and at least one null struct row (e.g. `wf: struct<t0, values: list<int32>>` with a null `wf`). Structs without null rows, structs without list members, and `List<Struct>` columns are written correctly. `write_parquet` is not affected. The cause is in the row-by-row re-encoding: for the null row Arrow.jl builds a default list whose type does not match our view-based element type.
+- `Arrow.write` cannot write INT96 columns (Arrow has no 96-bit integer); leave them out with `columns=`.
+- A multi-row-group table is split into Arrow record batches through each column's `arrays` property. A struct column with a member named `arrays` shadows it (`tbl.s.arrays` is the member), and `Arrow.write` of such a multi-row-group table fails.
 - Of the `logicalType` union only the TIMESTAMP member is parsed; everything else still relies on `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both). INT96 timestamps and TIME are not converted.
 - A `FixedSizeList` is restored at top level and as a struct member (at any struct depth). Inside a list (e.g. `list<fixed_size_list>`, `list<struct<…fsl…>>`) it is read as a variable-length list and written back as one: values are correct, but the fixed size is lost.
 - A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.

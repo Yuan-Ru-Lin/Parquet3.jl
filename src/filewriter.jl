@@ -36,7 +36,7 @@ _encode_values(values, enc::Encoding) =
     enc == BYTE_STREAM_SPLIT ? encode_byte_stream_split(values) :
     enc == DELTA_BINARY_PACKED ? encode_delta_binary_packed(physical_ints(values)) :
     enc == DELTA_LENGTH_BYTE_ARRAY ? encode_delta_length_byte_array(values) :
-    encode_plain(values)
+    enc == PLAIN ? encode_plain(values) : error("write_parquet: encoding $enc is not written")
 
 # A key names a leaf, or a struct/list above it
 _key_covers(key::String, leaf_key::String) = leaf_key == key || startswith(leaf_key, key * ".")

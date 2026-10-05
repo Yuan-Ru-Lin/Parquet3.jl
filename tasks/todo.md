@@ -132,7 +132,7 @@ Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, m
 - [x] A3 — layout, move-only: `typemap.jl`, `arrays.jl`; `api.jl` dissolved; files included
       in dependency order with the writer last; `encodings.jl` reordered so each decoder is
       followed by its encoder (same code lines).
-- [ ] B — `Arrow.write` for every column `read_parquet` returns
+- [x] B — `Arrow.write` for every column `read_parquet` returns (see the section below)
 - [ ] C — FixedSizeList inside a list (plan first)
 
 ## Deferred to v0.3 (refreshed 2026-10-04)
@@ -150,18 +150,22 @@ Out of scope: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for ints/FLBA, data page v2, m
 Done since this list was first written, no longer v0.3: nullability from decoded levels
 (shipped with the recursive reader); every nested shape and maps; member selection.
 
-## Arrow.write of nested columns (do with writer work)
-- [ ] `Arrow.write` does not see `NestedColumn` (StructColumn / ListOfStructsColumn) as an
-      Arrow array, so it re-encodes the column row by row (`Arrow.ToStruct` → `Arrow.ToList`)
-      instead of reusing the wrapped `Arrow.Struct` / `Arrow.List` buffers. Hand Arrow the
-      wrapped array directly; decide what to do for multi-RG `ChainedVector` chunks.
-- [ ] Same path throws for a nullable struct with a list member once a struct row is null:
-      `struct<a: int64, v: list<int64>>`, rows `[{a:1, v:[1]}, None]` →
-      `MethodError: Cannot convert SubArray{…Vector…} to SubArray{…Arrow.Primitive…}`.
-      Reproduced. Likely disappears once the row-by-row path is bypassed; re-check after.
-- [x] dev-note "verified by round-trip" claim is false for the struct-with-list shape; fix
-      the claim and add a round-trip test with a null struct row. (Claim corrected, failure
-      listed under Known Limitations, `@test_broken` pins it; the bug itself is still open.)
+## Arrow.write of nested columns (DONE 2026-10-04, part B; awaiting review)
+- [x] Wrapped columns, fixed-size lists, maps and binary are handed to Arrow.jl as arrays of
+      its own types over the same buffers (`_arrow_native`); nothing is re-encoded.
+- [x] The struct-with-list-member-and-null-row failure is gone (the row-by-row path is no
+      longer used); the two `@test_broken` are ordinary tests.
+- [x] Multi-row-group tables: one record batch per row group, through a `.arrays` answer on
+      the wrapper. Found on the way: such a table with a struct column could not be written
+      at all before (`FieldError: no field arrays`).
+- [x] A chunked wrapper column written on its own is joined into one array (`_arrow_concat`).
+- [x] Binary columns now read with Arrow.jl's binary element type, `Base.CodeUnits`, instead
+      of `Vector{UInt8}` (a single-row-group binary column could not be written before).
+      `write_parquet` accepts both as bytes.
+- [x] Fall-through audit: DELTA_BINARY_PACKED and DELTA_LENGTH_BYTE_ARRAY on a type they are
+      not defined for, and an unknown level encoding, are errors; the writer's value encoder
+      no longer defaults to PLAIN for an encoding it does not know.
+- Not covered: INT96 columns (no Arrow type).
 
 ---
 

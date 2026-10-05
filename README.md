@@ -71,6 +71,8 @@ A column's element type admits `Missing` exactly where a null occurs in the data
 
 A column that cannot be read (an encoding or type not supported yet) throws a `Parquet3.ColumnReadError` naming it; nothing is skipped silently. Pass `columns=` without that column, or without that member, to read the rest.
 
+The result can be written as Arrow IPC with `Arrow.write(path, tbl)`: every column kind is handed to Arrow.jl over the buffers that were read, without re-encoding, and a multi-row-group file becomes one record batch per row group. Binary columns have Arrow.jl's binary element type (`Base.CodeUnits`, an `AbstractVector{UInt8}`).
+
 `read_parquet` returns an `Arrow.Table`, which implements the Tables.jl interface:
 
 ```julia

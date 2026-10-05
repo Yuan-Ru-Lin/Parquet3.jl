@@ -52,13 +52,16 @@ function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, en
         len = ltoh(reinterpret(UInt32, @view data[1:4])[1])
         levels = decode_rle_bitpacked(@view(data[5:4+len]), count, bit_width)
         return (Int.(levels), 4 + Int(len))
-    else
+    elseif encoding == BIT_PACKED
         bytes = cld(count * bit_width, 8)
         levels = unpack_bits(@view(data[1:bytes]), count, bit_width)
         return (Int.(levels), bytes)
     end
+    error("Unsupported level encoding: $encoding")
 end
 
+# Each encoding is decoded only for the physical types it is defined for; any other pair
+# is an error, never a decode as some other type.
 function decode_values(data, count, ptype, encoding, type_len, dict)
     if encoding == PLAIN
         decode_plain(ptype, data, count, type_len)
@@ -66,10 +69,12 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
         dict === nothing && error("No dictionary for dictionary encoding")
         decode_dictionary(dict, data, count)
     elseif encoding == DELTA_BINARY_PACKED
+        ptype in (INT32, INT64) || error("DELTA_BINARY_PACKED is defined for INT32 and INT64 only, not $ptype")
         vals, _ = decode_delta_binary_packed(data, count)
         # Truncating, not checked: INT32 deltas wrap around in 32 bits
         ptype == INT32 ? vals .% Int32 : vals
     elseif encoding == DELTA_LENGTH_BYTE_ARRAY
+        ptype == BYTE_ARRAY || error("DELTA_LENGTH_BYTE_ARRAY is defined for BYTE_ARRAY only, not $ptype")
         decode_delta_length_byte_array(data, count)
     elseif encoding == BYTE_STREAM_SPLIT
         ptype in (FLOAT, DOUBLE, INT32, INT64) ||
@@ -78,7 +83,7 @@ function decode_values(data, count, ptype, encoding, type_len, dict)
     elseif encoding == RLE && ptype == BOOLEAN
         decode_rle_boolean(data, count)
     else
-        error("Unsupported encoding: $encoding")
+        error("Unsupported encoding: $encoding for $ptype")
     end
 end
 

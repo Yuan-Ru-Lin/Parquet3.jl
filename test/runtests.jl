@@ -82,6 +82,20 @@ using Dates
         @test (Parquet3._record_defs(rep, def) .< 1) == [false, true, false, false]
     end
 
+    @testset "An encoding on a type it is not defined for is an error" begin
+        P = Parquet3
+        data = zeros(UInt8, 64)
+        # never decoded as some other type (an INT64 BYTE_STREAM_SPLIT column once came back as Float64)
+        @test_throws "BYTE_STREAM_SPLIT" P.decode_values(data, 4, P.FIXED_LEN_BYTE_ARRAY, P.BYTE_STREAM_SPLIT, 4, nothing)
+        @test_throws "DELTA_BINARY_PACKED" P.decode_values(data, 4, P.DOUBLE, P.DELTA_BINARY_PACKED, 0, nothing)
+        @test_throws "DELTA_LENGTH_BYTE_ARRAY" P.decode_values(data, 4, P.INT32, P.DELTA_LENGTH_BYTE_ARRAY, 0, nothing)
+        @test_throws "Unsupported encoding: RLE for INT32" P.decode_values(data, 4, P.INT32, P.RLE, 0, nothing)
+        @test_throws "Unsupported encoding" P.decode_values(data, 4, P.BYTE_ARRAY, P.DELTA_BYTE_ARRAY, 0, nothing)
+        @test_throws "Unsupported level encoding" P.read_levels(data, 4, 1, P.PLAIN)
+        @test eltype(P.decode_values(data, 4, P.INT64, P.BYTE_STREAM_SPLIT, 0, nothing)) == Int64
+        @test_throws "is not written" P._encode_values([1.5], P.RLE_DICTIONARY)
+    end
+
     @testset "Snappy Decompression" begin
         compressed = UInt8[0x05, 0x10, 0x68, 0x65, 0x6c, 0x6c, 0x6f]
         @test String(Parquet3.decompress(compressed, Parquet3.SNAPPY, 5)) == "hello"
