@@ -54,7 +54,7 @@ function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, en
         return (Int.(levels), 4 + Int(len))
     elseif encoding == BIT_PACKED
         bytes = cld(count * bit_width, 8)
-        levels = unpack_bits(@view(data[1:bytes]), count, bit_width)
+        levels = unpack_bits_msb(@view(data[1:bytes]), count, bit_width)
         return (Int.(levels), bytes)
     end
     error("Unsupported level encoding: $encoding")

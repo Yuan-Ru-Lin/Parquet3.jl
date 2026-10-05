@@ -126,15 +126,24 @@ _write_zigzag(io::IO, v::Integer) = (x = Int64(v); _write_varint(io, reinterpret
 level_bit_width(max_level::Integer) = ndigits(max_level, base = 2)
 
 """
-    unpack_bits(data, count, bit_width) -> Vector{UInt32}
+    unpack_bits_msb(data, count, bit_width) -> Vector{UInt32}
 
-Unpack `count` values from bit-packed data where each value is `bit_width` bits.
+Unpack `count` values of `bit_width` bits packed from the most significant bit of each
+byte downwards. This is the layout of the deprecated BIT_PACKED level encoding only; the
+bit-packed runs of the RLE hybrid, and everything else, are packed LSB-first
+(`unpack_bits!`). The format's example: 0 to 7 at width 3 is `00000101 00111001 01110111`.
 """
-function unpack_bits(data::AbstractVector{UInt8}, count::Int, bit_width::Int)
-    bit_width == 0 && return zeros(UInt32, count)
-
+function unpack_bits_msb(data::AbstractVector{UInt8}, count::Int, bit_width::Int)
     result = Vector{UInt32}(undef, count)
-    _unpack_bits_into!(result, 1, data, count, bit_width)
+    bit = 0
+    for i in 1:count
+        value = UInt32(0)
+        for _ in 1:bit_width
+            value = (value << 1) | ((data[(bit >> 3) + 1] >> (7 - (bit & 7))) & 0x01)
+            bit += 1
+        end
+        result[i] = value
+    end
     result
 end
 
@@ -150,7 +159,7 @@ function unpack_bits!(result::Vector{U}, offset::Int, data::AbstractVector{UInt8
 end
 
 """
-Inner loop shared by unpack_bits and unpack_bits!.
+Inner loop of unpack_bits!.
 Uses an accumulator twice as wide as the values to extract them with shift+mask
 instead of a byte-at-a-time inner loop (UInt64 for levels and indices, UInt128
 for delta values, whose bit width can reach 64).

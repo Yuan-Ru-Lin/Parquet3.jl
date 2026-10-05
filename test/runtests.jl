@@ -46,6 +46,13 @@ end
                                      Parquet3.SchemaNode(element = Parquet3.SchemaElement()), Parquet3.ReadNode[])
     structure(rep, def, k) = Parquet3._list_structure(Parquet3.Levels(rep, def), k - 1, k - 1, list_node(k))
 
+    @testset "Deprecated BIT_PACKED levels are packed MSB-first" begin
+        # The example in the format specification: 0 to 7 at three bits each
+        @test Parquet3.read_levels(UInt8[0b00000101, 0b00111001, 0b01110111], 8, 7, Parquet3.BIT_PACKED) == (collect(0:7), 3)
+        # One bit per level, with a partial last byte
+        @test Parquet3.read_levels(UInt8[0b10110010, 0b10000000], 9, 1, Parquet3.BIT_PACKED) == ([1, 0, 1, 1, 0, 0, 1, 0, 1], 2)
+    end
+
     @testset "Nested Column Assembly" begin
         # [[1, 2], [3], [4, 5, 6]]: rep 0 starts a record, 1 continues its list; def 2 = value
         rep, def = [0, 1, 0, 0, 1, 1], [2, 2, 2, 2, 2, 2]
