@@ -3,6 +3,7 @@ using Parquet3
 using Arrow
 using Tables
 using Dates
+using Artifacts, LazyArtifacts
 
 # Selective runs: `Pkg.test(test_args=["FixedSizeList", "Writer"])` runs only the groups
 # whose name contains one of the arguments (case-insensitive); without arguments every
@@ -129,7 +130,7 @@ end
 const PYHELPER_DIR = joinpath(@__DIR__, "pyhelper")
 
 # With PARQUET3_TEST_STRICT set (CI sets it), a missing test dependency is a failure, not
-# a skip: `uv`/pyarrow for the cross-checks, and the parquet-testing submodule. Without
+# a skip: `uv`/pyarrow for the cross-checks, and the parquet-testing files. Without
 # it, as on a machine that has neither, those tests are skipped with a warning.
 const TEST_STRICT = lowercase(get(ENV, "PARQUET3_TEST_STRICT", "")) in ("1", "true", "yes")
 
@@ -1793,7 +1794,16 @@ end
 # Apache parquet-testing suite
 # =============================================================================
 
-const PARQUET_TESTING_DIR = joinpath(@__DIR__, "parquet-testing", "data")
+# The files are an artifact (test/Artifacts.toml): the Apache parquet-testing repository at a
+# pinned commit, downloaded on first use. When it cannot be fetched the suite is skipped
+# with a warning, or fails under PARQUET3_TEST_STRICT.
+const PARQUET_TESTING_COMMIT = "92d45b0752487a4b55fb7f1581c8126ee3e73b0d"
+const PARQUET_TESTING_DIR = try
+    joinpath(artifact"parquet_testing", "parquet-testing-" * PARQUET_TESTING_COMMIT, "data")
+catch err
+    @warn "The parquet-testing artifact could not be fetched" exception = err
+    ""
+end
 const HAS_PARQUET_TESTING = isdir(PARQUET_TESTING_DIR)
 
 # file => columns that cannot be read yet (see Known Limitations in dev-note.md).
@@ -2124,10 +2134,10 @@ if HAS_PARQUET_TESTING
 
 elseif TEST_STRICT
     @testset "parquet-testing submodule" begin
-        @test HAS_PARQUET_TESTING     # PARQUET3_TEST_STRICT is set: clone with --recurse-submodules
+        @test HAS_PARQUET_TESTING     # PARQUET3_TEST_STRICT is set: the parquet-testing artifact must be available
     end
 else
-    @warn "Skipping parquet-testing suite: submodule not found at $PARQUET_TESTING_DIR"
+    @warn "Skipping parquet-testing suite: the artifact is not available"
 end
 
 # =============================================================================

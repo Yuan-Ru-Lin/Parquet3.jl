@@ -23,6 +23,7 @@ Thrift = "8d9c9c80-f77e-5080-9541-c6f69d204e22"
 [compat]
 ArraysOfArrays = "0.6.6"
 Arrow = "~2.8.1"
+Artifacts = "<0.0.1, 1"
 ArrowTypes = "2.3.0"
 Base64 = "<0.0.1, 1"
 BitIntegers = "0.3.7"
@@ -32,6 +33,7 @@ ChunkCodecLibSnappy = "1.0.0"
 ChunkCodecLibZlib = "1.1.0"
 ChunkCodecLibZstd = "1.0.0"
 Dates = "<0.0.1, 1"
+LazyArtifacts = "<0.0.1, 1"
 Mmap = "<0.0.1, 1"
 SentinelArrays = "1.4.9"
 Tables = "1.13.0"
@@ -40,7 +42,9 @@ Thrift = "0.8.5"
 julia = "1.10"
 
 [extras]
+Artifacts = "56f22d72-fd6d-98f1-02f0-08ddc0907c33"
+LazyArtifacts = "4af54fe1-eca0-43a8-85a7-787d91b784e3"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Test"]
+test = ["Artifacts", "LazyArtifacts", "Test"]

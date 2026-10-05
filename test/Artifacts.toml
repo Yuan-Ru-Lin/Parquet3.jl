@@ -1,0 +1,9 @@
+# The Apache parquet-testing repository at the commit the tests were written against.
+# Used only by the tests; downloaded on first use.
+[parquet_testing]
+git-tree-sha1 = "ec6911ab1ee461ae075670a32ab1dcd8fd39b684"
+lazy = true
+
+    [[parquet_testing.download]]
+    url = "https://github.com/apache/parquet-testing/archive/92d45b0752487a4b55fb7f1581c8126ee3e73b0d.tar.gz"
+    sha256 = "bca8321aa0fdbd3cab5285307d47aaf286bd3245f2d2f4a755bdf5b4c249cc39"
