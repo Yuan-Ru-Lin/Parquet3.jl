@@ -77,6 +77,26 @@ Done since this list was first written, no longer v0.3: nullability from decoded
 (shipped with the recursive reader); every nested shape and maps; member selection.
 
 
+## Upstream to Arrow.jl (not tied to a Parquet3 version)
+Parquet3 builds its own Arrow array types, which means implementing Arrow.jl's internal
+interface for them. The user's position (2026-10-04): that is a sign the types belong
+upstream, where a change to the interface would be made together with them. For v0.2.0 the
+overloads stay, contained by the `Arrow = "~2.8.1"` pin. The fix is upstreaming, not removal.
+What Parquet3 carries only because Arrow.jl lacks it, and what would go once it lands there:
+1. View-based fixed-size lists. `Arrow.FixedSizeList` materialises an `NTuple` per access.
+   Would delete: `FixedSizeListVector` / `FixedSizeView` (and the element-null variants),
+   their `_arrow_native` conversion and the `ArrowKind` declarations. quinnj welcomed this on
+   the v0.1 announcement thread (discourse.julialang.org/t/136295, post 2).
+2. Zero-copy map rows. `Arrow.Map` builds a `Dict` per access. Would delete: `MapView`,
+   `MapVector` and their conversion.
+3. Named, columnar access to struct members, also through list levels. `Arrow.Struct`
+   stores members positionally with no access by name. Would delete: `NestedColumn`
+   (`StructColumn`, `ListOfStructsColumn`, `MapColumn`, `ListColumn`), `_member_list`.
+4. A public way to build Arrow arrays from existing buffers and to tell `Arrow.write` "this
+   column already is an Arrow array". Would delete: the calls to the internal positional
+   constructors, the `Arrow.arrowvector` method, the `.arrays` property on `NestedColumn`,
+   and the tight compat pin.
+
 ## Small clean-ups carried over
 - [ ] `_read_leaf` scans a flat column's levels twice when its parent needs them:
       `assemble_flat_column` and then `_page_defs` (src/reader.jl). Minor; measure first.

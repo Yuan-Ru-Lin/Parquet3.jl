@@ -155,6 +155,25 @@ the same buffers, and `Arrow.arrowvector` is defined for our three array types t
 
 A parent is rebuilt (a new header, no data) only when one of its children changed type.
 
+**Coupling to Arrow.jl, and the intent.** This package builds its own Arrow array types
+(view-based fixed-size lists, map views, wrappers with named access), so it has to
+implement Arrow.jl's internal interface for them. That is deliberate, not an accident:
+these types belong upstream, and the plan is to offer them to Arrow.jl rather than to
+remove the overloads (`tasks/todo.md`, "Upstream to Arrow.jl"). Until then the compat
+bound is `Arrow = "~2.8.1"`, and these internal names must be re-checked on each Arrow
+minor release:
+- the method `Arrow.arrowvector(x, i, nl, fi, de, ded, meta; kw...)`, extended for our types;
+- the `arrays` property Arrow.jl reads from every column when it splits a table whose first
+  column is a `ChainedVector` (`Tables.partitions` of an `Arrow.Table`);
+- the positional constructors and fields of `Arrow.Primitive`, `Arrow.BoolVector`,
+  `Arrow.List`, `Arrow.Struct`, `Arrow.FixedSizeList`, `Arrow.Map`, `Arrow.Offsets`,
+  `Arrow.ValidityBitmap`, and of `Arrow.Table` (built field by field in `read_parquet`);
+- `Arrow.toarrowvector`, `Arrow.getmetadata`, `Arrow.tobuffer` (the schema message for
+  `ARROW:schema`), `Arrow.FlatBuffers.getrootas` and the `Arrow.Meta` schema types
+  (`Schema`, `Message`, `Field`, `Struct`, `List`, `LargeList`, `FixedSizeList`, `Map`,
+  `TimeUnit`), used to read `ARROW:schema`;
+- `ArrowTypes.ArrowKind` / `ArrowTypes.FixedSizeListKind` (public, listed for completeness).
+
 Several row groups: `Arrow.write(io, table)` asks the table for partitions. Arrow.jl
 splits a table whose first column is a `ChainedVector` by taking `column.arrays[i]` of
 every column, so a wrapper answers `.arrays` with its per-row-group chunks. Each row group
