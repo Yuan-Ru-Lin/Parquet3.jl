@@ -218,6 +218,18 @@ list whose elements are not primitives (strings, structs).
 - A file whose lists do not all have the declared size: today's loop ignores extra
   elements and leaves short ones unfilled. Unchanged; worth an explicit error later.
 
+## Breaking changes to list in the v0.2.0 changelog (collected as decided)
+- Binary (raw-bytes) columns read with element type `Base.CodeUnits{UInt8, String}` instead
+  of `Vector{UInt8}`. Only raw-bytes columns are affected; code that mutates the bytes or
+  dispatches on `Vector{UInt8}` needs `Vector(x)`.
+- Element types admit `Missing` only where a null occurs (see the R7 report for the cases).
+- Shapes that read as flattened dotted columns are one nested column; maps are `MapColumn`.
+- `columns=` takes short dotted paths; an unmatched key is an `ArgumentError`.
+- A column that cannot be read throws `ColumnReadError` instead of being skipped.
+- An empty list that cannot be null reads as `[]`, not `missing`.
+- UTC and sub-millisecond timestamps read as `Arrow.Timestamp`, not `DateTime`.
+- A missing file is a `SystemError`; nothing is created at the path.
+
 ## Deferred to v0.3 (refreshed 2026-10-04)
 - Multiple row groups and multiple pages on write; min/max statistics
 - E4 — Dictionary encoding on write (RLE_DICTIONARY). `:dictionary` is not an accepted
@@ -230,6 +242,14 @@ list whose elements are not primitives (strings, structs).
 - First-write latency for tables with a FixedSizeList (build the ARROW:schema message
   without Arrow.jl's generic writer)
 - Infer struct member types for loosely typed `NamedTuple` / `Dict` literals
+- 2-D fixed-size lists (`fixed_size_list<fixed_size_list<T>[M]>[N]`), an edge case that must
+  not slow the 1-D waveform path. Design recorded 2026-10-04 (the user's suggestion): treat
+  it as ONE flat fixed-size list of N×M values with a shape, and present each row as a
+  zero-copy M×N view (a reshaped view, or a shape on the view type). `FixedSizeListVector`'s
+  storage and stride logic stay as they are; `FixedSizeView` is NOT made generic over its
+  parent. Arrow's canonical "fixed shape tensor" extension type (a flat fixed-size list plus
+  a shape in metadata) is the interchange form to look at. Applies only when inner lists
+  are never null; otherwise today's behaviour (inner fixed, outer variable).
 Done since this list was first written, no longer v0.3: nullability from decoded levels
 (shipped with the recursive reader); every nested shape and maps; member selection.
 

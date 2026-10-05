@@ -64,7 +64,8 @@ schema node the kind was read from (for a leaf, its column path).
 
 Levels, all cumulative definition/repetition levels as in the schema tree: the node is
 non-null when `def >= def_level`; `rep_level` counts the enclosing lists, a list included;
-for a list, an item exists when `def >= item_def`.
+for a list, an item exists when `def >= item_def`. `fsl_size` is the list's fixed size
+when `ARROW:schema` declares it a FixedSizeList, else 0.
 """
 struct ReadNode
     kind::Symbol
@@ -76,27 +77,62 @@ struct ReadNode
     item_def::Int
     schema::SchemaNode
     children::Vector{ReadNode}
+    fsl_size::Int
 end
+
+ReadNode(kind, name, key, path, def_level, rep_level, item_def, schema, children) =
+    ReadNode(kind, name, key, path, def_level, rep_level, item_def, schema, children, 0)
+
+# The Arrow schema (from ARROW:schema) has the same tree shape as the read plan: a struct's
+# members by name, a list's single element, a map's entries struct. The planner walks both
+# together, so a FixedSizeList is found at any depth. Where the trees do not line up, the
+# Arrow side is simply `nothing` from there down.
+const ArrowField = Union{Arrow.Meta.Field, Nothing}
+
+_arrow_children(field::ArrowField) = field === nothing || field.children === nothing ? () : field.children
+
+"""The Arrow field of struct member `name`."""
+function _arrow_member(field::ArrowField, name::String)
+    field !== nothing && field.type isa Arrow.Meta.Struct || return nothing
+    i = findfirst(child -> child.name == name, collect(_arrow_children(field)))
+    i === nothing ? nothing : _arrow_children(field)[i]
+end
+
+"""The Arrow field of a list's element (for a map, its entries struct)."""
+function _arrow_element(field::ArrowField)
+    children = _arrow_children(field)
+    field !== nothing && length(children) == 1 &&
+        field.type isa Union{Arrow.Meta.List, Arrow.Meta.LargeList, Arrow.Meta.FixedSizeList, Arrow.Meta.Map} ?
+        only(children) : nothing
+end
+
+_arrow_fsl_size(field::ArrowField) =
+    field !== nothing && field.type isa Arrow.Meta.FixedSizeList ? Int(field.type.listSize) : 0
 
 _is_repeated(node::SchemaNode) = node.element.repetition_type == REPEATED
 _is_map(node::SchemaNode) = node.element.converted_type in (CT_MAP, CT_MAP_KEY_VALUE)
 
 """Plan the top-level columns of a schema tree."""
-plan_read_tree(root::SchemaNode) = [_plan_read(child, String[], "") for child in root.children]
+function plan_read_tree(root::SchemaNode, schema::Union{Arrow.Meta.Schema, Nothing} = nothing)
+    fields = schema === nothing || schema.fields === nothing ? () : collect(schema.fields)
+    top(name) = (i = findfirst(f -> f.name == name, fields); i === nothing ? nothing : fields[i])
+    [_plan_read(child, String[], "", top(child.element.name)) for child in root.children]
+end
 
 """
-Plan `node` as a field named after it under `parent_path` / `parent_key`. A repeated node
-is a list of itself; anything else is planned by `_plan_value`.
+Plan `node` as a field named after it under `parent_path` / `parent_key`, with `field` its
+Arrow counterpart if there is one. A repeated node is a list of itself; anything else is
+planned by `_plan_value`.
 """
-function _plan_read(node::SchemaNode, parent_path::Vector{String}, parent_key::String)
+function _plan_read(node::SchemaNode, parent_path::Vector{String}, parent_key::String, field::ArrowField)
     name = node.element.name
     path = [parent_path; name]
     key = isempty(parent_key) ? name : string(parent_key, ".", name)
-    _is_repeated(node) || return _plan_value(node, name, key, path)
+    _is_repeated(node) || return _plan_value(node, name, key, path, field)
     # A repeated field outside a LIST/MAP wrapper: a list that cannot be null, whose
     # elements are the node itself, taken as required.
     ReadNode(:list, name, key, path, node.max_def_level - 1, node.max_rep_level, node.max_def_level,
-             node, [_plan_value(node, name, key, path)])
+             node, [_plan_value(node, name, key, path, _arrow_element(field))], _arrow_fsl_size(field))
 end
 
 """
@@ -104,7 +140,7 @@ Plan `node` as a value: a leaf, a list (LIST or MAP group), or a struct. Also us
 item of a repeated node, which is present exactly when the item exists: its
 `max_def_level` is then the item's level, so the same rule gives a node that is never null.
 """
-function _plan_value(node::SchemaNode, name::String, key::String, path::Vector{String})
+function _plan_value(node::SchemaNode, name::String, key::String, path::Vector{String}, field::ArrowField)
     isempty(node.children) && return ReadNode(:leaf, name, key, path, node.max_def_level,
                                               node.max_rep_level, 0, node, ReadNode[])
     wrapped = node.element.converted_type == CT_LIST || _is_map(node)
@@ -113,12 +149,13 @@ function _plan_value(node::SchemaNode, name::String, key::String, path::Vector{S
         # A map needs both a key and a value; a MAP group with only keys is a list of them
         kind = _is_map(node) && length(rep.children) == 2 ? :map : :list
         return ReadNode(kind, name, key, path, node.max_def_level, rep.max_rep_level, rep.max_def_level,
-                        node, [_plan_element(node, rep, name, key, [path; rep.element.name])])
+                        node, [_plan_element(node, rep, name, key, [path; rep.element.name], _arrow_element(field))],
+                        _arrow_fsl_size(field))
     end
     # Any other group is a struct. That includes a group annotated LIST or MAP without the
     # single repeated child the annotation requires: its children are read as they are.
     ReadNode(:struct, name, key, path, node.max_def_level, node.max_rep_level, 0, node,
-             [_plan_read(child, path, key) for child in node.children])
+             [_plan_read(child, path, key, _arrow_member(field, child.element.name)) for child in node.children])
 end
 
 """
@@ -127,18 +164,19 @@ format's backward-compatibility rules: the repeated node is itself the element w
 a primitive, has several fields (a map's key and value, or a legacy struct element), or
 carries a legacy name (`array`, `<list>_tuple`); otherwise its single child is the element
 (the standard 3-level layout; also a map without values, which pyarrow reads as a list of
-its keys). Structural groups add nothing to the user key.
+its keys). Structural groups add nothing to the user key. `field` is the Arrow field of the
+element.
 """
-function _plan_element(list::SchemaNode, rep::SchemaNode, name::String, key::String, path::Vector{String})
+function _plan_element(list::SchemaNode, rep::SchemaNode, name::String, key::String, path::Vector{String}, field::ArrowField)
     legacy = isempty(rep.children) || length(rep.children) > 1 ||
              rep.element.name in ("array", list.element.name * "_tuple")
-    legacy && return _plan_value(rep, name, key, path)
+    legacy && return _plan_value(rep, name, key, path, field)
     element = only(rep.children)
     path = [path; element.element.name]
     _is_repeated(element) ?
         ReadNode(:list, name, key, path, element.max_def_level - 1, element.max_rep_level, element.max_def_level,
-                 element, [_plan_value(element, name, key, path)]) :
-        _plan_value(element, name, key, path)
+                 element, [_plan_value(element, name, key, path, _arrow_element(field))], _arrow_fsl_size(field)) :
+        _plan_value(element, name, key, path, field)
 end
 
 """All leaves under `node`, in schema order."""
@@ -176,7 +214,7 @@ function _prune(node::ReadNode, columns)
     any(c -> _key_covers(String(c), node.key), columns) && return node
     children = ReadNode[p for p in (_prune(child, columns) for child in node.children) if p !== nothing]
     isempty(children) ? nothing :
-        ReadNode(node.kind, node.name, node.key, node.path, node.def_level, node.rep_level, node.item_def, node.schema, children)
+        ReadNode(node.kind, node.name, node.key, node.path, node.def_level, node.rep_level, node.item_def, node.schema, children, node.fsl_size)
 end
 
 # ── Levels and fixed-size list buffers ────────────────────────────────────
@@ -356,7 +394,7 @@ struct Levels
 end
 
 # Per-file context for stage 1
-const ReadContext = @NamedTuple{data::Vector{UInt8}, fsl::Dict{String, Int}}
+const ReadContext = @NamedTuple{data::Vector{UInt8}}
 
 """
 Stage 1 for `node` in row group `rg` (`nothing` for a file without row groups).
@@ -383,8 +421,8 @@ function _read_buffers(ctx::ReadContext, rg::Union{RowGroup, Nothing}, node::Rea
     end
     # A list that ARROW:schema declares fixed-size, with a primitive element and outside other lists
     child = only(node.children)
-    if slot_rep == 0 && child.kind == :leaf && haskey(ctx.fsl, node.key)
-        return _read_fixed_size_list(ctx, rg, node, child, ctx.fsl[node.key], want_levels)
+    if slot_rep == 0 && child.kind == :leaf && node.fsl_size > 0
+        return _read_fixed_size_list(ctx, rg, node, child, node.fsl_size, want_levels)
     end
     raw_child, levels = _read_buffers(ctx, rg, child, node.rep_level, node.item_def, true)
     offsets, nulls = _list_structure(levels, slot_rep, slot_def, node)
@@ -525,11 +563,11 @@ function _read_column(ctx::ReadContext, row_groups::Vector{RowGroup}, node::Read
 end
 
 function read_parquet(pf::ParquetFile; columns::Union{AbstractVector{<:AbstractString}, Nothing} = nothing)
-    (; schema, fsl, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
-    plan = plan_read_tree(build_schema_tree(pf.metadata.schema))
+    (; schema, field_meta) = parse_arrow_schema(pf.metadata.key_value_metadata)
+    plan = plan_read_tree(build_schema_tree(pf.metadata.schema), schema)
     columns === nothing || (plan = prune_read_plan(plan, columns))
 
-    ctx = (data = pf.data, fsl = fsl)
+    ctx = (data = pf.data,)
     tasks = [Threads.@spawn _read_column(ctx, pf.metadata.row_groups, node, field_meta) for node in plan]
     vectors = AbstractVector[try fetch(task) catch e; throw(ColumnReadError(node.name, _root_cause(e))) end
                              for (node, task) in zip(plan, tasks)]
