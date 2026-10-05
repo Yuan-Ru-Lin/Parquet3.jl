@@ -2630,6 +2630,37 @@ print(b.schema.field('lf').type, '|', b.schema.field('llf').type)""")
         end
     end
 
+    # A map is the table's only carrier of a fixed-size list, at top level, in a struct and
+    # in a list: the size survives write → read (ARROW:schema is written for it)
+    mktempdir() do dir
+        path, out = joinpath(dir, "m.parquet"), joinpath(dir, "rw.parquet")
+        script = """
+import pyarrow as pa, pyarrow.parquet as pq
+f = pa.list_(pa.float32(), 2)
+m = pa.map_(pa.string(), f)
+table = pa.table({
+    'm':  pa.array([[('a', [1.0, 2.0])], None, [], [('b', [3.0, None]), ('c', [5.0, 6.0])]], m),
+    's':  pa.array([{'m': [('a', [1.0, 2.0])], 'n': 1}, {'m': [], 'n': 2}, {'m': None, 'n': 3}, {'m': [('d', [7.0, 8.0])], 'n': 4}], pa.struct([('m', m), ('n', pa.int64())])),
+    'lm': pa.array([[[('a', [1.0, 2.0])], []], [], None, [[('e', [9.0, 0.5])]]], pa.list_(m)),
+})
+pq.write_table(table, '$(path)')
+print('SUCCESS')"""
+        if _run_pyarrow(script) == "SUCCESS"
+            t = read_parquet(path)
+            fixed_values(c) = fixed(inner(c).entries.data.data[2])
+            @test fixed_values(t.m) && fixed(inner(t.s).data[1].entries.data.data[2]) && fixed(inner(t.lm).data.entries.data.data[2])
+            for cols in (propertynames(t), (:m,), (:s,), (:lm,))
+                write_parquet(out, NamedTuple{Tuple(cols)}(Tuple(getproperty(t, k) for k in cols)))
+                back = read_parquet(out)
+                @test all(isequal(plain(getproperty(back, k)), plain(getproperty(t, k))) && eltype(getproperty(back, k)) == eltype(getproperty(t, k)) for k in cols)
+            end
+            write_parquet(out, t)
+            @test harness_pyarrow_compare([(path, out)]) == ["equal"]
+        else
+            @warn "Skipping map-of-fixed-size fixtures: uv/pyarrow not available"
+        end
+    end
+
     # Null fixed-size lists below a list, next to empty and null lists (from our writer)
     mktempdir() do dir
         path = joinpath(dir, "n.parquet")

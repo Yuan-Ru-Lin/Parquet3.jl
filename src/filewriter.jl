@@ -185,12 +185,13 @@ end
 _shred_stop!(node, rep::Int, def::Int) =
     foreach(leaf -> (push!(leaf.rep, rep); push!(leaf.def, def)), node.leaves)
 
-"""Whether a FixedSizeList appears in element type `FT`, at any depth of structs and lists."""
+"""Whether a FixedSizeList appears in element type `FT`, at any depth of structs, lists and maps."""
 function _has_fsl(::Type{FT}) where FT
     T = Base.nonmissingtype(FT)
     T === Union{} && return false
     T <: FixedSizeView && return true
     T <: NamedTuple && return isconcretetype(T) && any(_has_fsl, fieldtypes(T))
+    _is_map_type(T) && return _has_fsl(keytype(T)) || _has_fsl(valtype(T))
     _is_list_type(T) && _has_fsl(eltype(T))
 end
 
@@ -198,13 +199,14 @@ end
 Element type `FT` as Arrow.jl needs it to derive the schema: every type concrete. A column
 typed with the short name `FixedSizeView{N, E}` (a family of types, since the null-bits
 type is a parameter too) would otherwise lose its fixed size there. Lists become `Vector`s,
-which have the same schema.
+which have the same schema, and maps `Dict`s.
 """
 function _schema_eltype(::Type{FT}) where FT
     _has_fsl(FT) || return FT
     T = Base.nonmissingtype(FT)
     S = T <: FixedSizeView ? _concrete_view(T) :
         T <: NamedTuple ? NamedTuple{fieldnames(T), Tuple{map(_schema_eltype, fieldtypes(T))...}} :
+        _is_map_type(T) ? Dict{_schema_eltype(keytype(T)), _schema_eltype(valtype(T))} :
         Vector{_schema_eltype(eltype(T))}
     Missing <: FT ? Union{Missing, S} : S
 end
