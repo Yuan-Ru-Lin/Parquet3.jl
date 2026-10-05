@@ -3,10 +3,14 @@
 Everything planned for v0.2.0 is implemented and committed locally on `writer-w1`. The
 plans and reports for that work are in `tasks/history.md`.
 
-## Release of v0.2.0 (waiting on the user)
-- [ ] Push `writer-w1` (nothing has been pushed; the CI workflows have never run)
-- [ ] First CI run green on Julia 1.10 and latest
-- [ ] Merge to `main`, bump the version to 0.2.0, write the changelog from the list below, tag
+## Release of v0.2.0 (sequence decided by the user, 2026-10-05)
+The work is merged: PR #2 into main as 4dd646e, compat entries for the standard libraries in 6022cac, CI green on both. main is at version 0.2.0 and is NOT tagged. The user's sequence from here:
+- [x] Replace the `test/parquet-testing` git submodule with a test-only artifact. Reason: Pkg cannot install a repository that contains a submodule from git (`Pkg.add(url=…)` fails with "cannot get submodules without a working tree", on Julia 1.10–1.12, also for the old v0.1.0 tag), and General's checks may install the package that way.
+- [ ] The user reviews `src/` by hand (General requires that for generated code). A reading guide is being prepared separately in `tasks/review-guide.md`.
+- [ ] Fixes from that review.
+- [ ] The user registers 0.2.0 in General. It will not merge automatically: a new package's first version is expected to be 0.0.1, 0.1.0 or 1.0.0, and the name is close to Parquet and Parquet2. The registry pull request needs a note that 0.1.0 was released but never registered, and a manual merge by a registry maintainer. No `@JuliaRegistrator` comment from the assistant.
+- [ ] TagBot creates the v0.2.0 tag and the GitHub release once the version is registered. No tag is pushed by hand before that. Release notes are drafted (the changelog entry with an install line and a pointer to the AI disclosure) and kept outside the repository until then.
+- [ ] Follow-up post announcing the release.
 
 ## Null elements in a fixed-size list (audit finding 2; design note, 2026-10-04)
 Decision (the user, via the planning session): follow Arrow. An Arrow fixed-size list has a
