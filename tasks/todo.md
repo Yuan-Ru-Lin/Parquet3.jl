@@ -28,7 +28,8 @@ plans and reports for that work are in `tasks/history.md`.
   no size-based fallback to PLAIN (record as a limitation).
 - Read gaps: DELTA_BYTE_ARRAY; BYTE_STREAM_SPLIT beyond FLOAT/DOUBLE; the deprecated LZ4
   codec; string data over 2 GB in one chunk (64-bit offsets)
-- Other logical types: LIST-only annotation without a converted type, TIME, INT96 timestamps
+- Other logical types: LIST-only annotation without a converted type, TIME, INT96 timestamps,
+  DECIMAL (read as the raw unscaled bytes today), Float16 (two raw bytes), duration (Int64)
 - First-write latency for tables with a FixedSizeList (build the ARROW:schema message
   without Arrow.jl's generic writer)
 - Infer struct member types for loosely typed `NamedTuple` / `Dict` literals

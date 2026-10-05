@@ -18,7 +18,7 @@ This package uses two structs to circumvent the issue:
 `FixedSizeListVector` is not an `Arrow.ArrowVector` subtype. It registers `ArrowKind = FixedSizeListKind{N,T}` so `Arrow.write` can serialize it correctly, but:
 
 - FSL fields are detected from ARROW:schema at any depth: the reader walks the Arrow schema together with its read plan (struct ↔ struct, list ↔ list, map ↔ map), so a fixed-size list is found at top level, in structs, in lists (`List<FixedSizeList<T>>`, `List<Struct<…>>`) and as a map value.
-- Of a `FixedSizeList<FixedSizeList<T>>` only the inner level is restored; the outer one reads as a variable-length list (see Known Limitations). The element must be a primitive.
+- Of a `FixedSizeList<FixedSizeList<T>>` only the inner level is restored; the outer one reads as a variable-length list (see Known Limitations). The element must be fixed-width (numbers, `Bool`, dates, timestamps); a fixed-size list of strings or bytes reads as an ordinary list.
 - If you write the table to an Arrow IPC file with `Arrow.write` and read it back with `Arrow.read`, FixedSizeList columns will come back as Arrow.jl's native `NTuple`-based `FixedSizeList`, not as `FixedSizeListVector`. The data is preserved, but the zero-copy view behavior is lost.
 
 ## Source Layout
@@ -86,8 +86,8 @@ that one type, so `ChainedVector` composition is stable. Statistics are not cons
 element types do not depend on the writer. Consequence: types depend on the data read;
 two files with the same schema can differ in `Missing`.
 
-**FixedSizeList.** A list node that `ARROW:schema` declares fixed-size, with a primitive
-element, is read into one flat vector with one slot per row, or per item of the list it
+**FixedSizeList.** A list node that `ARROW:schema` declares fixed-size, with a fixed-width
+element (`_fixed_width_leaf`), is read into one flat vector with one slot per row, or per item of the list it
 sits in: straight copies of the page values when there are no nulls (the dense path, which
 is what makes waveforms fast, and which holds at any depth since every level entry is then
 one element), a scatter by level otherwise. To its parents it reports the levels a plain
@@ -308,11 +308,16 @@ corpus test when present and are not needed for a green run.
 - The first `write_parquet` call for each new table schema that contains a FixedSizeList (top-level, or nested in structs or lists) takes 5–20 s. The `ARROW:schema` entry is produced by Arrow.jl's generic writer, which Julia compiles per table type. Tables without a FixedSizeList skip that path, and later writes of the same schema in the same session are fast. Hand-building the schema message would avoid it; that was decided against for v0.2.0.
 - Parquet stores only a UTC flag for timestamps, not a time zone name. An `Arrow.Timestamp` with a named zone is written as UTC-adjusted and reads back as `:UTC`. pyarrow shows it as `tz=UTC` too, unless the file also has an `ARROW:schema` entry (i.e. a FixedSizeList is present), in which case pyarrow restores the zone name from there. The instants are the same either way.
 - `Arrow.write` cannot write INT96 columns (Arrow has no 96-bit integer); leave them out with `columns=`.
-- A multi-row-group table is split into Arrow record batches through each column's `arrays` property. A struct column with a member named `arrays` shadows it (`tbl.s.arrays` is the member), and `Arrow.write` of such a multi-row-group table fails.
+- A multi-row-group table is split into Arrow record batches through each column's `arrays` property. A struct column with a member named `arrays` shadows it (`tbl.s.arrays` is the member). `Arrow.write` of a multi-row-group table then fails when a plain column comes before that struct column, because Arrow.jl splits the table by the first column's chunks and asks every other column for `arrays`. It works when the struct column is first, or written on its own: the table is then one partition and the chunks are joined. The same holds for a list of such structs and for a struct whose `arrays` member is a list.
 - Of the `logicalType` union only the TIMESTAMP member is parsed; everything else still relies on `converted_type`. A LIST group carrying only `logicalType` would be read as a struct with a single member `list` (not observed in practice; pyarrow writes both). INT96 timestamps and TIME are not converted.
+- Types that come back as stored, without conversion:
+  - DECIMAL: the unscaled integer. pyarrow stores it as a fixed-length byte array, which reads as a `Vector{UInt8}` of the big-endian two's-complement value (4 bytes for `decimal128(9, 2)`, 13 for `decimal128(30, 2)`); the scale is in the schema only. A decimal stored as INT32 or INT64 reads as that integer.
+  - Float16: a two-byte `Vector{UInt8}`, little-endian (`reinterpret(Float16, bytes)[1]`).
+  - Other fixed-length byte arrays (UUID, interval): `Vector{UInt8}`.
+  - Duration: `Int64` in the file's unit (Parquet has no duration type; the unit is in `ARROW:schema`). TIME: `Int32` or `Int64` in the file's unit. INT96: `Int96`.
 - A `FixedSizeList` of primitives is restored wherever `ARROW:schema` declares it: at top level, in structs, in lists and as a map value, and it keeps its size through `write_parquet` and `Arrow.write`. Two cases are not restored; their values are correct, but they read as variable-length lists and are written back as such:
   - the outer level of a fixed-size list of fixed-size lists (`fixed_size_list<fixed_size_list<T>[M]>[N]` reads, and is written back, as `list<fixed_size_list<T>[M]>`);
-  - a fixed-size list whose elements are not primitives (strings, structs, lists).
+  - a fixed-size list whose elements are not fixed-width. The rule (`_fixed_width_leaf`): the element's Julia type must be a bits type, which covers integers, floats, `Bool`, `Date`, `DateTime`, `Arrow.Timestamp` and INT96. Strings, binary, fixed-length byte arrays (so decimals and Float16, see below), structs and lists are not.
 - pyarrow reads the values of a `map<K, fixed_size_list>` as variable-length lists even from its own files; this package restores the fixed size from `ARROW:schema`.
 - A fixed-size list whose stored lists do not all have the declared size is not rejected: extra elements are ignored and missing ones left as zero.
 - A file with a null map key (invalid in Parquet) is not rejected: the key type then admits `Missing` and the entry iterates as `missing => value`. Untested, since pyarrow does not write such files.

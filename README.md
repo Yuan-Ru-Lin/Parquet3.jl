@@ -145,7 +145,7 @@ Any nesting of lists, structs and maps is read, to any depth, by one recursive r
 
 Named access composes through structs and lists: `tbl.event.vertex.x`, `tbl.s.hits.x`, `tbl.tracks.vertex.x` (one value per track, per row), `tbl.mm.value.key` (the keys of nested maps). A map nested in a struct, a list or another map presents the same way (`tbl.mm[i]["a"]["x"]`). When a key occurs twice in a row, lookup and `Dict(...)` take the last entry, as the Parquet format specifies; iteration shows both. Multi-row-group files chain the per-group chunks without copying.
 
-`FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored wherever it is declared with a primitive element: at top level, as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), inside lists (`list<fixed_size_list>`, `list<struct<…>>`) and as a map value. Of a fixed-size list of fixed-size lists only the inner level is restored; the outer one reads as a variable-length list. Legacy list layouts (2-level lists, bare repeated fields) and maps without values are read as pyarrow reads them.
+`FixedSizeList` needs the `ARROW:schema` metadata that Arrow-based tools (pyarrow, Arrow C++, this package's writer) store; it is restored wherever it is declared with a fixed-width element (numbers, `Bool`, dates, timestamps; a fixed-size list of strings or bytes reads as an ordinary list): at top level, as a struct member (e.g. `waveform: {t0, dt, values: fixed_size_list<int32>[1400]}`), inside lists (`list<fixed_size_list>`, `list<struct<…>>`) and as a map value. Of a fixed-size list of fixed-size lists only the inner level is restored; the outer one reads as a variable-length list. Legacy list layouts (2-level lists, bare repeated fields) and maps without values are read as pyarrow reads them.
 
 ### Logical Types
 
@@ -160,6 +160,8 @@ Timestamps are read from `logicalType` (falling back to the converted type) and 
 | microseconds or nanoseconds | `Arrow.Timestamp{unit, tz}` with `tz` `:UTC` or `nothing` |
 
 `Arrow.Timestamp` wraps the stored `Int64` (`ts.x`), so microsecond and nanosecond values are exact. A file with only the older converted type (TIMESTAMP_MILLIS / TIMESTAMP_MICROS) is UTC-adjusted by definition and reads as `Arrow.Timestamp{…, :UTC}`. The same rule applies inside lists, structs and lists of structs.
+
+Not converted, returned as stored: decimals (the unscaled integer; as pyarrow writes them, a `Vector{UInt8}` holding it big-endian), Float16 (two bytes), other fixed-length byte arrays, durations and times (`Int32`/`Int64` in the file's unit), and INT96 timestamps.
 
 ## Developer Notes
 
