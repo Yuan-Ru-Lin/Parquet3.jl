@@ -12,12 +12,22 @@ end
 ColumnReader(data::Vector{UInt8}, meta::ColumnMetaData, node::SchemaNode, type_len::Int=0) =
     ColumnReader(data, 0, meta, node, type_len, nothing)
 
+# Levels stay in the decoder's UInt32 (a copy to Int doubled their memory); `nothing` means
+# every value is present (def) or every value starts a record (rep), which is what the
+# consumers assume for a missing stream and what a single RLE run of that value encodes.
 struct DecodedPage{T, V<:AbstractVector{T}}
     values::V
-    def_levels::Union{Vector{Int}, Nothing}
-    rep_levels::Union{Vector{Int}, Nothing}
+    def_levels::Union{Vector{UInt32}, Nothing}
+    rep_levels::Union{Vector{UInt32}, Nothing}
     num_values::Int
 end
+
+# Levels given as any integers (pages built by hand, as in the tests) are converted once
+_levels_u32(levels::Nothing) = nothing
+_levels_u32(levels::Vector{UInt32}) = levels
+_levels_u32(levels::AbstractVector{<:Integer}) = Vector{UInt32}(levels)
+DecodedPage(values::V, def_levels, rep_levels, num_values::Int) where {V<:AbstractVector} =
+    DecodedPage{eltype(V), V}(values, _levels_u32(def_levels), _levels_u32(rep_levels), num_values)
 
 """
 Parse the page header at `offset`; returns it with the number of bytes it occupies.
@@ -43,21 +53,38 @@ function read_page_header(data::Vector{UInt8}, offset::Int, limit::Int = length(
     end
 end
 
-function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, encoding::Encoding)
-    max_level == 0 && return (zeros(Int, count), 0)
-
+"""
+Decode a level stream; returns `(levels, bytes_consumed)`. `levels` is `nothing` when the
+stream is one RLE run of `trivial` over all `count` values (every value present, or no
+repetition), the form a no-null column takes: no buffer is built for it.
+"""
+function read_levels(data::AbstractVector{UInt8}, count::Int, max_level::Int, encoding::Encoding; trivial::Integer = max_level)
+    max_level == 0 && return (nothing, 0)
     bit_width = level_bit_width(max_level)
-
     if encoding == RLE
         len = ltoh(reinterpret(UInt32, @view data[1:4])[1])
-        levels = decode_rle_bitpacked(@view(data[5:4+len]), count, bit_width)
-        return (Int.(levels), 4 + Int(len))
+        rle = @view data[5:4+len]
+        _single_run(rle, count, bit_width) == trivial && return (nothing, 4 + Int(len))
+        return (decode_rle_bitpacked(rle, count, bit_width), 4 + Int(len))
     elseif encoding == BIT_PACKED
         bytes = cld(count * bit_width, 8)
-        levels = unpack_bits(@view(data[1:bytes]), count, bit_width)
-        return (Int.(levels), bytes)
+        return (unpack_bits(@view(data[1:bytes]), count, bit_width), bytes)
     end
     error("Unsupported level encoding: $encoding")
+end
+
+"""The value of an RLE/bit-packed hybrid stream that is exactly one RLE run of `count` values, else `nothing`."""
+function _single_run(data::AbstractVector{UInt8}, count::Int, bit_width::Int)
+    isempty(data) && return nothing
+    header, pos = _read_varint(data, 1)
+    (header & 1) == 0 && (header >> 1) == count || return nothing
+    value_bytes = cld(bit_width, 8)
+    pos + value_bytes - 1 <= length(data) || return nothing
+    value = UInt32(0)
+    for b in 0:value_bytes-1
+        value |= UInt32(data[pos + b]) << (8b)
+    end
+    value
 end
 
 # Each encoding is decoded only for the physical types it is defined for; any other pair
@@ -112,7 +139,7 @@ function read_page(reader::ColumnReader)
     # Decompress for DICTIONARY_PAGE and DATA_PAGE (v1) — entire page is compressed.
     # DATA_PAGE_V2 handles decompression of data portion separately.
     if header.type != DATA_PAGE_V2 && meta.codec != UNCOMPRESSED
-        page_data = decompress(reader.data[page_range], meta.codec, Int(header.uncompressed_page_size))
+        page_data = decompress(@view(reader.data[page_range]), meta.codec, Int(header.uncompressed_page_size))
     else
         page_data = @view reader.data[page_range]
     end
@@ -135,7 +162,7 @@ function read_page(reader::ColumnReader)
         def_levels = nothing
 
         if max_rep > 0
-            rep_levels, bytes = read_levels(@view(page_data[pos:end]), nv, max_rep, dh.repetition_level_encoding)
+            rep_levels, bytes = read_levels(@view(page_data[pos:end]), nv, max_rep, dh.repetition_level_encoding; trivial = 0)
             pos += bytes
         end
         if max_def > 0
@@ -160,11 +187,11 @@ function read_page(reader::ColumnReader)
         # column has such levels: some writers store repetition levels for a column that is
         # not repeated. Always skip them, so the data section starts in the right place.
         if max_rep > 0 && dh.repetition_levels_byte_length > 0
-            rep_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.repetition_levels_byte_length-1]), nv, level_bit_width(max_rep)))
+            rep_levels = decode_rle_bitpacked(@view(page_data[pos:pos+dh.repetition_levels_byte_length-1]), nv, level_bit_width(max_rep))
         end
         pos += dh.repetition_levels_byte_length
         if max_def > 0 && dh.definition_levels_byte_length > 0
-            def_levels = Int.(decode_rle_bitpacked(@view(page_data[pos:pos+dh.definition_levels_byte_length-1]), nv, level_bit_width(max_def)))
+            def_levels = decode_rle_bitpacked(@view(page_data[pos:pos+dh.definition_levels_byte_length-1]), nv, level_bit_width(max_def))
         end
         pos += dh.definition_levels_byte_length
 
@@ -173,7 +200,7 @@ function read_page(reader::ColumnReader)
         # compressed stream and must not be passed to the codec
         if dh.is_compressed && meta.codec != UNCOMPRESSED && !isempty(data_part)
             expected = header.uncompressed_page_size - dh.repetition_levels_byte_length - dh.definition_levels_byte_length
-            data_part = decompress(collect(data_part), meta.codec, Int(expected))
+            data_part = decompress(data_part, meta.codec, Int(expected))
         end
 
         # Count the stored values from the levels, as for a v1 page. The header's num_nulls
@@ -209,27 +236,39 @@ function assemble_flat_column(pages::Vector{<:DecodedPage}, max_def::Int)
 
     out = 1
     for page in pages
-        if page.def_levels === nothing
-            # Non-nullable: bulk copy entire page values
-            n = length(page.values)
-            copyto!(values, out, page.values, 1, n)
-            out += n
-        else
-            # Nullable: element-by-element with null check
-            val = 1
-            @inbounds for i in 1:page.num_values
-                if page.def_levels[i] < max_def
-                    nulls[out] = true
-                else
-                    values[out] = page.values[val]
-                    val += 1
-                end
-                out += 1
-            end
-        end
+        out = _flat_copy_page!(values, nulls, out, page.values, page.def_levels, page.num_values, max_def)
     end
 
     (values, nulls)
+end
+
+"""
+Copy one page into the column buffer; returns the next output index.
+
+A function barrier: `pages` is a heterogeneous vector, so `page.values` and `values` have unknown
+types in the caller and an element loop there boxes every value (about four allocations per value).
+Here the types are concrete. A page without def levels, or whose def levels are all `max_def`
+(a column written OPTIONAL with no nulls, which is what `write_parquet` produces), has no null and
+is copied in bulk.
+"""
+function _flat_copy_page!(values::Vector{T}, nulls::BitVector, out::Int, page_values::AbstractVector,
+                          def_levels, num_values::Int, max_def::Int) where T
+    if def_levels === nothing || all(==(max_def), def_levels)
+        n = length(page_values)
+        copyto!(values, out, page_values, 1, n)
+        return out + n
+    end
+    val = 1
+    @inbounds for i in 1:num_values
+        if def_levels[i] < max_def
+            nulls[out] = true
+        else
+            values[out] = page_values[val]
+            val += 1
+        end
+        out += 1
+    end
+    out
 end
 
 """Collect rep/def levels and raw values from decoded pages."""

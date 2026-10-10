@@ -125,8 +125,9 @@ function _plan_node(name::String, ::Type{FT}, path::Vector{String}, max_rep::Int
          leaves = child.leaves)
     else
         ptype, ctype = writer_parquet_type(T)
+        # levels are small integers: a byte each (a 26 M-row list column carries ~80 M of them)
         leaf = (path = path, key = join(key, "."), ptype = ptype, max_rep = max_rep, max_def = max_def, rep_def = rep_def,
-                rep = Int[], def = Int[], values = T[])
+                rep = UInt8[], def = UInt8[], values = T[])
         (kind = :leaf, required = required, rep_level = max_rep, children = (),
          elements = [SchemaElement(type = ptype, repetition_type = repetition, name = name, converted_type = ctype,
                                    logical_type = writer_logical_type(T))],
@@ -159,7 +160,8 @@ function _shred!(node, v, rep::Int, def::Int)
     node.required || (def += 1)
     if node.kind == :leaf
         leaf = only(node.leaves)
-        push!(leaf.rep, rep); push!(leaf.def, def); push!(leaf.values, v)
+        leaf.max_rep == 0 || push!(leaf.rep, rep)   # rep levels are only written under a list
+        push!(leaf.def, def); push!(leaf.values, v)
     elseif node.kind == :struct
         foreach((child, field) -> _shred!(child, field, rep, def), node.children, values(v))
     elseif isempty(v)
@@ -183,7 +185,34 @@ function _shred!(node, v, rep::Int, def::Int)
 end
 
 _shred_stop!(node, rep::Int, def::Int) =
-    foreach(leaf -> (push!(leaf.rep, rep); push!(leaf.def, def)), node.leaves)
+    foreach(leaf -> (leaf.max_rep == 0 || push!(leaf.rep, rep); push!(leaf.def, def)), node.leaves)
+
+_fsl_size(::FixedSizeListVector{N}) where N = N
+
+"""
+Shred a whole column into the leaves under `node`. Two shapes need no per-row work: a flat
+column without `missing`, whose values are appended as they are under a constant definition
+level, and a `FixedSizeListVector` without nulls, whose flat buffer is the leaf's values under
+a fixed per-row level pattern. Everything else goes row by row through `_shred!`.
+"""
+function _shred_column!(node, col::AbstractVector)
+    n = length(col)
+    foreach(leaf -> (sizehint!(leaf.values, n); sizehint!(leaf.def, n)), node.leaves)
+    if node.kind == :leaf && !(Missing <: eltype(col))
+        leaf = only(node.leaves)
+        append!(leaf.values, col)
+        append!(leaf.def, Iterators.repeated(UInt8(leaf.max_def), n))
+    elseif node.kind == :list && col isa FixedSizeListVector && col.element_nulls === nothing && !any(col.nulls) &&
+           _fsl_size(col) > 0 && only(node.children).kind == :leaf
+        leaf = only(node.leaves)
+        N = _fsl_size(col)
+        append!(leaf.values, col.data)
+        append!(leaf.rep, repeat([UInt8(0); fill(UInt8(leaf.max_rep), N - 1)], n))   # first element opens the row
+        append!(leaf.def, Iterators.repeated(UInt8(leaf.max_def), N * n))
+    else
+        foreach(v -> _shred!(node, v, 0, 0), col)
+    end
+end
 
 """Whether a FixedSizeList appears in element type `FT`, at any depth of structs, lists and maps."""
 function _has_fsl(::Type{FT}) where FT
@@ -284,14 +313,15 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
         total_bytes = 0
 
         for (node, col) in zip(nodes, vectors)
-            foreach(v -> _shred!(node, v, 0, 0), col)
+            _shred_column!(node, col)
             append!(schema, node.elements)
 
             for leaf in node.leaves
                 offset = position(io)
                 enc = popfirst!(leaf_encodings)
-                page, uncompressed_size = _data_page(leaf, codec, enc)
-                write(io, page)
+                header_bytes, compressed, uncompressed_size = _data_page(leaf, codec, enc)
+                write(io, header_bytes)
+                write(io, compressed)
                 total_bytes += uncompressed_size
 
                 meta = ColumnMetaData(
@@ -301,7 +331,7 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
                     codec = codec,
                     num_values = Int64(length(leaf.def)),
                     total_uncompressed_size = Int64(uncompressed_size),
-                    total_compressed_size = Int64(length(page)),
+                    total_compressed_size = Int64(length(header_bytes) + length(compressed)),
                     data_page_offset = Int64(offset),
                     statistics = Statistics(null_count = Int64(_null_count(leaf))))
                 push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
@@ -325,18 +355,29 @@ end
 Build one DataPage (v1) for a shredded leaf: thrift PageHeader followed by the
 length-prefixed RLE repetition levels (only under a list) and definition levels,
 then the values in encoding `enc`. In a v1 page, levels and values are compressed together.
-Returns `(page_bytes, uncompressed_size)`, both including the header.
+Returns `(header_bytes, compressed_body, uncompressed_size)`, the size including the header.
+
+The body is assembled once, in a buffer of the exact size: PLAIN fixed-width values are a
+`reinterpret` view of the leaf's vector and are copied by pointer, so a column's bytes are
+touched once before compression (an `IOBuffer` grown by doubling, `take!` and `vcat` each
+copied them again).
 """
 function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
-    body = IOBuffer()
-    for (levels, max_level) in ((leaf.rep, leaf.max_rep), (leaf.def, leaf.max_def))
-        max_level == 0 && continue
-        rle = encode_rle_bitpacked(levels, level_bit_width(max_level))
-        write(body, htol(UInt32(length(rle))))
-        write(body, rle)
+    levels = [encode_rle_bitpacked(lv, level_bit_width(ml)) for (lv, ml) in ((leaf.rep, leaf.max_rep), (leaf.def, leaf.max_def)) if ml > 0]
+    values = _encode_values(leaf.values, enc)
+    size = sum(4 + length(l) for l in levels; init = 0) + length(values)
+    size <= typemax(Int32) || error("write_parquet: column $(join(leaf.path, '.')) is $size bytes; a data page holds at most 2 GiB (several pages per column are not written yet)")
+    data = Vector{UInt8}(undef, size)
+    pos = 1
+    for l in levels
+        len = htol(UInt32(length(l)))
+        for b in 0:3
+            data[pos + b] = UInt8((len >> 8b) & 0xff)
+        end
+        copyto!(data, pos + 4, l, 1, length(l))
+        pos += 4 + length(l)
     end
-    write(body, _encode_values(leaf.values, enc))
-    data = take!(body)
+    _copy_bytes!(data, pos, values)
     compressed = compress(data, codec)
 
     header = PageHeader(
@@ -348,5 +389,13 @@ function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
             definition_level_encoding = RLE, repetition_level_encoding = RLE))
 
     header_bytes = serialize_thrift(header, PAGE_HEADER_FIELDS)
-    (vcat(header_bytes, compressed), length(header_bytes) + length(data))
+    (header_bytes, compressed, length(header_bytes) + length(data))
+end
+
+_copy_bytes!(data::Vector{UInt8}, pos::Int, bytes::AbstractVector{UInt8}) = copyto!(data, pos, bytes, 1, length(bytes))
+# the PLAIN view of a fixed-width vector: one memcpy from the parent
+function _copy_bytes!(data::Vector{UInt8}, pos::Int, bytes::Base.ReinterpretArray{UInt8, 1, T, Vector{T}}) where T
+    src = parent(bytes)
+    GC.@preserve data src unsafe_copyto!(pointer(data, pos), Ptr{UInt8}(pointer(src)), length(bytes))
+    data
 end
