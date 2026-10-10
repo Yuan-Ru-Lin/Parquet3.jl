@@ -56,7 +56,7 @@ decode_plain_fixed_byte_array(data::AbstractVector{UInt8}, count::Int, type_leng
 
 """PLAIN-encode fixed-width values (inverse of decode_plain for these types)."""
 encode_plain(values::Vector{T}) where {T <: Union{Int32, Int64, Float32, Float64}} =
-    collect(reinterpret(UInt8, values))
+    reinterpret(UInt8, values)   # a view: the page assembly copies it once, by pointer
 
 """PLAIN-encode integer-like values through their physical type (see `physical_ints`)."""
 encode_plain(values::Vector{<:Union{Int8, Int16, UInt8, UInt16, UInt32, UInt64, Date, DateTime, Arrow.Timestamp}}) =

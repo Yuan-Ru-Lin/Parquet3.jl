@@ -374,7 +374,15 @@ function _assemble_fsl_dense(pages::Vector{<:DecodedPage}, ptype, elem::SchemaEl
     if num_slots === nothing
         position = 0
         for page in pages
-            page.rep_levels === nothing && continue
+            if page.rep_levels === nothing
+                # no stored levels: every entry of the page starts a list, which fits only lists of one
+                # element, or a single entry that falls on a list boundary
+                n = page.num_values
+                (list_size == 1 || n == 0 || (n == 1 && mod(position, list_size) == 0)) ||
+                    _fsl_size_error(list_size, "does not have $list_size elements in every list")
+                position += n
+                continue
+            end
             _check_fsl_starts(iszero, page.rep_levels, list_size, position; counted = true)
             position += length(page.rep_levels)
         end
