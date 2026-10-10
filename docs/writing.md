@@ -4,11 +4,12 @@ What `write_parquet` accepts and what it writes. Limits are collected in [limita
 
 ## Column types and nesting
 
-`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`), structs (`NamedTuple` elements, written as a group) and maps (`AbstractDict` elements, written as a Parquet MAP) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (single row group, null-count statistics).
+`write_parquet(path, table)` writes flat columns of Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp` and `Vector{UInt8}`, lists (vector elements, written as `List<T>`), structs (`NamedTuple` elements, written as a group) and maps (`AbstractDict` elements, written as a Parquet MAP) of supported types nested to any depth — `struct{list}`, struct-of-struct, `list<struct>`, `list<list>`, … — and `Missing` unions at every level (null-count statistics).
 
 `DateTime` is written as a naive millisecond timestamp and `Arrow.Timestamp{unit, tz}` with its unit and UTC flag, so timestamp columns from `read_parquet` write back unchanged (a named time zone becomes UTC, since Parquet only stores a UTC flag).
 
-Multiple row groups are not yet written.
+## Row groups
+By default the table is one row group. `rowgroup_size = n` writes row groups of `n` rows (the last one shorter): each is shredded, encoded and written before the next, so the writer holds a few times one row group rather than the whole table, and `read_parquet` decodes the groups in parallel and presents them as one table. Choose `n` by the memory you can spend: with 26 M rows of five numeric columns, `rowgroup_size = 2_000_000` keeps the writer under a gigabyte where one row group needed four.
 
 ## Compression
 
@@ -44,7 +45,7 @@ A `Dict` chooses per column, keyed by the path used to reach the data: `encoding
 
 ## Fixed-size lists
 
-`FixedSizeListVector` columns, at top level or nested in structs, lists and maps, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow.
+`FixedSizeListVector` columns, at top level or nested in structs, lists and maps, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. `FixedSizeListVector(N, data)` builds such a column from a flat buffer of `N` values per record, e.g. `FixedSizeListVector(3, xyz)` for positions; a column read back from a file is one already.
 
 The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected).
 
