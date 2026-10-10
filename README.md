@@ -105,7 +105,7 @@ close(pf)
 - A column's element type admits `Missing` exactly where a null occurs in the data that was read. See [Element types follow the data](docs/reading.md#element-types-follow-the-data).
 - A column that cannot be read throws a `Parquet3.ColumnReadError` naming it; nothing is skipped silently. See [Errors](docs/reading.md#errors).
 - pyarrow cannot read a file in which a fixed-size list is null, or sits inside a null struct; `read_parquet` reads them. See [pyarrow interop](docs/limitations.md#pyarrow-interop).
-- Dictionary encoding and multiple row groups are not yet written. See [Known limitations](docs/limitations.md).
+- Dictionary encoding is not yet written. See [Known limitations](docs/limitations.md).
 
 ## Documentation
 

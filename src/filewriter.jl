@@ -270,8 +270,7 @@ Write a Tables.jl-compatible table to a Parquet file. Supported column eltypes:
 Int8–Int64, UInt8–UInt64, Float32, Float64, Bool, String, Date, DateTime,
 Arrow.Timestamp, Vector{UInt8}; dictionaries (`AbstractDict`, written as a MAP); vectors (written as
 LIST) and NamedTuples (written as a struct group) of supported types, nested to any
-depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields
-in a single row group.
+depth; and `Missing` unions at every level. Columns are written as OPTIONAL fields.
 
 `DateTime` is written as a naive millisecond timestamp. `Arrow.Timestamp{U, TZ}` keeps
 its unit (milli-, micro-, or nanoseconds) and is written as UTC-adjusted unless `TZ`
@@ -279,6 +278,11 @@ is `nothing`, so a timestamp column from `read_parquet` writes back unchanged.
 
 `compression` is `:snappy` (default, as in pyarrow), `:gzip`, `:brotli`, `:zstd`, `:lz4`,
 or `:uncompressed`; a string is accepted too.
+
+`rowgroup_size` splits the table into row groups of that many rows (the last one shorter);
+each is shredded, encoded and written before the next, so the writer's working set is a
+few times one row group rather than the whole table, and a reader can take the file one
+row group at a time. By default the table is one row group.
 
 `encoding` selects the value encoding: `:plain` (default), `:byte_stream_split`
 (Float32/Float64), or `:delta_binary_packed` (every type stored as an integer: all
@@ -290,10 +294,12 @@ a key naming a struct or list covers everything under it. In a `Dict`, an encodi
 that does not fit the column's type, or a key matching no column, is an error.
 """
 function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractString} = :snappy,
-                       encoding::Union{Symbol, AbstractString, AbstractDict} = :plain)
+                       encoding::Union{Symbol, AbstractString, AbstractDict} = :plain,
+                       rowgroup_size::Union{Nothing, Integer} = nothing)
     codec = get(WRITER_CODECS, Symbol(lowercase(String(compression))), nothing)
     codec === nothing && error("write_parquet: unknown compression $(repr(compression)) " *
                                "(supported: $(join(sort!(String.(collect(keys(WRITER_CODECS)))), ", ")))")
+    rowgroup_size === nothing || rowgroup_size >= 1 || error("write_parquet: rowgroup_size must be at least 1, got $rowgroup_size")
     cols = Tables.columns(tbl)
     names = collect(Symbol, Tables.columnnames(cols))
     isempty(names) && error("write_parquet: table has no columns")
@@ -303,44 +309,50 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
 
     # Plan every column first, so a bad type or encoding fails before the file is touched
     nodes = [_plan_node(String(name), eltype(col), String[], 0, 0) for (name, col) in zip(names, vectors)]
-    leaf_encodings = Iterators.Stateful(_leaf_encodings(encoding, reduce(vcat, [node.leaves for node in nodes])))
+    encodings = _leaf_encodings(encoding, reduce(vcat, [node.leaves for node in nodes]))
+    schema = [SchemaElement(name = "schema", num_children = Int32(length(names))); reduce(vcat, [node.elements for node in nodes])]
+    # Row groups are written one at a time, so the writer's working set is that of a row group, not the table
+    ranges = rowgroup_size === nothing || nrows == 0 ? [1:nrows] : [i:min(i + rowgroup_size - 1, nrows) for i in 1:rowgroup_size:nrows]
 
     open(path, "w") do io
         write(io, PARQUET_MAGIC)
+        row_groups = RowGroup[]
 
-        schema = [SchemaElement(name = "schema", num_children = Int32(length(names)))]
-        chunks = ColumnChunk[]
-        total_bytes = 0
+        for rows in ranges
+            chunks = ColumnChunk[]
+            total_bytes = 0
+            leaf_encodings = Iterators.Stateful(encodings)
 
-        for (node, col) in zip(nodes, vectors)
-            _shred_column!(node, col)
-            append!(schema, node.elements)
+            for (node, col) in zip(nodes, vectors)
+                foreach(leaf -> (empty!(leaf.values); empty!(leaf.rep); empty!(leaf.def)), node.leaves)   # buffers keep their capacity
+                _shred_column!(node, _rows(col, rows))
 
-            for leaf in node.leaves
-                offset = position(io)
-                enc = popfirst!(leaf_encodings)
-                header_bytes, compressed, uncompressed_size = _data_page(leaf, codec, enc)
-                write(io, header_bytes)
-                write(io, compressed)
-                total_bytes += uncompressed_size
+                for leaf in node.leaves
+                    offset = position(io)
+                    enc = popfirst!(leaf_encodings)
+                    header_bytes, compressed, uncompressed_size = _data_page(leaf, codec, enc)
+                    write(io, header_bytes)
+                    write(io, compressed)
+                    total_bytes += uncompressed_size
 
-                meta = ColumnMetaData(
-                    type = leaf.ptype,
-                    encodings = [enc, RLE],
-                    path_in_schema = leaf.path,
-                    codec = codec,
-                    num_values = Int64(length(leaf.def)),
-                    total_uncompressed_size = Int64(uncompressed_size),
-                    total_compressed_size = Int64(length(header_bytes) + length(compressed)),
-                    data_page_offset = Int64(offset),
-                    statistics = Statistics(null_count = Int64(_null_count(leaf))))
-                push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
+                    meta = ColumnMetaData(
+                        type = leaf.ptype,
+                        encodings = [enc, RLE],
+                        path_in_schema = leaf.path,
+                        codec = codec,
+                        num_values = Int64(length(leaf.def)),
+                        total_uncompressed_size = Int64(uncompressed_size),
+                        total_compressed_size = Int64(length(header_bytes) + length(compressed)),
+                        data_page_offset = Int64(offset),
+                        statistics = Statistics(null_count = Int64(_null_count(leaf))))
+                    push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
+                end
             end
+            push!(row_groups, RowGroup(columns = chunks, total_byte_size = Int64(total_bytes), num_rows = Int64(length(rows))))
         end
 
-        rg = RowGroup(columns = chunks, total_byte_size = Int64(total_bytes), num_rows = Int64(nrows))
         fmeta = FileMetaData(version = Int32(1), schema = schema, num_rows = Int64(nrows),
-                             row_groups = [rg], created_by = CREATED_BY,
+                             row_groups = row_groups, created_by = CREATED_BY,
                              key_value_metadata = _arrow_schema_kv(names, vectors))
 
         footer = serialize_thrift(fmeta, FILE_METADATA_FIELDS)
@@ -349,6 +361,15 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
         write(io, PARQUET_MAGIC)
     end
     path
+end
+
+"""The rows `r` of a column as a vector `_shred_column!` can take its fast paths on: the column itself when `r` is all of it, a slice of a fixed-size-list column, else a view."""
+_rows(col::AbstractVector, r::UnitRange{Int}) = r == eachindex(col) ? col : view(col, r)
+function _rows(col::FixedSizeListVector{N}, r::UnitRange{Int}) where N
+    r == eachindex(col) && return col
+    flat = (first(r) - 1) * N + 1 : last(r) * N
+    element_nulls = col.element_nulls === nothing ? nothing : col.element_nulls[flat]
+    FixedSizeListVector(N, col.data[flat], element_nulls, col.nulls[r], length(r), Missing <: eltype(col))
 end
 
 """
