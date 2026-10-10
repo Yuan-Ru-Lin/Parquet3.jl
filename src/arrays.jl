@@ -56,6 +56,20 @@ struct FixedSizeListVector{N, T, ET, B <: Union{Nothing, BitVector}} <: Abstract
     len::Int
 end
 
+"""
+    FixedSizeListVector(N, data::Vector)
+
+A fixed-size-list column over a flat buffer: record `i` is `data[(i-1)N+1 : iN]`, no record
+or element is null. The way to hand `write_parquet` a `FixedSizeList<T>[N]` column, e.g.
+positions as `FixedSizeListVector(3, xyz)` with `xyz` the x, y, z triples back to back.
+"""
+function FixedSizeListVector(N::Int, data::Vector)
+    N >= 1 || throw(ArgumentError("FixedSizeListVector: N must be at least 1, got $N"))
+    rem(length(data), N) == 0 || throw(ArgumentError("FixedSizeListVector: $(length(data)) values do not form lists of $N"))
+    len = length(data) ÷ N
+    FixedSizeListVector(N, data, nothing, falses(len), len, false)
+end
+
 """Build the column for stride `N`; `nullable` says whether a record can be null."""
 function FixedSizeListVector(N::Int, data::Vector{T}, element_nulls::B, nulls::BitVector, len::Int, nullable::Bool) where {T, B}
     V = FixedSizeView{N, B === Nothing ? T : Union{Missing, T}, T, B}

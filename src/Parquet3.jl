@@ -32,6 +32,7 @@ include("filewriter.jl")    # plan, shred, encode: write_parquet
 export
     read_parquet,
     write_parquet,
+    FixedSizeListVector,
     open_parquet,
     num_rows,
     num_row_groups,

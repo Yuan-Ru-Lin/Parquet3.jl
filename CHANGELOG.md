@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Writing
+
+- `write_parquet(path, tbl; rowgroup_size = n)` writes the table as row groups of `n` rows, each shredded, encoded and written before the next, so the writer's working set is a few times one row group instead of the whole table. The default is still one row group.
+- `FixedSizeListVector(N, data)` builds a fixed-size-list column from a flat buffer for writing; the type is exported.
+
 ### Performance
 
 Measured on a 26.4 M-row table (two Int64, two Float32 and one `FixedSizeList<Float32>[3]` column, zstd, Julia 1.12, 4 threads); the files written are byte-identical to before.
