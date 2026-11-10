@@ -13,6 +13,33 @@ By default the table is one row group. `rowgroup_size = n` writes row groups of 
 
 If writing fails partway (a value that cannot be written is found while the columns are processed), no partial file is left at the path. A file that was there before the call is then gone too, since writing starts by emptying it. When the path is a symbolic link, the file it points to is the one removed, and the link stays.
 
+## Writing in batches
+`open_parquet_writer` writes a file one row group at a time, for a producer that makes its table in batches and should not hold all of it:
+
+```julia
+open_parquet_writer("hits.parquet"; compression = :zstd) do w
+    for batch in batches            # any Tables.jl table
+        write_rowgroup!(w, batch)   # one row group, written before the next batch is made
+    end
+end
+```
+
+The first batch fixes the columns (names, order, types); an empty one only does that. Later batches must have the same columns; `Missing` may come and go. The footer is written when the writer is closed (`close(w)`, or the end of the `do` block), and until then the file is not a Parquet file. With the `do` form a block that throws leaves no file. A batch that cannot be written is an error that leaves the file as it was, and the writer can go on.
+
+Several processes can write one file. All the work of a row group (shredding, encoding, compression) is in `encode_rowgroup(batch; compression, encoding)`, which returns the row group's bytes and metadata as plain data; `write_rowgroup!(w, encoded)` appends it by copying the bytes. So workers encode and one process appends, for example with Distributed.jl:
+
+```julia
+using Distributed
+@everywhere using Parquet3
+open_parquet_writer("hits.parquet") do w
+    for encoded in pmap(i -> encode_rowgroup(simulate(i); compression = :zstd), 1:100)
+        write_rowgroup!(w, encoded)
+    end
+end
+```
+
+(`pmap` collects before the loop runs; feed a `RemoteChannel` from the workers to append as results arrive.) Each row group keeps the compression and encodings it was encoded with.
+
 ## Compression
 
 Pages are compressed with Snappy by default; pass `compression = :gzip`, `:brotli`, `:zstd`, `:lz4`, or `:uncompressed` to change it.
