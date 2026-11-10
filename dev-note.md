@@ -134,7 +134,7 @@ Delta arithmetic wraps around in the column's own width (so every delta fits in 
 
 DELTA_LENGTH_BYTE_ARRAY (strings and bytes) is the lengths, delta-packed as INT32, followed by the values' bytes back to back; it reuses the delta encoder.
 
-Not written: dictionary encoding (read, but writing is deferred to v0.3; `:dictionary` is not an accepted name), and DELTA_BYTE_ARRAY, which the reader does not decode either.
+Dictionary encoding is written on request (`encoding = :dictionary`: one dictionary page per column chunk, indices in the RLE/bit-packed hybrid, PLAIN fallback past 1 MiB of distinct values). Not written: DELTA_BYTE_ARRAY, which the reader does not decode either.
 
 ## Timestamp Design
 

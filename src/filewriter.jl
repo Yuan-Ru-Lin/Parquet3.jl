@@ -16,7 +16,15 @@ _is_map_type(::Type{T}) where T = T !== Union{} && T <: AbstractDict
 # Value encodings the writer can produce, by the lower-case Parquet name
 const WRITER_ENCODINGS = Dict(:plain => PLAIN, :byte_stream_split => BYTE_STREAM_SPLIT,
                               :delta_binary_packed => DELTA_BINARY_PACKED,
-                              :delta_length_byte_array => DELTA_LENGTH_BYTE_ARRAY)
+                              :delta_length_byte_array => DELTA_LENGTH_BYTE_ARRAY,
+                              :dictionary => RLE_DICTIONARY, :rle_dictionary => RLE_DICTIONARY)
+
+"""
+A column chunk asked to be dictionary-encoded is written PLAIN instead once its dictionary
+(the distinct values, PLAIN-encoded) would pass this size: 1 MiB, pyarrow's limit. Beyond it
+a dictionary no longer pays for itself.
+"""
+const DICTIONARY_PAGE_LIMIT = 1 << 20
 
 _encoding_name(enc::Encoding) = Symbol(lowercase(string(enc)))
 
@@ -27,6 +35,7 @@ end
 """Whether value encoding `enc` can be used for `leaf`'s physical type."""
 _encoding_supports(enc::Encoding, leaf) =
     enc == PLAIN ||
+    (enc == RLE_DICTIONARY && leaf.ptype != BOOLEAN) ||
     (enc == BYTE_STREAM_SPLIT && leaf.ptype in (FLOAT, DOUBLE)) ||
     (enc == DELTA_BINARY_PACKED && leaf.ptype in (INT32, INT64)) ||
     (enc == DELTA_LENGTH_BYTE_ARRAY && leaf.ptype == BYTE_ARRAY)
@@ -312,7 +321,8 @@ row group at a time. By default the table is one row group.
 `encoding` selects the value encoding: `:plain` (default), `:byte_stream_split`
 (Float32/Float64), or `:delta_binary_packed` (every type stored as an integer: all
 signed and unsigned integers, Date, DateTime, Arrow.Timestamp), or
-`:delta_length_byte_array` (String, Vector{UInt8}). A single name applies to the whole table, falling back to PLAIN for
+`:delta_length_byte_array` (String, Vector{UInt8}), or `:dictionary` (every type but Bool; a column chunk whose
+distinct values would take more than 1 MiB is written PLAIN). A single name applies to the whole table, falling back to PLAIN for
 columns whose type does not allow it. A `Dict` sets it per column, keyed by the path
 used to reach the data, e.g. `Dict("x" => :byte_stream_split, "wf.values" => :plain)`;
 a key naming a struct or list covers everything under it. In a `Dict`, an encoding
@@ -355,20 +365,21 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
                 for leaf in node.leaves
                     offset = position(io)
                     enc = popfirst!(leaf_encodings)
-                    header_bytes, compressed, uncompressed_size = _data_page(leaf, codec, enc)
-                    write(io, header_bytes)
-                    write(io, compressed)
-                    total_bytes += uncompressed_size
+                    chunk = _column_pages(leaf, codec, enc)
+                    foreach(part -> write(io, part), chunk.parts)
+                    total_bytes += chunk.uncompressed_size
+                    dictionary = chunk.dictionary_bytes > 0
 
                     meta = ColumnMetaData(
                         type = leaf.ptype,
-                        encodings = [enc, RLE],
+                        encodings = dictionary ? [PLAIN, RLE, RLE_DICTIONARY] : [chunk.encoding, RLE],
                         path_in_schema = leaf.path,
                         codec = codec,
                         num_values = Int64(length(leaf.def)),
-                        total_uncompressed_size = Int64(uncompressed_size),
-                        total_compressed_size = Int64(length(header_bytes) + length(compressed)),
-                        data_page_offset = Int64(offset),
+                        total_uncompressed_size = Int64(chunk.uncompressed_size),
+                        total_compressed_size = Int64(sum(length, chunk.parts)),
+                        data_page_offset = Int64(offset + chunk.dictionary_bytes),
+                        dictionary_page_offset = dictionary ? Int64(offset) : nothing,
                         statistics = Statistics(null_count = Int64(_null_count(leaf))))
                     push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
                 end
@@ -430,9 +441,8 @@ The body is assembled once, in a buffer of the exact size: PLAIN fixed-width val
 touched once before compression (an `IOBuffer` grown by doubling, `take!` and `vcat` each
 copied them again).
 """
-function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
+function _data_page(leaf, codec::CompressionCodec, enc::Encoding, values::AbstractVector{UInt8} = _encode_values(leaf.values, enc))
     levels = [encode_rle_bitpacked(lv, level_bit_width(ml)) for (lv, ml) in ((leaf.rep, leaf.max_rep), (leaf.def, leaf.max_def)) if ml > 0]
-    values = _encode_values(leaf.values, enc)
     size = sum(4 + length(l) for l in levels; init = 0) + length(values)
     size <= typemax(Int32) || error("write_parquet: column $(join(leaf.path, '.')) is $size bytes; a data page holds at most 2 GiB (several pages per column are not written yet)")
     data = Vector{UInt8}(undef, size)
@@ -458,6 +468,74 @@ function _data_page(leaf, codec::CompressionCodec, enc::Encoding)
 
     header_bytes = serialize_thrift(header, PAGE_HEADER_FIELDS)
     (header_bytes, compressed, length(header_bytes) + length(data))
+end
+
+"""
+The pages of one column chunk, as byte vectors in file order (`parts`), with the chunk's
+uncompressed size, the value encoding actually used, and the size of the dictionary page
+(0 without one).
+
+With `RLE_DICTIONARY` the chunk is a dictionary page (the distinct values in order of first
+appearance, PLAIN) followed by a data page of indices: one byte of bit width, then the
+RLE/bit-packed hybrid. If the dictionary would pass `DICTIONARY_PAGE_LIMIT`, or the chunk
+has no value, the chunk is written PLAIN.
+"""
+function _column_pages(leaf, codec::CompressionCodec, enc::Encoding)
+    if enc == RLE_DICTIONARY
+        dict = _dictionary(leaf.values)
+        if dict !== nothing
+            uniques, indices = dict
+            plain = encode_plain(uniques)
+            plain isa Vector{UInt8} || (plain = collect(plain))
+            body = compress(plain, codec)
+            header = serialize_thrift(PageHeader(
+                type = DICTIONARY_PAGE,
+                uncompressed_page_size = Int32(length(plain)),
+                compressed_page_size = Int32(length(body)),
+                dictionary_page_header = DictionaryPageHeader(num_values = Int32(length(uniques)), encoding = PLAIN)),
+                PAGE_HEADER_FIELDS)
+            bit_width = max(1, ndigits(length(uniques) - 1, base = 2))
+            data_header, data_body, data_size = _data_page(leaf, codec, RLE_DICTIONARY, [UInt8(bit_width); encode_hybrid(indices, bit_width)])
+            return (parts = [header, body, data_header, data_body], uncompressed_size = length(header) + length(plain) + data_size,
+                    encoding = RLE_DICTIONARY, dictionary_bytes = length(header) + length(body))
+        end
+        enc = PLAIN
+    end
+    data_header, data_body, data_size = _data_page(leaf, codec, enc)
+    (parts = [data_header, data_body], uncompressed_size = data_size, encoding = enc, dictionary_bytes = 0)
+end
+
+# Floats are keyed by their bits, so that NaNs with different payloads and the two zeros stay distinct values
+_dictionary_key(v) = v
+_dictionary_key(v::Float32) = reinterpret(UInt32, v)
+_dictionary_key(v::Float64) = reinterpret(UInt64, v)
+_plain_size(v) = sizeof(v)
+_plain_size(v::Union{AbstractString, Vector{UInt8}, Base.CodeUnits}) = 4 + sizeof(v)
+
+"""
+The distinct values of `values` in order of first appearance and, per value, its 0-based
+index among them; `nothing` if there is no value or the distinct values would take more than
+`DICTIONARY_PAGE_LIMIT` bytes (the scan stops there).
+"""
+function _dictionary(values::Vector{T}) where T
+    isempty(values) && return nothing
+    index = Dict{typeof(_dictionary_key(first(values))), UInt32}()
+    uniques = T[]
+    indices = Vector{UInt32}(undef, length(values))
+    bytes = 0
+    @inbounds for (i, v) in enumerate(values)
+        key = _dictionary_key(v)
+        idx = get(index, key, typemax(UInt32))
+        if idx == typemax(UInt32)
+            bytes += _plain_size(v)
+            bytes > DICTIONARY_PAGE_LIMIT && return nothing
+            idx = UInt32(length(uniques))
+            push!(uniques, v)
+            index[key] = idx
+        end
+        indices[i] = idx
+    end
+    (uniques, indices)
 end
 
 _copy_bytes!(data::Vector{UInt8}, pos::Int, bytes::AbstractVector{UInt8}) = copyto!(data, pos, bytes, 1, length(bytes))

@@ -4,6 +4,7 @@
 
 ### Writing
 
+- `encoding = :dictionary` writes a column dictionary-encoded (every type but `Bool`), for the whole table or per column: the distinct values of each column chunk once, and bit-packed indices. A chunk whose distinct values would take more than 1 MiB is written PLAIN, as in pyarrow.
 - `write_parquet(path, tbl; rowgroup_size = n)` writes the table as row groups of `n` rows, each shredded, encoded and written before the next, so the writer's working set is a few times one row group instead of the whole table. The default is still one row group.
 - A column of fixed-length vectors is written as a `FixedSizeList`: an ArraysOfArrays `VectorOfSimilarVectors` (no copy) or a `Vector` of isbits fixed-length vectors such as StaticArrays' `SVector`.
 
