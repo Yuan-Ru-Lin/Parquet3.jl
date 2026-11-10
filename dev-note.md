@@ -143,9 +143,9 @@ The writer emits `logicalType` for `DateTime` (naive millis) and `Arrow.Timestam
 
 ## Testing and CI
 
-`julia --project=. -e 'using Pkg; Pkg.test()'` runs everything. pyarrow is the reference: the tests have pyarrow write fixtures and read our files, through `uv` in the Python environment committed under `test/pyhelper` (pyarrow pinned in `pyproject.toml` and `uv.lock`). The Apache parquet-testing files come from the `test/parquet-testing` submodule (`git clone --recurse-submodules`).
+`julia --project=. -e 'using Pkg; Pkg.test()'` runs everything. pyarrow is the reference: the tests have pyarrow write fixtures and read our files, through `uv` in the Python environment committed under `test/pyhelper` (pyarrow pinned in `pyproject.toml` and `uv.lock`). The Apache parquet-testing files are a lazy artifact declared in `test/Artifacts.toml`: the upstream repository's archive at a pinned commit, downloaded on the first test run and kept in the Julia depot. It is a test-only dependency (`Artifacts` and `LazyArtifacts` are in `[extras]`), so installing the package downloads nothing. It replaced a git submodule, which made the repository impossible to install with `Pkg.add(url=…)`: Pkg checks a package out of a bare clone and libgit2 refuses a tree that contains a submodule. The archive is the one GitHub generates for the commit; if its bytes ever change, the checksum in `test/Artifacts.toml` has to be updated (the tree hash stays valid).
 
-Without `uv`, or without the submodule, the tests that need them are skipped with a warning. With `PARQUET3_TEST_STRICT=1` a missing dependency is a failure instead; CI sets it, so a green run means the pyarrow cross-checks and the parquet-testing suite ran.
+Without `uv`, or when the artifact cannot be fetched, the tests that need them are skipped with a warning. With `PARQUET3_TEST_STRICT=1` a missing dependency is a failure instead; CI sets it, so a green run means the pyarrow cross-checks and the parquet-testing suite ran.
 
 **Running tests.** The full suite takes about 12 minutes, nearly all of it Julia compiling code for each new table schema. While iterating, run only the groups that matter:
 
