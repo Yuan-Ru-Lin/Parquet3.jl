@@ -4,6 +4,7 @@ using Arrow
 using Tables
 using Dates
 using Artifacts, LazyArtifacts
+using StaticArrays: SVector
 
 # Selective runs: `Pkg.test(test_args=["FixedSizeList", "Writer"])` runs only the groups
 # whose name contains one of the arguments (case-insensitive); without arguments every
@@ -816,6 +817,53 @@ end
             for k in keys(tbl)
                 @test isequal(collect(Tables.getcolumn(t, k)), collect(tbl[k]))
             end
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "row groups" begin
+        f = wfile("test_w1_rowgroups.parquet")
+        try
+            n = 10
+            tbl = (i = collect(Int64, 1:n), x = Float32.(0.5:1:n), s = string.('a':'j'),
+                   l = [collect(Int32, 1:k) for k in 0:n-1], m = [isodd(k) ? missing : k for k in 1:n],
+                   fsl = Parquet3.nestedview(reshape(Float32.(1:3n), 3, n)),   # x, y, z rows
+                   sv = [SVector{2, Int16}(k, -k) for k in 1:n])
+            write_parquet(f, tbl; rowgroup_size = 3)
+            @test [rg.num_rows for rg in open_parquet(f).metadata.row_groups] == [3, 3, 3, 1]
+            t = read_parquet(f)
+            @test collect(t.i) == tbl.i && collect(t.x) == tbl.x && collect(t.s) == tbl.s
+            @test collect.(collect(t.l)) == tbl.l
+            @test isequal(collect(t.m), tbl.m)
+            @test [collect(v) for v in t.fsl] == [collect(v) for v in tbl.fsl]
+            @test t.fsl isa Parquet3.FixedSizeListVector || first(t.fsl.arrays) isa Parquet3.FixedSizeListVector
+            @test [collect(v) for v in t.sv] == [collect(v) for v in tbl.sv]
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+print(pq.ParquetFile('$(f)').metadata.num_row_groups)
+t = pq.read_table('$(f)')
+print(t.column('i').to_pylist())
+print(t.column('fsl').to_pylist()[-1])
+print(t.schema.field('fsl').type, '|', t.schema.field('sv').type)""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "4"
+                @test lines[2] == "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]"
+                @test lines[3] == "[28.0, 29.0, 30.0]"
+                @test lines[4] == "fixed_size_list<element: float>[3] | fixed_size_list<element: int16>[2]"
+            else
+                @warn "Skipping pyarrow cross-check of row groups: uv/pyarrow not available"
+            end
+            # a size at or above the table's length is one row group; zero is an error; zero rows are one group
+            write_parquet(f, tbl; rowgroup_size = 10)
+            @test num_row_groups(open_parquet(f)) == 1
+            write_parquet(f, tbl; rowgroup_size = 100)
+            @test num_row_groups(open_parquet(f)) == 1
+            @test_throws Exception write_parquet(f, tbl; rowgroup_size = 0)
+            write_parquet(f, (a = Int32[],); rowgroup_size = 2)
+            @test num_row_groups(open_parquet(f)) == 1 && length(read_parquet(f).a) == 0
+            @test_throws ArgumentError Parquet3.FixedSizeListVector(3, Float32[1, 2])
         finally
             rm(f, force=true)
         end
