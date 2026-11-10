@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+Measured on a 26.4 M-row table (two Int64, two Float32 and one `FixedSizeList<Float32>[3]` column, zstd, Julia 1.12, 4 threads); the files written are byte-identical to before.
+
+- Reading a flat column no longer boxes every value. `assemble_flat_column` copied optional columns (every column `write_parquet` writes) element by element through an abstractly typed page vector, about four allocations per value. The per-page copy is now a typed function barrier, and a page whose definition levels are all at the maximum is copied in bulk. One column: 4.7 s and 106 M allocations to 0.8 s and 1.5 k; all columns: 12.1 s and 397 M to about 3 s of work and 2 k.
+- Definition and repetition levels are kept in the decoder's `UInt32` instead of being copied to `Int`, and a level stream that is a single RLE run of "present" (or "no repetition") over the whole page builds no buffer at all. The compressed bytes of a page are decompressed from a view, not a copy.
+- Writing allocates per column, not per row: a flat column without `missing` and a `FixedSizeListVector` without nulls are appended in bulk, repetition levels are only kept under a list, level buffers are bytes, and a page is assembled once in a buffer of its exact size (PLAIN fixed-width values are copied by pointer) instead of through an `IOBuffer`, `take!` and `vcat`. Whole table: 25.7 s and 52.9 M allocations (18.5 GiB) to 7.8 s and 2 k (3.6 GiB).
+- A column chunk larger than 2 GiB now fails with a message naming the column instead of an `InexactError` (one data page per column is still written).
+
 ## v0.2.0
 
 Parquet3 now reads every nested shape Parquet can hold and writes Parquet files. pyarrow is the reference throughout: the tests compare what we read with what pyarrow reads, and have pyarrow read what we write.
