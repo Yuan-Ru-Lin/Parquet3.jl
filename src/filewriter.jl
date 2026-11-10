@@ -284,9 +284,9 @@ types, so a zero-row copy of the table is enough; its first stream message is th
 Returns `nothing` unless a column is or contains a FixedSizeList: Arrow.jl compiles its schema code
 per table type (seconds on a first call), and no other type we write needs the entry.
 """
-function _arrow_schema_kv(names::Vector{Symbol}, vectors::Vector)
-    any(v -> _has_fsl(eltype(v)), vectors) || return nothing
-    empties = NamedTuple{Tuple(names)}(Tuple(_schema_eltype(eltype(v))[] for v in vectors))
+function _arrow_schema_kv(names::Vector{Symbol}, eltypes::Vector)
+    any(_has_fsl, eltypes) || return nothing
+    empties = NamedTuple{Tuple(names)}(Tuple(_schema_eltype(T)[] for T in eltypes))
     buf = take!(Arrow.tobuffer(empties))
     # Encapsulated message: 0xFFFFFFFF continuation, Int32 metadata length, metadata
     len = ltoh(reinterpret(Int32, buf[5:8])[1])
@@ -331,72 +331,280 @@ that does not fit the column's type, or a key matching no column, is an error.
 function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractString} = :snappy,
                        encoding::Union{Symbol, AbstractString, AbstractDict} = :plain,
                        rowgroup_size::Union{Nothing, Integer} = nothing)
-    codec = get(WRITER_CODECS, Symbol(lowercase(String(compression))), nothing)
-    codec === nothing && error("write_parquet: unknown compression $(repr(compression)) " *
-                               "(supported: $(join(sort!(String.(collect(keys(WRITER_CODECS)))), ", ")))")
+    codec = _codec(compression)
     rowgroup_size === nothing || rowgroup_size >= 1 || error("write_parquet: rowgroup_size must be at least 1, got $rowgroup_size")
+    names, vectors, nrows = _table_columns(tbl)
+    # Plan every column first, so a bad type or encoding fails before the file is touched
+    plan = _write_plan(names, Type[eltype(v) for v in vectors], codec, encoding)
+    # Row groups are written one at a time, so the writer's working set is that of a row group, not the table
+    ranges = rowgroup_size === nothing || nrows == 0 ? [1:nrows] : [i:min(i + rowgroup_size - 1, nrows) for i in 1:rowgroup_size:nrows]
+
+    _write_whole_file(path) do io
+        write(io, PARQUET_MAGIC)
+        row_groups = [_write_rowgroup!(io, plan, [_rows(col, rows) for col in vectors], length(rows)) for rows in ranges]
+        _write_footer(io, plan, row_groups)
+    end
+    path
+end
+
+_codec(compression) = get(WRITER_CODECS, Symbol(lowercase(String(compression)))) do
+    error("write_parquet: unknown compression $(repr(compression)) " *
+          "(supported: $(join(sort!(String.(collect(keys(WRITER_CODECS)))), ", ")))")
+end
+
+"""The table's column names, its columns in the form the writer takes them, and its number of rows."""
+function _table_columns(tbl)
     cols = Tables.columns(tbl)
     names = collect(Symbol, Tables.columnnames(cols))
     isempty(names) && error("write_parquet: table has no columns")
     vectors = [_as_writable(Tables.getcolumn(cols, name)) for name in names]
     nrows = length(vectors[1])
     all(v -> length(v) == nrows, vectors) || error("write_parquet: ragged columns")
+    (names, vectors, nrows)
+end
 
-    # Plan every column first, so a bad type or encoding fails before the file is touched
-    nodes = [_plan_node(String(name), eltype(col), String[], 0, 0) for (name, col) in zip(names, vectors)]
+"""
+What the element types of a table fix for every row group written from it: the shredding
+plan of each column (with its reusable leaf buffers), the value encoding of each leaf, the
+codec and the file's schema.
+"""
+struct WritePlan
+    names::Vector{Symbol}
+    eltypes::Vector{Type}
+    nodes::Vector{Any}
+    encodings::Vector{Encoding}
+    codec::CompressionCodec
+    schema::Vector{SchemaElement}
+end
+
+function _write_plan(names::Vector{Symbol}, eltypes::Vector{Type}, codec::CompressionCodec, encoding)
+    nodes = Any[_plan_node(String(name), T, String[], 0, 0) for (name, T) in zip(names, eltypes)]
     encodings = _leaf_encodings(encoding, reduce(vcat, [node.leaves for node in nodes]))
     schema = [SchemaElement(name = "schema", num_children = Int32(length(names))); reduce(vcat, [node.elements for node in nodes])]
-    # Row groups are written one at a time, so the writer's working set is that of a row group, not the table
-    ranges = rowgroup_size === nothing || nrows == 0 ? [1:nrows] : [i:min(i + rowgroup_size - 1, nrows) for i in 1:rowgroup_size:nrows]
+    WritePlan(names, eltypes, nodes, encodings, codec, schema)
+end
 
-    _write_whole_file(path) do io
-        write(io, PARQUET_MAGIC)
-        row_groups = RowGroup[]
+"""
+Shred, encode and write one row group (`columns`, in the plan's order, `nrows` rows) at the
+current position of `io`; returns its metadata, with offsets as positions in `io`.
+"""
+function _write_rowgroup!(io::IO, plan::WritePlan, columns::Vector, nrows::Int)
+    chunks = ColumnChunk[]
+    total_bytes = 0
+    leaf_encodings = Iterators.Stateful(plan.encodings)
 
-        for rows in ranges
-            chunks = ColumnChunk[]
-            total_bytes = 0
-            leaf_encodings = Iterators.Stateful(encodings)
+    for (node, col) in zip(plan.nodes, columns)
+        foreach(leaf -> (empty!(leaf.values); empty!(leaf.rep); empty!(leaf.def)), node.leaves)   # buffers keep their capacity
+        _shred_column!(node, col)
 
-            for (node, col) in zip(nodes, vectors)
-                foreach(leaf -> (empty!(leaf.values); empty!(leaf.rep); empty!(leaf.def)), node.leaves)   # buffers keep their capacity
-                _shred_column!(node, _rows(col, rows))
+        for leaf in node.leaves
+            offset = position(io)
+            enc = popfirst!(leaf_encodings)
+            chunk = _column_pages(leaf, plan.codec, enc)
+            foreach(part -> write(io, part), chunk.parts)
+            total_bytes += chunk.uncompressed_size
+            dictionary = chunk.dictionary_bytes > 0
 
-                for leaf in node.leaves
-                    offset = position(io)
-                    enc = popfirst!(leaf_encodings)
-                    chunk = _column_pages(leaf, codec, enc)
-                    foreach(part -> write(io, part), chunk.parts)
-                    total_bytes += chunk.uncompressed_size
-                    dictionary = chunk.dictionary_bytes > 0
-
-                    meta = ColumnMetaData(
-                        type = leaf.ptype,
-                        encodings = dictionary ? [PLAIN, RLE, RLE_DICTIONARY] : [chunk.encoding, RLE],
-                        path_in_schema = leaf.path,
-                        codec = codec,
-                        num_values = Int64(length(leaf.def)),
-                        total_uncompressed_size = Int64(chunk.uncompressed_size),
-                        total_compressed_size = Int64(sum(length, chunk.parts)),
-                        data_page_offset = Int64(offset + chunk.dictionary_bytes),
-                        dictionary_page_offset = dictionary ? Int64(offset) : nothing,
-                        statistics = Statistics(null_count = Int64(_null_count(leaf))))
-                    push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
-                end
-            end
-            push!(row_groups, RowGroup(columns = chunks, total_byte_size = Int64(total_bytes), num_rows = Int64(length(rows))))
+            meta = ColumnMetaData(
+                type = leaf.ptype,
+                encodings = dictionary ? [PLAIN, RLE, RLE_DICTIONARY] : [chunk.encoding, RLE],
+                path_in_schema = leaf.path,
+                codec = plan.codec,
+                num_values = Int64(length(leaf.def)),
+                total_uncompressed_size = Int64(chunk.uncompressed_size),
+                total_compressed_size = Int64(sum(length, chunk.parts)),
+                data_page_offset = Int64(offset + chunk.dictionary_bytes),
+                dictionary_page_offset = dictionary ? Int64(offset) : nothing,
+                statistics = Statistics(null_count = Int64(_null_count(leaf))))
+            push!(chunks, ColumnChunk(file_offset = Int64(offset), meta_data = meta))
         end
+    end
+    RowGroup(columns = chunks, total_byte_size = Int64(total_bytes), num_rows = Int64(nrows))
+end
 
-        fmeta = FileMetaData(version = Int32(1), schema = schema, num_rows = Int64(nrows),
-                             row_groups = row_groups, created_by = CREATED_BY,
-                             key_value_metadata = _arrow_schema_kv(names, vectors))
+function _write_footer(io::IO, plan::WritePlan, row_groups::Vector{RowGroup})
+    fmeta = FileMetaData(version = Int32(1), schema = plan.schema, num_rows = sum(rg -> rg.num_rows, row_groups; init = Int64(0)),
+                         row_groups = row_groups, created_by = CREATED_BY,
+                         key_value_metadata = _arrow_schema_kv(plan.names, plan.eltypes))
+    footer = serialize_thrift(fmeta, FILE_METADATA_FIELDS)
+    write(io, footer)
+    write(io, htol(UInt32(length(footer))))
+    write(io, PARQUET_MAGIC)
+    nothing
+end
 
-        footer = serialize_thrift(fmeta, FILE_METADATA_FIELDS)
-        write(io, footer)
-        write(io, htol(UInt32(length(footer))))
-        write(io, PARQUET_MAGIC)
+# =============================================================================
+# Streaming: a file written one row group at a time
+# =============================================================================
+
+"""
+    encode_rowgroup(tbl; compression = :snappy, encoding = :plain) -> EncodedRowGroup
+
+One row group as it would be written to a file: its pages as bytes and its metadata, with
+offsets counted from the start of those bytes. It is plain data, so it can be made on one
+process and sent to another (Distributed.jl, a channel, a file); `write_rowgroup!` appends
+it to a writer by copying the bytes. All the work of writing a row group (shredding,
+encoding, compression) is here.
+"""
+struct EncodedRowGroup
+    bytes::Vector{UInt8}
+    row_group::RowGroup
+    names::Vector{Symbol}
+    eltypes::Vector{Type}
+end
+
+function encode_rowgroup(tbl; compression::Union{Symbol, AbstractString} = :snappy,
+                         encoding::Union{Symbol, AbstractString, AbstractDict} = :plain)
+    names, vectors, nrows = _table_columns(tbl)
+    plan = _write_plan(names, Type[eltype(v) for v in vectors], _codec(compression), encoding)
+    io = IOBuffer()
+    row_group = _write_rowgroup!(io, plan, vectors, nrows)
+    EncodedRowGroup(take!(io), row_group, names, plan.eltypes)
+end
+
+"""
+    open_parquet_writer(path; compression = :snappy, encoding = :plain) -> ParquetWriter
+    open_parquet_writer(f, path; ...)
+
+A Parquet file written one row group at a time, for a producer that makes its table in
+batches and should never hold all of it:
+
+    open_parquet_writer("hits.parquet"; compression = :zstd) do w
+        for batch in batches
+            write_rowgroup!(w, batch)       # any Tables.jl table; one row group
+        end
+    end
+
+The first batch fixes the columns: their names, order and types (a batch may be empty and
+then only does that). Every later batch must have the same; `Missing` may come and go.
+`close(w)` writes the footer; until then the file is not a Parquet file. With the `do`
+form the file is closed at the end, and removed if the block throws.
+
+`write_rowgroup!` also takes an `EncodedRowGroup` (see `encode_rowgroup`), which is how
+several processes write one file: workers encode, one process appends.
+"""
+mutable struct ParquetWriter
+    path::String
+    io::IOStream
+    codec::CompressionCodec
+    encoding::Any
+    plan::Union{WritePlan, Nothing}
+    row_groups::Vector{RowGroup}
+end
+
+function open_parquet_writer(path::String; compression::Union{Symbol, AbstractString} = :snappy,
+                             encoding::Union{Symbol, AbstractString, AbstractDict} = :plain)
+    codec = _codec(compression)
+    io = open(path, "w")
+    write(io, PARQUET_MAGIC)
+    ParquetWriter(path, io, codec, encoding, nothing, RowGroup[])
+end
+
+function open_parquet_writer(f::Function, path::String; kwargs...)
+    w = open_parquet_writer(path; kwargs...)
+    written = realpath(path)
+    try
+        f(w)
+        close(w)
+    catch
+        isopen(w.io) && close(w.io)
+        isfile(written) && rm(written; force = true)      # as write_parquet: no partial file is left
+        rethrow()
     end
     path
+end
+
+Base.isopen(w::ParquetWriter) = isopen(w.io)
+Base.show(io::IO, w::ParquetWriter) =
+    print(io, "ParquetWriter(", repr(w.path), ", ", length(w.row_groups), " row groups, ",
+          sum(rg -> rg.num_rows, w.row_groups; init = Int64(0)), " rows", isopen(w) ? ")" : ", closed)")
+
+# The plan of the first batch, or a check that this batch has the same columns: names, order and schema.
+# (Compared through the schema, which does not record whether an element type admits Missing.)
+function _plan!(w::ParquetWriter, names::Vector{Symbol}, eltypes::Vector{Type})
+    isopen(w) || error("write_rowgroup!: the writer of $(repr(w.path)) is closed")
+    w.plan === nothing || w.plan.names == names ||
+        error("write_rowgroup!: columns $(join(names, ", ")) do not match the file's columns $(join(w.plan.names, ", "))")
+    plan = _write_plan(names, eltypes, w.codec, w.encoding)
+    if w.plan === nothing
+        w.plan = plan
+    else
+        sig(p) = [serialize_thrift(e, SCHEMA_ELEMENT_FIELDS) for e in p.schema]
+        sig(plan) == sig(w.plan) ||
+            error("write_rowgroup!: column types $(join(eltypes, ", ")) do not match the file's column types $(join(w.plan.eltypes, ", "))")
+    end
+    w.plan
+end
+
+"""
+    write_rowgroup!(w::ParquetWriter, tbl) -> w
+    write_rowgroup!(w::ParquetWriter, encoded::EncodedRowGroup) -> w
+
+Append one row group to the file: a table, which is shredded, encoded and written here, or
+a row group encoded elsewhere, whose bytes are copied. An empty table writes no row group.
+If it fails, nothing of the row group stays in the file and the writer can go on.
+"""
+function write_rowgroup!(w::ParquetWriter, tbl)
+    names, vectors, nrows = _table_columns(tbl)
+    plan = _plan!(w, names, Type[eltype(v) for v in vectors])
+    nrows == 0 && return w
+    start = position(w.io)
+    try
+        push!(w.row_groups, _write_rowgroup!(w.io, plan, vectors, nrows))
+    catch
+        truncate(w.io, start); seek(w.io, start)
+        rethrow()
+    end
+    w
+end
+
+function write_rowgroup!(w::ParquetWriter, encoded::EncodedRowGroup)
+    _plan!(w, encoded.names, encoded.eltypes)
+    encoded.row_group.num_rows == 0 && return w
+    start = position(w.io)
+    try
+        write(w.io, encoded.bytes)
+    catch
+        truncate(w.io, start); seek(w.io, start)
+        rethrow()
+    end
+    push!(w.row_groups, _shifted(encoded.row_group, start))
+    w
+end
+
+# The row group's metadata with every offset moved by `by` bytes
+function _shifted(rg::RowGroup, by::Integer)
+    chunks = map(rg.columns) do c
+        m = c.meta_data
+        meta = ColumnMetaData(type = m.type, encodings = m.encodings, path_in_schema = m.path_in_schema, codec = m.codec,
+                              num_values = m.num_values, total_uncompressed_size = m.total_uncompressed_size,
+                              total_compressed_size = m.total_compressed_size, data_page_offset = m.data_page_offset + by,
+                              index_page_offset = m.index_page_offset === nothing ? nothing : m.index_page_offset + by,
+                              dictionary_page_offset = m.dictionary_page_offset === nothing ? nothing : m.dictionary_page_offset + by,
+                              statistics = m.statistics)
+        ColumnChunk(file_path = c.file_path, file_offset = c.file_offset + by, meta_data = meta)
+    end
+    RowGroup(columns = chunks, total_byte_size = rg.total_byte_size, num_rows = rg.num_rows)
+end
+
+"""
+    close(w::ParquetWriter)
+
+Write the footer and close the file. A file needs its columns: closing a writer that was
+given no batch at all (not even an empty one) is an error, and the file is removed.
+"""
+function Base.close(w::ParquetWriter)
+    isopen(w) || return nothing
+    if w.plan === nothing
+        written = realpath(w.path)
+        close(w.io)
+        isfile(written) && rm(written; force = true)
+        error("close(::ParquetWriter): nothing was written to $(repr(w.path)), so the file has no columns; " *
+              "give the writer at least an empty table")
+    end
+    _write_footer(w.io, w.plan, w.row_groups)
+    close(w.io)
+    nothing
 end
 
 """The rows `r` of a column as a vector `_shred_column!` can take its fast paths on: the column itself when `r` is all of it, a slice of a fixed-size-list column, else a view."""

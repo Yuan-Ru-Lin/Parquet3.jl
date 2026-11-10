@@ -4,6 +4,7 @@ using Arrow
 using Tables
 using Dates
 using Artifacts, LazyArtifacts
+import Serialization
 using StaticArrays: SVector
 
 # Selective runs: `Pkg.test(test_args=["FixedSizeList", "Writer"])` runs only the groups
@@ -940,6 +941,72 @@ print(t.column('l').to_pylist()[1:4], t.column('one').to_pylist()[-1], t.num_row
             @test all(ismissing, read_parquet(f).a) && collect(read_parquet(f).b) == [1, 1]
             write_parquet(f, (a = Int64[],); encoding = :dictionary)
             @test length(read_parquet(f).a) == 0
+        finally
+            rm(f, force=true)
+        end
+    end
+
+    @testset "streaming writer" begin
+        f = wfile("test_w1_stream.parquet")
+        batch(k, n) = (id = collect(Int64, k:k+n-1), det = fill(Int64(k % 3), n), s = ["h$(i % 4)" for i in 1:n],
+                       m = [isodd(i) ? missing : Float32(i) for i in 1:n], l = [collect(Int32, 1:(i % 3)) for i in 1:n],
+                       pos = Parquet3.nestedview(reshape(Float32.(1:3n) .+ k, 3, n)))
+        batches = [batch(1, 5), batch(6, 3), batch(9, 4)]
+        whole = NamedTuple{keys(batches[1])}(Tuple(reduce(vcat, [collect(b[k]) for b in batches]) for k in keys(batches[1])))
+        same(t) = collect(t.id) == whole.id && collect(t.det) == whole.det && collect(t.s) == whole.s && isequal(collect(t.m), whole.m) &&
+                  collect.(collect(t.l)) == whole.l && [collect(v) for v in t.pos] == [collect(v) for v in whole.pos]
+        try
+            @test open_parquet_writer(f; compression = :zstd, encoding = Dict("det" => :dictionary)) do w
+                write_rowgroup!(w, batches[1])
+                write_rowgroup!(w, batches[2])
+                # a batch of other columns or types is refused and leaves the file as it was
+                @test_throws ErrorException write_rowgroup!(w, (id = [1], other = [2]))
+                @test_throws ErrorException write_rowgroup!(w, merge(batches[2], (id = ["a", "b", "c"],)))
+                @test_throws Exception write_rowgroup!(w, merge(batches[2], (id = Any[1, 2im, 3],)))
+                # a row group encoded elsewhere, as it arrives from another process
+                buf = IOBuffer()
+                Serialization.serialize(buf, encode_rowgroup(batches[3]; compression = :snappy))
+                write_rowgroup!(w, Serialization.deserialize(seekstart(buf)))
+                write_rowgroup!(w, batch(13, 0))            # empty: no row group
+                @test occursin("3 row groups, 12 rows", sprint(show, w))
+            end == f
+            @test [rg.num_rows for rg in open_parquet(f).metadata.row_groups] == [5, 3, 4]
+            @test same(read_parquet(f))
+            # the same table from write_parquet in one piece reads the same
+            g = wfile("test_w1_stream_whole.parquet")
+            write_parquet(g, whole)
+            @test same(read_parquet(g)); rm(g, force = true)
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('$(f)')
+t = pf.read()
+print(pf.metadata.num_row_groups, t.num_rows, t.column('id').to_pylist(), t.schema.field('pos').type)
+print([pf.metadata.row_group(i).column(0).compression for i in range(3)], t.column('pos').to_pylist()[-1])""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test lines[1] == "3 12 [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] fixed_size_list<element: float>[3]"
+                @test lines[2] == "['ZSTD', 'ZSTD', 'SNAPPY'] [19.0, 20.0, 21.0]"
+            else
+                @warn "Skipping pyarrow cross-check of the streaming writer: uv/pyarrow not available"
+            end
+            # Missing may come and go between batches
+            open_parquet_writer(f) do w
+                write_rowgroup!(w, (a = [1, 2],)); write_rowgroup!(w, (a = [missing, 4],)); write_rowgroup!(w, (a = [5],))
+            end
+            @test isequal(collect(read_parquet(f).a), [1, 2, missing, 4, 5])
+            # an empty first batch fixes the columns; the file then has them and no row
+            open_parquet_writer(w -> write_rowgroup!(w, batch(1, 0)), f)
+            @test length(read_parquet(f).id) == 0 && column_names(open_parquet(f)) == String.(collect(keys(batches[1])))
+            # no batch at all: an error, and no file; a failing block: no file; a closed writer refuses
+            @test_throws ErrorException open_parquet_writer(identity, f)
+            @test !isfile(f)
+            @test_throws ErrorException open_parquet_writer(f) do w
+                write_rowgroup!(w, batches[1]); error("stop")
+            end
+            @test !isfile(f)
+            w = open_parquet_writer(f); write_rowgroup!(w, batches[1]); close(w); close(w)
+            @test !isopen(w) && collect(read_parquet(f).id) == batches[1].id
+            @test_throws ErrorException write_rowgroup!(w, batches[2])
         finally
             rm(f, force=true)
         end
