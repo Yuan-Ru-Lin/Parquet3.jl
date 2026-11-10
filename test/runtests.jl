@@ -869,6 +869,82 @@ print(t.schema.field('fsl').type, '|', t.schema.field('sv').type)""")
         end
     end
 
+    @testset "dictionary encoding" begin
+        # the index encoder against the decoder: random values, long runs, runs that start off a group boundary
+        for bw in (1, 2, 3, 7, 8, 9, 17), n in (0, 1, 7, 8, 9, 63, 64, 65, 1000)
+            top = UInt32(2^bw - 1)
+            for v in (UInt32[(i * 2654435761) % 2^bw for i in 1:n], fill(top, n),
+                      UInt32[div(i, 13) % 2^bw for i in 1:n], UInt32[(i % 40 < 20 ? 1 : i) % 2^bw for i in 1:n])
+                @test Parquet3.decode_rle_bitpacked(Parquet3.encode_hybrid(v, bw), n, bw) == v
+            end
+        end
+        @test length(Parquet3.encode_hybrid(fill(UInt32(1), 10_000), 2)) <= 4          # one RLE run
+        @test length(Parquet3.encode_hybrid(UInt32[i % 4 for i in 1:8000], 2)) <= 2004  # bit-packed: 2 bits a value
+
+        f = wfile("test_w1_dictionary.parquet")
+        try
+            n = 1000
+            pick(xs, i) = xs[mod1(i * 7 + div(i, 3), length(xs))]
+            tbl = (det = [pick(Int64[3, 7, 11], i) for i in 1:n],
+                   x = [pick(Float32[1.5, NaN, -0.0, 0.0], i) for i in 1:n],
+                   s = [pick(["a", "bb", "", "déjà"], i) for i in 1:n],
+                   m = [isodd(i) ? missing : i % 5 for i in 1:n],
+                   d = [pick([Date(2020), Date(2021)], i) for i in 1:n],
+                   u = [pick(UInt16[1, 2, 65535], i) for i in 1:n],
+                   l = [[pick(Int32[1, 2, 3], i + k) for k in 1:(i % 4)] for i in 1:n],
+                   one = fill(42, n), flag = [isodd(div(i, 3)) for i in 1:n])
+            for kw in ((;), (; rowgroup_size = 300), (; compression = :zstd))
+                write_parquet(f, tbl; encoding = :dictionary, kw...)
+                t = read_parquet(f)
+                @test collect(t.det) == tbl.det && collect(t.s) == tbl.s && collect(t.u) == tbl.u && collect(t.one) == tbl.one
+                @test reinterpret(UInt32, collect(t.x)) == reinterpret(UInt32, tbl.x)        # NaN and both zeros, bit for bit
+                @test isequal(collect(t.m), tbl.m) && collect(t.d) == tbl.d && collect(t.flag) == tbl.flag
+                @test collect.(collect(t.l)) == tbl.l
+            end
+            write_parquet(f, tbl; encoding = :dictionary)
+            chunks = Dict(c.meta_data.path_in_schema[1] => c.meta_data for c in open_parquet(f).metadata.row_groups[1].columns)
+            @test chunks["det"].encodings == [Parquet3.PLAIN, Parquet3.RLE, Parquet3.RLE_DICTIONARY]
+            @test chunks["det"].dictionary_page_offset !== nothing && chunks["det"].data_page_offset > chunks["det"].dictionary_page_offset
+            @test chunks["flag"].encodings == [Parquet3.PLAIN, Parquet3.RLE] && chunks["flag"].dictionary_page_offset === nothing   # Bool stays PLAIN
+            result = _run_pyarrow("""
+import pyarrow.parquet as pq
+pf = pq.ParquetFile('$(f)')
+t = pf.read()
+c = pf.metadata.row_group(0).column(0)
+print(c.encodings, c.has_dictionary_page)
+print(t.column('det').to_pylist()[:6], t.column('s').to_pylist()[:4], t.column('m').to_pylist()[:4])
+print(t.column('l').to_pylist()[1:4], t.column('one').to_pylist()[-1], t.num_rows)""")
+            if result !== nothing
+                lines = split(result, '\n')
+                @test occursin("RLE_DICTIONARY", lines[1]) && endswith(lines[1], "True")
+                @test lines[2] == string(tbl.det[1:6]) * " " * replace(repr(tbl.s[1:4]), "\"" => "'") * " [None, 2, None, 4]"
+                @test lines[3] == replace(string([Int.(v) for v in tbl.l[2:4]]), "Int64" => "") * " 42 1000"
+            else
+                @warn "Skipping pyarrow cross-check of dictionary encoding: uv/pyarrow not available"
+            end
+            # per column, by either name; an unsupported type under an explicit key is an error
+            write_parquet(f, tbl; encoding = Dict("det" => :dictionary, "s" => :rle_dictionary))
+            chunks = Dict(c.meta_data.path_in_schema[1] => c.meta_data for c in open_parquet(f).metadata.row_groups[1].columns)
+            @test chunks["s"].dictionary_page_offset !== nothing && chunks["u"].dictionary_page_offset === nothing
+            @test_throws Exception write_parquet(f, tbl; encoding = Dict("flag" => :dictionary))
+            # distinct values past 1 MiB: the chunk is PLAIN; in smaller row groups each chunk fits and is a dictionary
+            big = (x = collect(1:200_000),)
+            write_parquet(f, big; encoding = :dictionary)
+            @test open_parquet(f).metadata.row_groups[1].columns[1].meta_data.encodings == [Parquet3.PLAIN, Parquet3.RLE]
+            @test collect(read_parquet(f).x) == big.x
+            write_parquet(f, big; encoding = :dictionary, rowgroup_size = 50_000)
+            @test all(rg -> rg.columns[1].meta_data.dictionary_page_offset !== nothing, open_parquet(f).metadata.row_groups)
+            @test collect(read_parquet(f).x) == big.x
+            # a chunk without values (all null, or no rows) has nothing to put in a dictionary
+            write_parquet(f, (a = Union{Missing, Int64}[missing, missing], b = [1, 1]); encoding = :dictionary)
+            @test all(ismissing, read_parquet(f).a) && collect(read_parquet(f).b) == [1, 1]
+            write_parquet(f, (a = Int64[],); encoding = :dictionary)
+            @test length(read_parquet(f).a) == 0
+        finally
+            rm(f, force=true)
+        end
+    end
+
     @testset "edge cases" begin
         f = wfile("test_w1_edge.parquet")
         try
@@ -1678,7 +1754,7 @@ print(t.column('tags').to_pylist()[:3], t.column('wf').to_pylist()[0], t.column(
             @test all(ismissing, read_parquet(f).o)
             @test_throws "not valid for column id" write_parquet(f, tbl; encoding = Dict("id" => :delta_length_byte_array))
             # Dictionary encoding is on hold, so its name is not accepted
-            @test_throws "unknown encoding" write_parquet(f, tbl; encoding = :dictionary)
+            @test_throws "unknown encoding" write_parquet(f, tbl; encoding = :delta_byte_array)
         finally
             rm(f, force=true)
         end

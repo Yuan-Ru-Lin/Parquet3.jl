@@ -298,6 +298,51 @@ function encode_rle_bitpacked(levels::AbstractVector{<:Integer}, bit_width::Int)
 end
 
 """
+    encode_hybrid(values, bit_width) -> Vector{UInt8}
+
+The RLE/bit-packed hybrid with both kinds of run (inverse of `decode_rle_bitpacked`): a
+value repeated at least 8 times is an RLE run, everything between such runs is bit-packed
+in groups of 8, borrowing from the front of a run to fill the last group. Used for
+dictionary indices, which rarely repeat for long; `encode_rle_bitpacked` writes RLE runs
+only, which suits levels of flat columns.
+"""
+function encode_hybrid(values::AbstractVector{UInt32}, bit_width::Int)
+    out = IOBuffer(sizehint = cld(length(values) * bit_width, 8) + 16)
+    value_bytes = cld(bit_width, 8)
+    n = length(values)
+    literal_start, i = 1, 1
+    while i <= n
+        v = values[i]
+        j = i
+        while j < n && values[j + 1] == v
+            j += 1
+        end
+        pad = mod(literal_start - i, 8)        # values of this run needed to complete the pending group of 8
+        if j - i + 1 - pad >= 8
+            _write_bitpacked_run(out, values, literal_start, i + pad - 1, bit_width)
+            _write_varint(out, UInt64(j - i + 1 - pad) << 1)
+            for b in 0:value_bytes-1
+                write(out, UInt8((v >> (8b)) & 0xff))
+            end
+            literal_start = j + 1
+        end
+        i = j + 1
+    end
+    _write_bitpacked_run(out, values, literal_start, n, bit_width)
+    take!(out)
+end
+
+# values[from:to] as one bit-packed run; the last group is zero-padded (only possible at the end of the data)
+function _write_bitpacked_run(out::IO, values::AbstractVector{UInt32}, from::Int, to::Int, bit_width::Int)
+    count = to - from + 1
+    count <= 0 && return
+    groups = cld(count, 8)
+    _write_varint(out, (UInt64(groups) << 1) | 0x01)
+    write(out, pack_bits(@view(values[from:to]), bit_width, 8groups))
+    nothing
+end
+
+"""
 RLE-encoded boolean values: the RLE/bit-packed hybrid at bit width 1, preceded by its
 4-byte length. Unlike levels and dictionary indices, boolean values carry the length
 prefix in both v1 and v2 data pages.

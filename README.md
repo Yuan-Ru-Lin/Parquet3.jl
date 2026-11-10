@@ -96,7 +96,7 @@ close(pf)
 | Written column types | Int8–Int64, UInt8–UInt64, Float32/Float64, Bool, String, `Date`, `DateTime`, `Arrow.Timestamp`, `Vector{UInt8}`, and lists, structs and maps of these nested to any depth, with `Missing` at every level | [Column types and nesting](docs/writing.md#column-types-and-nesting) |
 | Compression | Snappy, Gzip, Brotli, Zstd and LZ4 (raw), read and written; the deprecated LZ4 codec is read | [Compression](docs/writing.md#compression) |
 | Encodings read | Plain, RLE/Bit-Packed, Dictionary, Delta Binary Packed, Delta Length Byte Array, Byte Stream Split (float, double, int32, int64) | [Encodings read](docs/reading.md#encodings-read) |
-| Encodings written | PLAIN (default), BYTE_STREAM_SPLIT, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY | [Encodings](docs/writing.md#encodings) |
+| Encodings written | PLAIN (default), Dictionary, BYTE_STREAM_SPLIT, DELTA_BINARY_PACKED, DELTA_LENGTH_BYTE_ARRAY | [Encodings](docs/writing.md#encodings) |
 | Logical types | UTF8, Date, Int8/16/32/64, UInt8/16/32/64, and timestamps with their unit and UTC flag | [Logical types](docs/reading.md#logical-types) |
 | Arrow | The result can be written as Arrow IPC with `Arrow.write(path, tbl)` | [Tables.jl and Arrow](docs/reading.md#tablesjl-and-arrow) |
 
@@ -105,7 +105,7 @@ close(pf)
 - A column's element type admits `Missing` exactly where a null occurs in the data that was read. See [Element types follow the data](docs/reading.md#element-types-follow-the-data).
 - A column that cannot be read throws a `Parquet3.ColumnReadError` naming it; nothing is skipped silently. See [Errors](docs/reading.md#errors).
 - pyarrow cannot read a file in which a fixed-size list is null, or sits inside a null struct; `read_parquet` reads them. See [pyarrow interop](docs/limitations.md#pyarrow-interop).
-- Dictionary encoding is not yet written. See [Known limitations](docs/limitations.md).
+- Everything else is in [Known limitations](docs/limitations.md).
 
 ## Documentation
 

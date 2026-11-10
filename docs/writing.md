@@ -38,8 +38,9 @@ Values are PLAIN-encoded by default. `encoding` accepts:
 | `:byte_stream_split` | Float32, Float64 |
 | `:delta_binary_packed` | every type stored as an integer: Int8–Int64, UInt8–UInt64, Date, DateTime, Arrow.Timestamp |
 | `:delta_length_byte_array` | String, `Vector{UInt8}` |
+| `:dictionary` | every type but `Bool` |
 
-Dictionary-encoded files are read, but dictionary encoding is not yet written (planned for v0.3).
+`:dictionary` writes, per row group, the column's distinct values once (a dictionary page) and an index per value, bit-packed at the width the number of distinct values needs. It pays for columns with few distinct values (detector or channel numbers, event numbers repeated over hits, categories, repeated strings). A column chunk whose distinct values would take more than 1 MiB is written PLAIN instead, as pyarrow does, so asking for it on a column of all-different values costs one scan and nothing in the file; smaller row groups keep more chunks under the limit. Dictionary encoding is never chosen for you: the default stays PLAIN.
 
 A single name applies to the whole table: it is used for every column whose type allows it, and the others stay PLAIN.
 
