@@ -220,8 +220,9 @@ const ListOfStructsColumn{T, fnames, D} = NestedColumn{:list_of_structs, T, fnam
 every row as ragged lists sharing the map's offsets and validity."""
 const MapColumn{T, fnames, D} = NestedColumn{:map, T, fnames, D}
 
-"""List column whose items are fixed-size lists, at any list depth. It behaves as the list
-it wraps; the wrapper is what lets `Arrow.write` take the column without re-encoding it."""
+"""List column whose items Arrow.jl cannot take as they are: fixed-size lists, dates, naive
+timestamps or fixed-length byte arrays, at any list depth. It behaves as the list it wraps; the wrapper is what lets
+`Arrow.write` be handed the column in Arrow's own layout."""
 const ListColumn{T, D} = NestedColumn{:list, T, (), D}
 
 ListColumn(data::AbstractVector{T}) where T = NestedColumn{:list, T, (), typeof(data)}(data)
@@ -272,21 +273,34 @@ _inner_struct(l::Arrow.List) = _inner_struct(l.data)
 _inner_struct(m::MapVector) = _inner_struct(m.entries)
 _inner_struct(::Any) = nothing
 
-"""Whether `v` is a fixed-size list array, looking through any number of list levels."""
-_fixed_size_items(::FixedSizeListVector) = true
-_fixed_size_items(l::Arrow.List) = _fixed_size_items(l.data)
-_fixed_size_items(::Any) = false
+"""
+Element types of our leaf arrays that are not stored as Arrow stores them: Arrow keeps a
+date as 32-bit days and a naive timestamp as milliseconds since 1970, where `Date` and
+`DateTime` are other integers; and a fixed-length byte array (a decimal, a Float16) is a
+vector of byte vectors here. At top level Arrow.jl converts such a column itself; inside
+a struct or a list it is handed over by us, so it is encoded then (a copy).
+"""
+const ArrowEncoded = Union{Dates.Date, Dates.DateTime, Vector{UInt8}}
+
+"""
+Whether `v`, looking through any number of list levels, is an array that has to be
+converted before Arrow.jl can write it: a fixed-size list, or a leaf of an `ArrowEncoded` type.
+"""
+_needs_arrow_conversion(::FixedSizeListVector) = true
+_needs_arrow_conversion(::Arrow.Primitive{T, Vector{S}}) where {T, S <: ArrowEncoded} = true
+_needs_arrow_conversion(l::Arrow.List) = _needs_arrow_conversion(l.data)
+_needs_arrow_conversion(::Any) = false
 
 """
 Wrap an array whose elements are structs, directly (`StructColumn`) or through list levels
 (`ListOfStructsColumn`), or maps (`MapColumn`), so named access composes (`tbl.a.b.c`).
-A list of fixed-size lists becomes a `ListColumn`. Other arrays are returned as is.
+A list of fixed-size lists, dates, naive timestamps or fixed-length byte arrays becomes a `ListColumn`. Other arrays are returned as is.
 """
 function _wrap_nested(v::AbstractVector)
     v isa ChainedVector && isempty(v.arrays) && return v
     chunk = _first_chunk(v)
     s = _inner_struct(chunk)
-    s === nothing && return chunk isa Arrow.List && _fixed_size_items(chunk) ? ListColumn(v) : v
+    s === nothing && return chunk isa Arrow.List && _needs_arrow_conversion(chunk) ? ListColumn(v) : v
     fnames = _struct_fnames(typeof(s))
     chunk isa Arrow.Struct ? StructColumn(v, fnames) :
     chunk isa MapVector ? MapColumn(v, fnames) : ListOfStructsColumn(v, fnames)
@@ -315,6 +329,8 @@ _arrow_native(c::NestedColumn) = _arrow_native(getfield(c, :_data))
 
 # Several row groups in one Arrow array: the chunks' buffers have to be joined
 _arrow_native(cv::ChainedVector) = _arrow_concat([_arrow_native(chunk) for chunk in cv.arrays])
+
+_arrow_native(p::Arrow.Primitive{T, Vector{S}}) where {T, S <: ArrowEncoded} = Arrow.toarrowvector(collect(p))
 
 _arrow_native(l::Arrow.List{T, O, Vector{UInt8}}) where {T, O} = l       # strings and binary
 _arrow_native(l::Arrow.List) = _list_over(l, _arrow_native(l.data))
@@ -369,6 +385,9 @@ function _struct_over(s::Arrow.Struct{T, S, fnames}, children::Tuple) where {T, 
 end
 
 Arrow.arrowvector(x::Union{NestedColumn, FixedSizeListVector, MapVector}, i, nl, fi, de, ded, meta; kw...) = _arrow_native(x)
+# A chunked column of our own array types that Arrow.jl writes as one array (it does so
+# when the table's first column is not chunked, or is a wrapper): join the chunks
+Arrow.arrowvector(x::ChainedVector{T, A}, i, nl, fi, de, ded, meta; kw...) where {T, A <: Union{FixedSizeListVector, MapVector}} = _arrow_native(x)
 
 """
 Join Arrow.jl arrays of one type — a column's row-group chunks — into one array. Needed
@@ -388,11 +407,13 @@ _concat(xs::Vector{<:Arrow.BoolVector{T}}, validity, n) where T =
 
 # Offsets of the joined list: each chunk's offsets, shifted by the items before it
 function _joined_offsets(xs, item_count)
-    offsets, shift = Int32[0], Int32(0)
+    offsets, shift = Int32[0], 0
     for x in xs
         own = x.offsets.offsets
-        append!(offsets, @view(own[2:end]) .- first(own) .+ shift)
-        shift += Int32(item_count(x))
+        # 64-bit arithmetic, then a checked conversion: more than 2^31 items in the joined
+        # array is an error here, not a wrapped offset
+        append!(offsets, Int32.(Int64.(@view(own[2:end])) .- first(own) .+ shift))
+        shift += item_count(x)
     end
     Arrow.Offsets(UInt8[], offsets)
 end

@@ -46,6 +46,23 @@ end
                                      Parquet3.SchemaNode(element = Parquet3.SchemaElement()), Parquet3.ReadNode[])
     structure(rep, def, k) = Parquet3._list_structure(Parquet3.Levels(rep, def), k - 1, k - 1, list_node(k))
 
+    @testset "Deprecated BIT_PACKED levels are packed MSB-first" begin
+        # The example in the format specification: 0 to 7 at three bits each
+        @test Parquet3.read_levels(UInt8[0b00000101, 0b00111001, 0b01110111], 8, 7, Parquet3.BIT_PACKED) == (collect(0:7), 3)
+        # One bit per level, with a partial last byte
+        @test Parquet3.read_levels(UInt8[0b10110010, 0b10000000], 9, 1, Parquet3.BIT_PACKED) == ([1, 0, 1, 1, 0, 0, 1, 0, 1], 2)
+    end
+
+    @testset "The root schema element's repetition does not count" begin
+        E, T = Parquet3.SchemaElement, Parquet3
+        for root_repetition in (nothing, T.REQUIRED, T.OPTIONAL, T.REPEATED)
+            tree = T.build_schema_tree([E(name = "schema", num_children = Int32(2), repetition_type = root_repetition),
+                                        E(name = "a", type = T.INT32, repetition_type = T.REQUIRED),
+                                        E(name = "b", type = T.INT32, repetition_type = T.OPTIONAL)])
+            @test [(c.max_def_level, c.max_rep_level) for c in tree.children] == [(0, 0), (1, 0)]
+        end
+    end
+
     @testset "Nested Column Assembly" begin
         # [[1, 2], [3], [4, 5, 6]]: rep 0 starts a record, 1 continues its list; def 2 = value
         rep, def = [0, 1, 0, 0, 1, 1], [2, 2, 2, 2, 2, 2]
@@ -1818,10 +1835,7 @@ const PARQUET_TESTING_KNOWN_GAPS = Dict(
                                                  "c_preferred_cust_flag:", "c_birth_country:", "c_email_address:", "c_last_review_date:"],
     # malformed (a required column whose pages contain nulls); pyarrow rejects it as well
     "fixed_length_byte_array.parquet" => ["flba_field"],
-    "hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
-    "hadoop_lz4_compressed_larger.parquet" => ["a"],
     "large_string_map.brotli.parquet" => ["arr"],
-    "non_hadoop_lz4_compressed.parquet" => ["c0", "c1", "v11"],
 )
 
 if HAS_PARQUET_TESTING
@@ -1947,6 +1961,22 @@ if HAS_PARQUET_TESTING
             @test length(Tables.columnnames(t)) == 3
             @test t.c0 == [1593604800, 1593604800, 1593604801, 1593604801]
             @test t.v11 ≈ [42.0, 7.7, 42.125, 7.7]
+        end
+
+        # The deprecated LZ4 codec: Hadoop's frames ([uncompressed size][compressed size][block]),
+        # and a single raw block under the same codec id. Same data as lz4_raw_compressed.
+        @testset "deprecated LZ4 codec: $f" for f in ("hadoop_lz4_compressed.parquet", "non_hadoop_lz4_compressed.parquet")
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, f))
+            raw = read_parquet(joinpath(PARQUET_TESTING_DIR, "lz4_raw_compressed.parquet"))
+            @test t.c0 == [1593604800, 1593604800, 1593604801, 1593604801]
+            @test t.v11 ≈ [42.0, 7.7, 42.125, 7.7]
+            @test all(isequal(collect(getproperty(t, k)), collect(getproperty(raw, k))) for k in propertynames(raw))
+        end
+
+        @testset "hadoop_lz4_compressed_larger" begin
+            t = read_parquet(joinpath(PARQUET_TESTING_DIR, "hadoop_lz4_compressed_larger.parquet"))
+            raw = read_parquet(joinpath(PARQUET_TESTING_DIR, "lz4_raw_compressed_larger.parquet"))
+            @test length(t.a) == 10000 && t.a == raw.a
         end
 
         @testset "lz4_raw_compressed_larger" begin
@@ -2858,6 +2888,228 @@ print([n for n in a.column_names if a.schema.field(n).type != b.schema.field(n).
         write_parquet(path, (c = V[nv(1, 2), nv(missing, 4), nv(5, missing)],))
         @test _run_pyarrow("import pyarrow.parquet as pq\nt = pq.read_table('$(path)')\nprint(t.schema.field('c').type, t.column('c').to_pylist())") in
               (nothing, "fixed_size_list<element: int32>[2] [[1, 2], [None, 4], [5, None]]")
+    end
+end
+
+@group "Arrow.write: dates inside structs and lists; chunked fixed-size lists in one batch" begin
+    P = Parquet3
+    mktempdir() do dir
+        # Dates and naive timestamps are stored differently by Arrow; inside a struct or a
+        # list they are handed over by us and have to be converted
+        dates = joinpath(dir, "dates.parquet")
+        script = """
+import pyarrow as pa, pyarrow.parquet as pq, datetime as dt
+day = lambda i: dt.date(2020, 1, i + 1)
+table = pa.table({
+    's':  pa.array([{'day': day(0), 't': dt.datetime(2020, 1, 1, 1)}, None, {'day': None, 't': dt.datetime(2020, 1, 3)}, {'day': day(3), 't': None}],
+                   pa.struct([('day', pa.date32()), ('t', pa.timestamp('ms'))])),
+    'ld': pa.array([[day(0), day(1)], [], [None, day(3)], None], pa.list_(pa.date32())),
+    'lt': pa.array([[dt.datetime(2020, 1, 1)], None, [dt.datetime(2020, 1, 2), None], []], pa.list_(pa.timestamp('ms'))),
+    'd':  pa.array([day(0), None, day(2), day(3)], pa.date32()),
+})
+pq.write_table(table, '$(dates)')
+pq.write_table(table, '$(joinpath(dir, "dates_rg.parquet"))', row_group_size=2)
+# a struct first, then chunked fixed-size lists: Arrow.jl writes the table as one batch
+chunked = pa.table({'s': pa.array([{'a': i} for i in range(6)], pa.struct([('a', pa.int64())])),
+                    'f': pa.array([[i, i + 1] for i in range(6)], pa.list_(pa.int32(), 2)),
+                    'u': pa.array([[i, i + 1] for i in range(6)], pa.list_(pa.uint8(), 2)),
+                    'm': pa.array([[('k', i)] for i in range(6)], pa.map_(pa.string(), pa.int64()))})
+pq.write_table(chunked, '$(joinpath(dir, "chunked.parquet"))', row_group_size=2)
+print('SUCCESS')"""
+        if _run_pyarrow(script) != "SUCCESS"
+            @warn "Skipping Arrow.write date fixtures: uv/pyarrow not available"
+            return
+        end
+        compare = """
+import pyarrow as pa, pyarrow.parquet as pq, sys
+norm = lambda v: {'key': norm(v[0]), 'value': norm(v[1])} if isinstance(v, tuple) else [norm(x) for x in v] if isinstance(v, list) else {k: norm(x) for k, x in v.items()} if isinstance(v, dict) else v
+a, b = pq.read_table(ARGS[0]), pa.ipc.open_file(ARGS[1]).read_all()
+print([n for n in a.column_names if norm(a.column(n).to_pylist()) != norm(b.column(n).to_pylist())], ' '.join(str(b.schema.field(n).type) for n in ARGS[2:]))"""
+        for name in ("dates", "dates_rg")
+            t = read_parquet(joinpath(dir, name * ".parquet"))
+            @test t.ld isa P.ListColumn && t.lt isa P.ListColumn && t.s isa P.StructColumn
+            out = joinpath(dir, name * ".arrow")
+            Arrow.write(out, t)
+            @test _run_pyarrow("ARGS = ['$(joinpath(dir, name * ".parquet"))', '$(out)', 'd']\n" * compare) == "[] date32[day]"
+            # each nested column on its own as well
+            for k in (:s, :ld, :lt)
+                Arrow.write(out, NamedTuple{(k,)}((getproperty(t, k),)))
+                back = Arrow.Table(out)
+                @test isequal([ismissing(r) ? missing : collect(skipmissing(r isa NamedTuple ? values(r) : r)) for r in getproperty(back, k)],
+                              [ismissing(r) ? missing : collect(skipmissing(r isa NamedTuple ? values(r) : r)) for r in getproperty(t, k)])
+            end
+        end
+        # Fixed-length byte arrays (decimals, Float16, fixed-size binary) inside a struct or a
+        # list: read as byte vectors, written to Arrow as lists of bytes, as at top level
+        flba = joinpath(dir, "flba.parquet")
+        if _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq, decimal
+D = decimal.Decimal; d = pa.decimal128(30, 2)
+table = pa.table({'s': pa.array([{'d': D('1.25'), 'u': b'abcd'}, None, {'d': None, 'u': b'efgh'}], pa.struct([('d', d), ('u', pa.binary(4))])),
+                  'l': pa.array([[D('1.25'), None], [], None], pa.list_(d)),
+                  'f': pa.array([[1.5, 2.5], [3.5], []], pa.list_(pa.float32())).cast(pa.list_(pa.float16())),
+                  'top': pa.array([D('1.25'), None, D('3.00')], d)})
+pq.write_table(table, '$(flba)')
+print('SUCCESS')""") == "SUCCESS"
+            bytes(x) = x isa AbstractVector{UInt8} ? Vector{UInt8}(x) : x isa Union{AbstractVector, Tuple} ? Any[bytes(v) for v in x] : x isa NamedTuple ? map(bytes, x) : x
+            t = read_parquet(flba)
+            @test t.l isa P.ListColumn && t.f isa P.ListColumn
+            out = joinpath(dir, "flba.arrow")
+            Arrow.write(out, t)
+            back = Arrow.Table(out)
+            @test all(isequal(bytes(getproperty(back, k)), bytes(getproperty(t, k))) for k in propertynames(t))
+            @test all(k -> (Arrow.write(out, NamedTuple{(k,)}((getproperty(t, k),))); isequal(bytes(Arrow.Table(out)[1]), bytes(getproperty(t, k)))), propertynames(t))
+        end
+
+        t = read_parquet(joinpath(dir, "chunked.parquet"))
+        @test t.f isa P.ChainedVector && t.u isa P.ChainedVector
+        out = joinpath(dir, "chunked.arrow")
+        Arrow.write(out, t)
+        @test _run_pyarrow("ARGS = ['$(joinpath(dir, "chunked.parquet"))', '$(out)', 'f', 'u']\n" * compare) ==
+              "[] fixed_size_list<: int32 not null>[2] fixed_size_list<: uint8>[2]"
+    end
+end
+
+@group "FixedSizeList: a stored list of the wrong size is an error" begin
+    P = Parquet3
+    V = P.FixedSizeView{3, Int32}
+    fsv(a, b, c) = V(Int32[a, b, c], 0)
+    # No writer produces such a file, so one is made: the data of a file with ordinary
+    # lists under the footer metadata (ARROW:schema) of a file with fixed-size lists
+    function with_declared_size(path, lists, declared)
+        mktempdir() do dir
+            a, b = joinpath(dir, "a.parquet"), joinpath(dir, "b.parquet")
+            write_parquet(a, (c = declared,)); write_parquet(b, (c = lists,))
+            pa, pb = open_parquet(a), open_parquet(b)
+            kv, meta = pa.metadata.key_value_metadata, pb.metadata
+            close(pa); close(pb)
+            footer = P.serialize_thrift(P.FileMetaData(version = meta.version, schema = meta.schema, num_rows = meta.num_rows,
+                                                         row_groups = meta.row_groups, key_value_metadata = kv, created_by = meta.created_by),
+                                        P.FILE_METADATA_FIELDS)
+            bytes = read(b)
+            old = Int(ltoh(reinterpret(UInt32, bytes[end-7:end-4])[1]))
+            write(path, vcat(bytes[1:end-8-old], footer, reinterpret(UInt8, [htol(UInt32(length(footer)))]), bytes[end-3:end]))
+        end
+        path
+    end
+    reads(path) = collect.(skipmissing(read_parquet(path).c))
+    cause(path) = try read_parquet(path); nothing catch e; e isa P.ColumnReadError ? sprint(showerror, e.cause) : rethrow() end
+
+    mktempdir() do dir
+        path = joinpath(dir, "f.parquet")
+        top = [fsv(1, 2, 3), fsv(4, 5, 6)]
+        # the construction itself: lists of the declared size read as the fixed-size list
+        @test read_parquet(with_declared_size(path, [Int32[1, 2, 3], Int32[4, 5, 6]], top)).c isa P.FixedSizeListVector
+        # without nulls (the dense path): too short, too long, empty
+        # ... and two wrong sizes that add up to the right total, which a count alone would miss
+        for lists in ([Int32[1, 2, 3], Int32[4, 5], Int32[7, 8, 9]], [Int32[1, 2, 3], Int32[4, 5, 6, 60]], [Int32[1, 2, 3], Int32[]],
+                      [Int32[1, 2], Int32[3, 4, 5, 6], Int32[7, 8, 9]], [Int32[1, 2, 3, 4], Int32[5, 6], Int32[7, 8, 9]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, top)), ""))
+        end
+        # with a null list (the scatter path): the wrong size in the middle and at the end
+        nullable = Union{Missing, V}[fsv(1, 2, 3), missing]
+        for lists in (Union{Missing, Vector{Int32}}[Int32[1, 2], missing, Int32[4, 5, 6]], Union{Missing, Vector{Int32}}[Int32[1, 2, 3], missing, Int32[4, 5, 6, 7]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, nullable)), ""))
+        end
+        @test reads(with_declared_size(path, Union{Missing, Vector{Int32}}[Int32[1, 2, 3], missing, Int32[4, 5, 6]], nullable)) == [[1, 2, 3], [4, 5, 6]]
+        # inside a list, next to an empty list
+        inside = [[fsv(1, 2, 3)], V[]]
+        for lists in ([[Int32[1, 2, 3], Int32[4, 5]], Vector{Int32}[]], [[Int32[1, 2, 3, 4]], Vector{Int32}[]], [Vector{Int32}[], [Int32[1, 2, 3], Int32[4]]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, inside)), ""))
+        end
+        @test length(read_parquet(with_declared_size(path, [[Int32[1, 2, 3], Int32[4, 5, 6]], Vector{Int32}[]], inside)).c) == 2
+        # inside a list without empty or null lists (the dense path): a multiple of the size is not enough
+        dense_inside = [[fsv(1, 2, 3)], [fsv(4, 5, 6)]]
+        for lists in ([[Int32[1, 2], Int32[3, 4, 5, 6]], [Int32[7, 8, 9]]], [[Int32[1, 2, 3, 4]], [Int32[5, 6]]], [[Int32[1, 2, 3]], [Int32[4, 5]]])
+            @test occursin("fixed_size_list[3]", something(cause(with_declared_size(path, lists, dense_inside)), ""))
+        end
+        @test length(read_parquet(with_declared_size(path, [[Int32[1, 2, 3], Int32[4, 5, 6]], [Int32[7, 8, 9]]], dense_inside)).c) == 2
+    end
+end
+
+@group "write_parquet leaves no partial file" begin
+    good = (id = [1, 2], name = ["a", "b"])
+    # a null map key passes planning (the type allows it) and is only found while writing
+    bad = (id = [1, 2], m = [Dict{Union{Missing, String}, Int}("a" => 1), Dict{Union{Missing, String}, Int}(missing => 2)])
+    mktempdir() do dir
+        path = joinpath(dir, "out.parquet")
+
+        # a failure while writing, with nothing at the path: no file is left
+        @test_throws ErrorException write_parquet(path, bad)
+        @test isempty(readdir(dir))
+        # a type error is found before the file is opened
+        @test_throws Exception write_parquet(path, (x = Any[1, "a"],))
+        @test isempty(readdir(dir))
+
+        # success, then overwriting
+        write_parquet(path, good)
+        @test readdir(dir) == ["out.parquet"] && read_parquet(path).id == [1, 2]
+        write_parquet(path, (id = [3],))
+        @test read_parquet(path).id == [3]
+
+        # a failure while writing over an existing file: opening it emptied it, so it is
+        # removed like any partial file (documented)
+        @test_throws ErrorException write_parquet(path, bad)
+        @test isempty(readdir(dir))
+
+        # the file cannot be opened: an error, and nothing is removed
+        write_parquet(path, good)
+        before = read(path)
+        chmod(path, 0o444)
+        @test_throws SystemError write_parquet(path, good)
+        @test read(path) == before
+        chmod(path, 0o644)
+        sub = mkdir(joinpath(dir, "sub")); touch(joinpath(sub, "keep"))
+        @test_throws SystemError write_parquet(sub, good)                # a non-empty directory
+        @test readdir(sub) == ["keep"]
+        empty_dir = mkdir(joinpath(dir, "empty"))
+        @test_throws SystemError write_parquet(empty_dir, good)          # an empty directory
+        @test isdir(empty_dir)
+        @test_throws SystemError write_parquet(joinpath(dir, "nowhere", "x.parquet"), good)
+        @test !ispath(joinpath(dir, "nowhere"))
+
+        # a device is not a file to clean up: the error is the one from writing, and the device stays
+        if isfile("/dev/null") == false && ispath("/dev/null")
+            @test_throws "map key cannot be missing" write_parquet("/dev/null", bad)
+            @test ispath("/dev/null")
+            write_parquet("/dev/null", good)
+            @test ispath("/dev/null")
+        end
+
+        # a symbolic link at the path is written through, not replaced
+        if !Sys.iswindows()
+            target, link = joinpath(dir, "target.parquet"), joinpath(dir, "link.parquet")
+            write_parquet(target, (id = [0],))
+            symlink(target, link)
+            write_parquet(link, good)
+            @test islink(link) && read_parquet(target).id == [1, 2]
+            # ... and when writing through it fails, the partial file it points to is removed and the link stays
+            @test_throws ErrorException write_parquet(link, bad)
+            @test islink(link) && !ispath(target)
+        end
+    end
+end
+
+@group "Row group metadata" begin
+    # The optional RowGroup fields, as pyarrow reports them (Thrift ids 5 and 6)
+    mktempdir() do dir
+        path = joinpath(dir, "rg.parquet")
+        expected = _run_pyarrow("""
+import pyarrow as pa, pyarrow.parquet as pq
+pq.write_table(pa.table({'a': list(range(10)), 's': ['x%d' % i for i in range(10)]}), '$(path)', row_group_size=4)
+m = pq.ParquetFile('$(path)').metadata
+rgs = [m.row_group(i) for i in range(m.num_row_groups)]
+print(';'.join('%d,%d,%d,%d' % (rg.num_rows, rg.total_byte_size, sum(rg.column(j).total_compressed_size for j in range(rg.num_columns)),
+                                min(rg.column(j).dictionary_page_offset or rg.column(j).data_page_offset for j in range(rg.num_columns))) for rg in rgs))""")
+        if expected === nothing
+            @warn "Skipping row group metadata check: uv/pyarrow not available"
+        else
+            pf = open_parquet(path)
+            ours = join(("$(rg.num_rows),$(rg.total_byte_size),$(rg.total_compressed_size),$(rg.file_offset)" for rg in pf.metadata.row_groups), ';')
+            close(pf)
+            @test ours == expected
+            @test length(split(expected, ';')) == 3
+        end
     end
 end
 

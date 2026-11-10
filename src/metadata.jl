@@ -180,8 +180,8 @@ const ROW_GROUP_FIELDS = [
     (1, :columns,               t_list(t_struct(ColumnChunk, COLUMN_CHUNK_FIELDS))),
     (2, :total_byte_size,       T_I64),
     (3, :num_rows,              T_I64),
-    (6, :file_offset,           T_I64),
-    (7, :total_compressed_size, T_I64),
+    (5, :file_offset,           T_I64),
+    (6, :total_compressed_size, T_I64),
 ]
 
 const KEY_VALUE_FIELDS = [

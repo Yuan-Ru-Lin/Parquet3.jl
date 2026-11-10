@@ -48,9 +48,10 @@ function build_schema_tree(schema::Vector{SchemaElement})::SchemaNode
     function build(idx, def, rep)
         elem = schema[idx]
 
-        # Calculate this node's contribution to def/rep levels
-        adds_def = elem.repetition_type in (OPTIONAL, REPEATED) ? 1 : 0
-        adds_rep = elem.repetition_type == REPEATED ? 1 : 0
+        # Calculate this node's contribution to def/rep levels. The root is not a field:
+        # whatever repetition a writer gives it does not count.
+        adds_def = idx > 1 && elem.repetition_type in (OPTIONAL, REPEATED) ? 1 : 0
+        adds_rep = idx > 1 && elem.repetition_type == REPEATED ? 1 : 0
 
         new_def = def + adds_def
         new_rep = rep + adds_rep

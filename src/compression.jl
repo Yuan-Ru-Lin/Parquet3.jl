@@ -2,7 +2,7 @@
 
 using ChunkCodecLibZlib: GzipCodec, GzipEncodeOptions, encode, decode
 using ChunkCodecLibZstd: ZstdCodec, ZstdEncodeOptions
-using ChunkCodecLibLz4: LZ4BlockCodec, LZ4BlockEncodeOptions
+using ChunkCodecLibLz4: LZ4BlockCodec, LZ4BlockEncodeOptions, ChunkCodecCore
 using ChunkCodecLibSnappy: SnappyCodec, SnappyEncodeOptions
 using ChunkCodecLibBrotli: BrotliCodec, BrotliEncodeOptions
 
@@ -39,26 +39,39 @@ compress(data::AbstractVector{UInt8}, codec::CompressionCodec) =
     codec == UNCOMPRESSED ? data : encode(last(_chunk_codec(codec)), data)
 
 """
-Decompress the deprecated LZ4 codec: Hadoop framing around raw LZ4 blocks. An optional
-4-byte total size, then blocks of [4-byte compressed size, 4-byte uncompressed size,
-data], all big-endian. ChunkCodecs has no codec for this framing, only for the blocks.
+Decompress the deprecated LZ4 codec. Hadoop wrote it as a sequence of frames, each
+[4-byte uncompressed size][4-byte compressed size][raw LZ4 block], sizes big-endian; other
+writers stored one raw LZ4 block with no framing under the same codec id. The Hadoop
+framing is tried first and accepted only if it accounts for the input and the output
+exactly; otherwise the data is taken as a single raw block (as Arrow C++ does).
+ChunkCodecs has no codec for the framing, only for the blocks.
 """
 function decompress_lz4_hadoop(data::AbstractVector{UInt8}, uncompressed_size::Int)
-    be_int(pos) = Int(ntoh(reinterpret(Int32, data[pos:pos+3])[1]))
+    framed = _lz4_hadoop_frames(data, uncompressed_size)
+    framed !== nothing ? framed : decode(LZ4BlockCodec(), data; max_size = uncompressed_size)
+end
+
+"""The data decoded as Hadoop LZ4 frames, or `nothing` if it is not laid out that way."""
+function _lz4_hadoop_frames(data::AbstractVector{UInt8}, uncompressed_size::Int)
+    be_int(pos) = Int(ntoh(reinterpret(UInt32, data[pos:pos+3])[1]))
     result = UInt8[]
     sizehint!(result, uncompressed_size)
-
-    # Skip total size header if present
-    pos = length(data) >= 4 && be_int(1) == uncompressed_size ? 5 : 1
-
-    while pos + 7 <= length(data) && length(result) < uncompressed_size
-        compressed_size, block_uncompressed = be_int(pos), be_int(pos + 4)
+    pos = 1
+    while pos <= length(data)
+        pos + 7 <= length(data) || return nothing
+        block_uncompressed, compressed_size = be_int(pos), be_int(pos + 4)
         pos += 8
-        block = @view data[pos:pos+compressed_size-1]
-        append!(result, compressed_size == block_uncompressed ? block :
-                        decode(LZ4BlockCodec(), block; max_size = block_uncompressed))
+        (compressed_size <= length(data) - pos + 1 && length(result) + block_uncompressed <= uncompressed_size) || return nothing
+        block = try
+            decode(LZ4BlockCodec(), @view(data[pos:pos+compressed_size-1]); max_size = block_uncompressed)
+        catch err
+            # only a block that does not decode means "not framed"; anything else is not ours to swallow
+            err isa Union{ChunkCodecCore.DecodingError, ChunkCodecCore.DecodedSizeError} || rethrow()
+            return nothing
+        end
+        length(block) == block_uncompressed || return nothing
+        append!(result, block)
         pos += compressed_size
     end
-
-    result
+    length(result) == uncompressed_size ? result : nothing
 end
