@@ -47,7 +47,7 @@ A `Dict` chooses per column, keyed by the path used to reach the data: `encoding
 
 ## Fixed-size lists
 
-`FixedSizeListVector` columns, at top level or nested in structs, lists and maps, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. `FixedSizeListVector(N, data)` builds such a column from a flat buffer of `N` values per record, e.g. `FixedSizeListVector(3, xyz)` for positions; a column read back from a file is one already.
+`FixedSizeListVector` columns, at top level or nested in structs, lists and maps, keep their fixed size through `ARROW:schema` metadata, for this reader and for pyarrow. A column of fixed-length vectors is written as one: an ArraysOfArrays `VectorOfSimilarVectors` (a `nestedview` of an `N × n` matrix, e.g. x, y, z rows of positions) over its buffer without a copy, or a `Vector` of isbits fixed-length vectors such as StaticArrays' `SVector{N, T}`; a `FixedSizeListVector` read back from a file is written as it is.
 
 The first write of each new table schema containing such a column takes 5–20 s (one-time compilation of the Arrow schema step; later writes of the same schema in the same session are fast, and tables without a fixed-size list are unaffected).
 

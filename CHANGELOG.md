@@ -5,7 +5,7 @@
 ### Writing
 
 - `write_parquet(path, tbl; rowgroup_size = n)` writes the table as row groups of `n` rows, each shredded, encoded and written before the next, so the writer's working set is a few times one row group instead of the whole table. The default is still one row group.
-- `FixedSizeListVector(N, data)` builds a fixed-size-list column from a flat buffer for writing; the type is exported.
+- A column of fixed-length vectors is written as a `FixedSizeList`: an ArraysOfArrays `VectorOfSimilarVectors` (no copy) or a `Vector` of isbits fixed-length vectors such as StaticArrays' `SVector`.
 
 ### Performance
 

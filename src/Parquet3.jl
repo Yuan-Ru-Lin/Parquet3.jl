@@ -5,7 +5,7 @@ using Dates
 using Arrow
 using ArrowTypes: ArrowTypes
 using SentinelArrays: ChainedVector
-using ArraysOfArrays: nestedview, VectorOfVectors
+using ArraysOfArrays: nestedview, VectorOfVectors, VectorOfSimilarVectors, innersize, flatview
 using BitIntegers: @define_integers
 using Tables
 using Thrift: TCompactProtocol, TMemoryTransport, TType,
@@ -32,7 +32,6 @@ include("filewriter.jl")    # plan, shred, encode: write_parquet
 export
     read_parquet,
     write_parquet,
-    FixedSizeListVector,
     open_parquet,
     num_rows,
     num_row_groups,

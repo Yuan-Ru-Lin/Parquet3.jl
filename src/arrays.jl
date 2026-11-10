@@ -60,8 +60,8 @@ end
     FixedSizeListVector(N, data::Vector)
 
 A fixed-size-list column over a flat buffer: record `i` is `data[(i-1)N+1 : iN]`, no record
-or element is null. The way to hand `write_parquet` a `FixedSizeList<T>[N]` column, e.g.
-positions as `FixedSizeListVector(3, xyz)` with `xyz` the x, y, z triples back to back.
+or element is null. `write_parquet` builds one from a column of fixed-length vectors (see
+`_as_writable`); callers do not need to.
 """
 function FixedSizeListVector(N::Int, data::Vector)
     N >= 1 || throw(ArgumentError("FixedSizeListVector: N must be at least 1, got $N"))

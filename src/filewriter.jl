@@ -190,6 +190,27 @@ _shred_stop!(node, rep::Int, def::Int) =
 _fsl_size(::FixedSizeListVector{N}) where N = N
 
 """
+A column of fixed-length vectors as the writer's fixed-size-list column, so that it is written
+as `FixedSizeList<T>[N]` (and shredded in bulk) rather than as a list of lists: an ArraysOfArrays
+`VectorOfSimilarVectors` (a `nestedview` of an `N × n` matrix) over its flat buffer without a
+copy, and a `Vector` of isbits fixed-length vectors (StaticArrays' `SVector{N, T}`) through one
+reinterpreting copy. Every other column is written as it is.
+"""
+_as_writable(col::AbstractVector) = col
+function _as_writable(col::VectorOfSimilarVectors)
+    N = innersize(col, 1)
+    N >= 1 || return col
+    flat = flatview(col)
+    FixedSizeListVector(N, flat isa Array ? vec(flat) : vec(collect(flat)))
+end
+function _as_writable(col::Vector{E}) where {E <: AbstractVector}
+    (isbitstype(E) && isconcretetype(eltype(E)) && !isempty(col)) || return col
+    N = length(first(col))
+    (N >= 1 && sizeof(E) == N * sizeof(eltype(E))) || return col      # a plain fixed-length layout and nothing else
+    FixedSizeListVector(N, collect(reinterpret(eltype(E), col)))
+end
+
+"""
 Shred a whole column into the leaves under `node`. Two shapes need no per-row work: a flat
 column without `missing`, whose values are appended as they are under a constant definition
 level, and a `FixedSizeListVector` without nulls, whose flat buffer is the leaf's values under
@@ -307,7 +328,7 @@ function write_parquet(path::String, tbl; compression::Union{Symbol, AbstractStr
     cols = Tables.columns(tbl)
     names = collect(Symbol, Tables.columnnames(cols))
     isempty(names) && error("write_parquet: table has no columns")
-    vectors = [Tables.getcolumn(cols, name) for name in names]
+    vectors = [_as_writable(Tables.getcolumn(cols, name)) for name in names]
     nrows = length(vectors[1])
     all(v -> length(v) == nrows, vectors) || error("write_parquet: ragged columns")
 
