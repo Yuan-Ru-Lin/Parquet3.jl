@@ -1,22 +1,5 @@
 # Changelog
 
-## Unreleased
-
-### Writing
-
-- `encoding = :dictionary` writes a column dictionary-encoded (every type but `Bool`), for the whole table or per column: the distinct values of each column chunk once, and bit-packed indices. A chunk whose distinct values would take more than 1 MiB is written PLAIN, as in pyarrow.
-- `write_parquet(path, tbl; rowgroup_size = n)` writes the table as row groups of `n` rows, each shredded, encoded and written before the next, so the writer's working set is a few times one row group instead of the whole table. The default is still one row group.
-- A column of fixed-length vectors is written as a `FixedSizeList`: an ArraysOfArrays `VectorOfSimilarVectors` (no copy) or a `Vector` of isbits fixed-length vectors such as StaticArrays' `SVector`.
-
-### Performance
-
-Measured on a 26.4 M-row table (two Int64, two Float32 and one `FixedSizeList<Float32>[3]` column, zstd, Julia 1.12, 4 threads); the files written are byte-identical to before.
-
-- Reading a flat column no longer boxes every value. `assemble_flat_column` copied optional columns (every column `write_parquet` writes) element by element through an abstractly typed page vector, about four allocations per value. The per-page copy is now a typed function barrier, and a page whose definition levels are all at the maximum is copied in bulk. One column: 4.7 s and 106 M allocations to 0.8 s and 1.5 k; all columns: 12.1 s and 397 M to about 3 s of work and 2 k.
-- Definition and repetition levels are kept in the decoder's `UInt32` instead of being copied to `Int`, and a level stream that is a single RLE run of "present" (or "no repetition") over the whole page builds no buffer at all. The compressed bytes of a page are decompressed from a view, not a copy.
-- Writing allocates per column, not per row: a flat column without `missing` and a `FixedSizeListVector` without nulls are appended in bulk, repetition levels are only kept under a list, level buffers are bytes, and a page is assembled once in a buffer of its exact size (PLAIN fixed-width values are copied by pointer) instead of through an `IOBuffer`, `take!` and `vcat`. Whole table: 25.7 s and 52.9 M allocations (18.5 GiB) to 7.8 s and 2 k (3.6 GiB).
-- A column chunk larger than 2 GiB now fails with a message naming the column instead of an `InexactError` (one data page per column is still written).
-
 ## v0.2.0
 
 Parquet3 now reads every nested shape Parquet can hold and writes Parquet files. pyarrow is the reference throughout: the tests compare what we read with what pyarrow reads, and have pyarrow read what we write.
@@ -39,6 +22,18 @@ Parquet3 now reads every nested shape Parquet can hold and writes Parquet files.
 - `compression = :snappy` (default), `:gzip`, `:brotli`, `:zstd`, `:lz4`, `:uncompressed`.
 - `encoding = :plain` (default), `:byte_stream_split`, `:delta_binary_packed`, `:delta_length_byte_array`, for the whole table or per column.
 - Null counts are written as pyarrow writes them.
+- `encoding = :dictionary` writes a column dictionary-encoded (every type but `Bool`), for the whole table or per column: the distinct values of each column chunk once, and bit-packed indices. A chunk whose distinct values would take more than 1 MiB is written PLAIN, as in pyarrow.
+- `write_parquet(path, tbl; rowgroup_size = n)` writes the table as row groups of `n` rows, each shredded, encoded and written before the next, so the writer's working set is a few times one row group instead of the whole table. The default is still one row group.
+- A column of fixed-length vectors is written as a `FixedSizeList`: an ArraysOfArrays `VectorOfSimilarVectors` (no copy) or a `Vector` of isbits fixed-length vectors such as StaticArrays' `SVector`.
+
+### Performance
+
+Measured on a 26.4 M-row table (two Int64, two Float32 and one `FixedSizeList<Float32>[3]` column, zstd, Julia 1.12, 4 threads); the files written are byte-identical to before.
+
+- Reading a flat column no longer boxes every value. `assemble_flat_column` copied optional columns (every column `write_parquet` writes) element by element through an abstractly typed page vector, about four allocations per value. The per-page copy is now a typed function barrier, and a page whose definition levels are all at the maximum is copied in bulk. One column: 4.7 s and 106 M allocations to 0.8 s and 1.5 k; all columns: 12.1 s and 397 M to about 3 s of work and 2 k.
+- Definition and repetition levels are kept in the decoder's `UInt32` instead of being copied to `Int`, and a level stream that is a single RLE run of "present" (or "no repetition") over the whole page builds no buffer at all. The compressed bytes of a page are decompressed from a view, not a copy.
+- Writing allocates per column, not per row: a flat column without `missing` and a `FixedSizeListVector` without nulls are appended in bulk, repetition levels are only kept under a list, level buffers are bytes, and a page is assembled once in a buffer of its exact size (PLAIN fixed-width values are copied by pointer) instead of through an `IOBuffer`, `take!` and `vcat`. Whole table: 25.7 s and 52.9 M allocations (18.5 GiB) to 7.8 s and 2 k (3.6 GiB).
+- A column chunk larger than 2 GiB now fails with a message naming the column instead of an `InexactError` (one data page per column is still written).
 
 ### Arrow.write
 
@@ -63,7 +58,7 @@ Parquet3 now reads every nested shape Parquet can hold and writes Parquet files.
 ### Known limitations
 
 - pyarrow cannot read a file in which a fixed-size list is null (for example a null waveform) or sits inside a null struct; it fails with "Expected all lists to be of size=N". This is so for such files from any writer, pyarrow included. `write_parquet` writes them faithfully and `read_parquet` reads them.
-- The writer writes one row group and one page per column, with no min/max statistics and no dictionary encoding.
+- The writer writes one page per column chunk (so a chunk is limited to 2 GiB; use `rowgroup_size`), with no min/max statistics. Dictionary encoding is written only on request.
 - Not read yet: DELTA_BYTE_ARRAY, BYTE_STREAM_SPLIT for fixed-length byte arrays, and more than 2 GB of strings in one column chunk.
 - Decimals, Float16, durations, times and INT96 timestamps are returned as stored (raw bytes or integers), not converted. Written back, they keep their values but lose the annotation: decimals, Float16 and fixed-length binary become plain binary, times and durations plain integers. INT96 columns cannot be written.
 - `Arrow.write` of rows collected out of a fixed-size list of `UInt8` (`collect(tbl.col)`) produces Arrow fixed-size binary; the column as read is written as a fixed-size list.
