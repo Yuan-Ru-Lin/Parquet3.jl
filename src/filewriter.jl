@@ -1,4 +1,4 @@
-# Parquet file writer (flat, list, struct and map columns, arbitrarily nested; one row group)
+# Parquet file writer (flat, list, struct and map columns, arbitrarily nested; one or more row groups)
 
 const CREATED_BY = "Parquet3.jl"
 
